@@ -387,6 +387,40 @@ def plot_confusion_matrix(y_true, y_pred, label_names=("Sell", "Hold", "Buy")):
     plt.show()
 
 
+def build_context_dataset(df, feature_cols, context_len, target_start=0):
+    if not isinstance(context_len, (int, np.integer)):
+        raise TypeError("context_len doit etre un entier.")
+    if context_len <= 0:
+        raise ValueError("context_len doit etre strictement positif.")
+
+    values = df[feature_cols].to_numpy(dtype=np.float32)
+    labels = df["Label_id"].to_numpy(dtype=np.int64)
+    feature_dim = len(feature_cols)
+
+    if len(df) < context_len:
+        return (
+            np.empty((0, context_len * feature_dim), dtype=np.float32),
+            np.empty((0,), dtype=np.int64),
+        )
+
+    X_list, y_list = [], []
+    target_start = max(target_start, context_len - 1)
+    for t in range(context_len - 1, len(df)):
+        if t < target_start:
+            continue
+        window = values[t - context_len + 1 : t + 1]
+        X_list.append(window.reshape(-1))  # (context_len * F,)
+        y_list.append(labels[t])
+
+    if not X_list:
+        return (
+            np.empty((0, context_len * feature_dim), dtype=np.float32),
+            np.empty((0,), dtype=np.int64),
+        )
+
+    return np.asarray(X_list, dtype=np.float32), np.asarray(y_list, dtype=np.int64)
+
+
 def train_model(
     train,
     epochs=200,
@@ -397,11 +431,16 @@ def train_model(
     batch_size=32,
     train_ratio=0.7,
     val_ratio=0.15,
+    context_len=40
 ):
     if batch_size <= 0:
         raise ValueError("batch_size doit etre strictement positif.")
     if not 0 <= dropout_percent < 1:
         raise ValueError("dropout_percent doit etre dans [0, 1).")
+    if not isinstance(context_len, (int, np.integer)):
+        raise TypeError("context_len doit etre un entier.")
+    if context_len <= 0:
+        raise ValueError("context_len doit etre strictement positif.")
 
     feature_cols = [
         "open_ret",
@@ -432,26 +471,55 @@ def train_model(
         val_ratio=val_ratio,
     )
 
-    X_train_raw = train_df[feature_cols].to_numpy(dtype=np.float32)
-    y_train = train_df["Label_id"].to_numpy(dtype=np.int64)
+    X_train_raw, y_train = build_context_dataset(train_df, feature_cols, context_len)
+
+    # Build validation windows with train history as context
+    val_prefix_len = min(context_len - 1, len(train_df))
+    val_source = pd.concat([train_df.tail(val_prefix_len), val_df], ignore_index=True)
+    X_val_raw, y_val = build_context_dataset(
+        val_source,
+        feature_cols,
+        context_len,
+        target_start=val_prefix_len,
+    )
+
+    # Build test windows with train+val history as context
+    test_history = pd.concat([train_df, val_df], ignore_index=True)
+    test_prefix_len = min(context_len - 1, len(test_history))
+    test_source = pd.concat([test_history.tail(test_prefix_len), test_df], ignore_index=True)
+    X_test_raw, y_test = build_context_dataset(
+        test_source,
+        feature_cols,
+        context_len,
+        target_start=test_prefix_len,
+    )
+
+    if len(X_train_raw) == 0:
+        raise ValueError("Aucun echantillon train apres fenetrage. Reduis context_len.")
+    if len(X_val_raw) == 0:
+        raise ValueError("Aucun echantillon validation apres fenetrage. Reduis context_len.")
+    if len(X_test_raw) == 0:
+        raise ValueError("Aucun echantillon test apres fenetrage. Reduis context_len.")
+
     Y_train = one_hot(y_train, 3)
     class_weights = compute_class_weights(y_train, num_classes=3)
 
     X_train, feature_mean, feature_std = standardize_features(X_train_raw)
     X_val, _, _ = standardize_features(
-        val_df[feature_cols].to_numpy(dtype=np.float32),
+        X_val_raw,
         mean=feature_mean,
         std=feature_std,
     )
     X_test, _, _ = standardize_features(
-        test_df[feature_cols].to_numpy(dtype=np.float32),
+        X_test_raw,
         mean=feature_mean,
         std=feature_std,
     )
-    y_val = val_df["Label_id"].to_numpy(dtype=np.int64)
-    y_test = test_df["Label_id"].to_numpy(dtype=np.int64)
 
     entry = X_train.shape[1]
+    if entry != context_len * len(feature_cols):
+        raise ValueError("Entry size miss-match.")
+    
     W0 = 0.01 * np.random.randn(entry, hidden).astype(np.float32)
     b0 = np.zeros((1, hidden), dtype=np.float32)
     W1 = 0.01 * np.random.randn(hidden, 3).astype(np.float32)
@@ -465,6 +533,7 @@ def train_model(
     print("X_train:", X_train.shape)
     print("X_val:", X_val.shape)
     print("X_test:", X_test.shape)
+    print("context_len:", context_len, "| feature_dim:", len(feature_cols))
     print("W0:", W0.shape)
     print("b0:", b0.shape)
     print("W1:", W1.shape)
