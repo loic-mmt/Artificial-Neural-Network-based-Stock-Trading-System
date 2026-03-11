@@ -387,7 +387,7 @@ def plot_confusion_matrix(y_true, y_pred, label_names=("Sell", "Hold", "Buy")):
     plt.show()
 
 
-def build_context_dataset(df, feature_cols, context_len, target_start=0):
+def build_context_dataset(df, feature_cols, context_len, target_start=0, return_indices=False):
     if not isinstance(context_len, (int, np.integer)):
         raise TypeError("context_len doit etre un entier.")
     if context_len <= 0:
@@ -403,7 +403,7 @@ def build_context_dataset(df, feature_cols, context_len, target_start=0):
             np.empty((0,), dtype=np.int64),
         )
 
-    X_list, y_list = [], []
+    X_list, y_list, idx_list = [], [], []
     target_start = max(target_start, context_len - 1)
     for t in range(context_len - 1, len(df)):
         if t < target_start:
@@ -411,14 +411,71 @@ def build_context_dataset(df, feature_cols, context_len, target_start=0):
         window = values[t - context_len + 1 : t + 1]
         X_list.append(window.reshape(-1))  # (context_len * F,)
         y_list.append(labels[t])
+        idx_list.append(t)
 
     if not X_list:
+        empty_x = np.empty((0, context_len * feature_dim), dtype=np.float32)
+        empty_y = np.empty((0,), dtype=np.int64)
+        empty_idx = np.empty((0,), dtype=np.int64)
+        if return_indices:
+            return empty_x, empty_y, empty_idx
         return (
             np.empty((0, context_len * feature_dim), dtype=np.float32),
             np.empty((0,), dtype=np.int64),
         )
 
-    return np.asarray(X_list, dtype=np.float32), np.asarray(y_list, dtype=np.int64)
+    X = np.asarray(X_list, dtype=np.float32)
+    y = np.asarray(y_list, dtype=np.int64)
+    indices = np.asarray(idx_list, dtype=np.int64)
+    if return_indices:
+        return X, y, indices
+    return X, y
+
+
+def signals_to_positions(pred_labels):
+    """Convert class predictions to a long/flat position stream."""
+    positions = []
+    current_position = 0.0
+
+    for label in pred_labels:
+        if label == 2:  # Buy
+            current_position = 1.0
+        elif label == 0:  # Sell
+            current_position = 0.0
+        # Hold keeps previous position
+        positions.append(current_position)
+
+    return np.asarray(positions, dtype=np.float64)
+
+
+def evaluate_strategy_vs_buy_hold(test_frame, pred_labels, initial_capital=10_000.0, price_col="adj_close"):
+    """Compute test-period PnL of model signals versus buy-and-hold."""
+    if len(test_frame) != len(pred_labels):
+        raise ValueError("Mismatch entre nombre de predictions et lignes test.")
+    if len(test_frame) < 2:
+        raise ValueError("Le set test doit contenir au moins 2 lignes pour calculer un PnL.")
+
+    prices = test_frame[price_col].to_numpy(dtype=np.float64)
+    forward_returns = np.zeros(len(prices), dtype=np.float64)
+    forward_returns[:-1] = (prices[1:] / prices[:-1]) - 1.0
+
+    positions = signals_to_positions(pred_labels)
+    strategy_returns = positions * forward_returns
+
+    model_curve = initial_capital * np.cumprod(1.0 + strategy_returns)
+    buy_hold_curve = initial_capital * np.cumprod(1.0 + forward_returns)
+
+    model_final = float(model_curve[-1])
+    buy_hold_final = float(buy_hold_curve[-1])
+
+    return {
+        "initial_capital": float(initial_capital),
+        "model_final_capital": model_final,
+        "buy_hold_final_capital": buy_hold_final,
+        "model_pnl": model_final - float(initial_capital),
+        "buy_hold_pnl": buy_hold_final - float(initial_capital),
+        "outperformance": model_final - buy_hold_final,
+    }
 
 
 def train_model(
@@ -431,7 +488,7 @@ def train_model(
     batch_size=32,
     train_ratio=0.7,
     val_ratio=0.15,
-    context_len=40
+    context_len=20
 ):
     if batch_size <= 0:
         raise ValueError("batch_size doit etre strictement positif.")
@@ -487,11 +544,12 @@ def train_model(
     test_history = pd.concat([train_df, val_df], ignore_index=True)
     test_prefix_len = min(context_len - 1, len(test_history))
     test_source = pd.concat([test_history.tail(test_prefix_len), test_df], ignore_index=True)
-    X_test_raw, y_test = build_context_dataset(
+    X_test_raw, y_test, test_target_indices = build_context_dataset(
         test_source,
         feature_cols,
         context_len,
         target_start=test_prefix_len,
+        return_indices=True,
     )
 
     if len(X_train_raw) == 0:
@@ -633,9 +691,18 @@ def train_model(
     test_preds = predict_with_thresholds(test_probs, best["thresholds"][0], best["thresholds"][1])
     test_metrics = evaluate_predictions(y_test, test_preds)
 
+    aligned_test_frame = test_source.iloc[test_target_indices].reset_index(drop=True)
+    benchmark_comparison = evaluate_strategy_vs_buy_hold(
+        aligned_test_frame,
+        test_preds,
+        initial_capital=float(CAPITAL),
+        price_col="adj_close",
+    )
+
     best["test_metrics"] = test_metrics
     best["test_y_true"] = y_test.copy()
     best["test_y_pred"] = test_preds.copy()
+    best["benchmark_comparison"] = benchmark_comparison
 
     print(
         "Final test | "
@@ -645,6 +712,14 @@ def train_model(
         f"| precision_sell={test_metrics['precision_sell']:.3f} | recall_sell={test_metrics['recall_sell']:.3f} "
         f"| precision_hold={test_metrics['precision_hold']:.3f} | recall_hold={test_metrics['recall_hold']:.3f} "
         f"| buy_threshold={best['thresholds'][0]:.2f} | sell_threshold={best['thresholds'][1]:.2f}"
+    )
+    print(
+        "PnL test | "
+        f"model={benchmark_comparison['model_pnl']:.2f} "
+        f"| buy_hold={benchmark_comparison['buy_hold_pnl']:.2f} "
+        f"| outperformance={benchmark_comparison['outperformance']:.2f} "
+        f"| final_model={benchmark_comparison['model_final_capital']:.2f} "
+        f"| final_buy_hold={benchmark_comparison['buy_hold_final_capital']:.2f}"
     )
 
     plot_confusion_matrix(best["test_y_true"], best["test_y_pred"])
