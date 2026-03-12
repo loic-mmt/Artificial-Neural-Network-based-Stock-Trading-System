@@ -587,7 +587,7 @@ def train_model(
     best_macro_f1 = -1.0
     best = None
 
-    print("train rows:", len(train_df), "| val rows:", len(val_df), "| test rows:", len(test_df))
+    print("\ntrain rows:", len(train_df), "| val rows:", len(val_df), "| test rows:", len(test_df))
     print("X_train:", X_train.shape)
     print("X_val:", X_val.shape)
     print("X_test:", X_test.shape)
@@ -678,15 +678,20 @@ def train_model(
                 "val_bal_acc": val_metrics["bal_acc"],
                 "best_macro_f1": best_macro_f1,
             }
-        if ep//10 == 0:
+
+        if ep in {0, 49, 99, 149, 199}:
+            if ep == 0:
+                print("\n Starting training ===========================================")
             print(
-                f"epoch {ep + 1}/{epochs} | loss={avg_loss:.4f} "
+                f"\nepoch {ep + 1}/{epochs} | loss={avg_loss:.4f} "
                 f"| acc(train)={train_metrics['acc']:.3f} | acc(val)={val_metrics['acc']:.3f} "
-                f"| bal_acc(val)={val_metrics['bal_acc']:.3f} | macro_f1(val)={val_metrics['macro_f1']:.3f} "
-                f"| precision_buy={val_metrics['precision_buy']:.3f} | recall_buy={val_metrics['recall_buy']:.3f} "
-                f"| precision_sell={val_metrics['precision_sell']:.3f} | recall_sell={val_metrics['recall_sell']:.3f} "
+                f"| bal_acc(val)={val_metrics['bal_acc']:.3f} | macro_f1(val)={val_metrics['macro_f1']:.3f} \n"
+                f"| precision_buy={val_metrics['precision_buy']:.3f} | recall_buy={val_metrics['recall_buy']:.3f} \n"
+                f"| precision_sell={val_metrics['precision_sell']:.3f} | recall_sell={val_metrics['recall_sell']:.3f} \n"
                 f"| precision_hold={val_metrics['precision_hold']:.3f} | recall_hold={val_metrics['recall_hold']:.3f}"
             )
+            if ep == 199:
+                print("\n Ending training ===========================================")
 
     _, _, _, test_probs = forward_pass(X_test, best["W0"], best["b0"], best["W1"], best["b1"])
     test_preds = predict_with_thresholds(test_probs, best["thresholds"][0], best["thresholds"][1])
@@ -706,21 +711,21 @@ def train_model(
     best["benchmark_comparison"] = benchmark_comparison
 
     print(
-        "Final test | "
+        "\nFinal test | "
         f"acc={test_metrics['acc']:.3f} | bal_acc={test_metrics['bal_acc']:.3f} "
-        f"| macro_f1={test_metrics['macro_f1']:.3f} "
-        f"| precision_buy={test_metrics['precision_buy']:.3f} | recall_buy={test_metrics['recall_buy']:.3f} "
-        f"| precision_sell={test_metrics['precision_sell']:.3f} | recall_sell={test_metrics['recall_sell']:.3f} "
-        f"| precision_hold={test_metrics['precision_hold']:.3f} | recall_hold={test_metrics['recall_hold']:.3f} "
+        f"| macro_f1={test_metrics['macro_f1']:.3f} \n"
+        f"| precision_buy={test_metrics['precision_buy']:.3f} | recall_buy={test_metrics['recall_buy']:.3f} \n"
+        f"| precision_sell={test_metrics['precision_sell']:.3f} | recall_sell={test_metrics['recall_sell']:.3f} \n"
+        f"| precision_hold={test_metrics['precision_hold']:.3f} | recall_hold={test_metrics['recall_hold']:.3f} \n"
         f"| buy_threshold={best['thresholds'][0]:.2f} | sell_threshold={best['thresholds'][1]:.2f}"
     )
     print(
-        "PnL test | "
+        "\nPnL test | "
         f"model={benchmark_comparison['model_pnl']:.2f} "
         f"| buy_hold={benchmark_comparison['buy_hold_pnl']:.2f} "
         f"| outperformance={benchmark_comparison['outperformance']:.2f} "
         f"| final_model={benchmark_comparison['model_final_capital']:.2f} "
-        f"| final_buy_hold={benchmark_comparison['buy_hold_final_capital']:.2f}"
+        f"| final_buy_hold={benchmark_comparison['buy_hold_final_capital']:.2f}\n"
     )
 
     plot_confusion_matrix(best["test_y_true"], best["test_y_pred"])
