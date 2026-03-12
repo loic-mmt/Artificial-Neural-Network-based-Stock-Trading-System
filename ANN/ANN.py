@@ -683,7 +683,7 @@ def train_model(
             if ep == 0:
                 print("\n Starting training ===========================================")
             print(
-                f"\nepoch {ep + 1}/{epochs} | loss={avg_loss:.4f} "
+                f"\nepoch {ep + 1}/{epochs} \n| loss={avg_loss:.4f} "
                 f"| acc(train)={train_metrics['acc']:.3f} | acc(val)={val_metrics['acc']:.3f} "
                 f"| bal_acc(val)={val_metrics['bal_acc']:.3f} | macro_f1(val)={val_metrics['macro_f1']:.3f} \n"
                 f"| precision_buy={val_metrics['precision_buy']:.3f} | recall_buy={val_metrics['recall_buy']:.3f} \n"
