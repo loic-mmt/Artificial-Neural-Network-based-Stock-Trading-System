@@ -678,14 +678,15 @@ def train_model(
                 "val_bal_acc": val_metrics["bal_acc"],
                 "best_macro_f1": best_macro_f1,
             }
-        print(
-            f"epoch {ep + 1}/{epochs} | loss={avg_loss:.4f} "
-            f"| acc(train)={train_metrics['acc']:.3f} | acc(val)={val_metrics['acc']:.3f} "
-            f"| bal_acc(val)={val_metrics['bal_acc']:.3f} | macro_f1(val)={val_metrics['macro_f1']:.3f} "
-            f"| precision_buy={val_metrics['precision_buy']:.3f} | recall_buy={val_metrics['recall_buy']:.3f} "
-            f"| precision_sell={val_metrics['precision_sell']:.3f} | recall_sell={val_metrics['recall_sell']:.3f} "
-            f"| precision_hold={val_metrics['precision_hold']:.3f} | recall_hold={val_metrics['recall_hold']:.3f}"
-        )
+        if ep//10 == 0:
+            print(
+                f"epoch {ep + 1}/{epochs} | loss={avg_loss:.4f} "
+                f"| acc(train)={train_metrics['acc']:.3f} | acc(val)={val_metrics['acc']:.3f} "
+                f"| bal_acc(val)={val_metrics['bal_acc']:.3f} | macro_f1(val)={val_metrics['macro_f1']:.3f} "
+                f"| precision_buy={val_metrics['precision_buy']:.3f} | recall_buy={val_metrics['recall_buy']:.3f} "
+                f"| precision_sell={val_metrics['precision_sell']:.3f} | recall_sell={val_metrics['recall_sell']:.3f} "
+                f"| precision_hold={val_metrics['precision_hold']:.3f} | recall_hold={val_metrics['recall_hold']:.3f}"
+            )
 
     _, _, _, test_probs = forward_pass(X_test, best["W0"], best["b0"], best["W1"], best["b1"])
     test_preds = predict_with_thresholds(test_probs, best["thresholds"][0], best["thresholds"][1])
