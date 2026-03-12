@@ -480,7 +480,7 @@ def evaluate_strategy_vs_buy_hold(test_frame, pred_labels, initial_capital=10_00
 
 def train_model(
     train,
-    epochs=200,
+    epochs=500,
     alpha=1e-3,
     hidden=32,
     do_dropout=False,
@@ -488,7 +488,9 @@ def train_model(
     batch_size=32,
     train_ratio=0.7,
     val_ratio=0.15,
-    context_len=20
+    context_len=20,
+    early_stopping_patience=50,
+    early_stopping_min_delta=1e-4,
 ):
     if batch_size <= 0:
         raise ValueError("batch_size doit etre strictement positif.")
@@ -498,6 +500,12 @@ def train_model(
         raise TypeError("context_len doit etre un entier.")
     if context_len <= 0:
         raise ValueError("context_len doit etre strictement positif.")
+    if not isinstance(early_stopping_patience, (int, np.integer)):
+        raise TypeError("early_stopping_patience doit etre un entier.")
+    if early_stopping_patience <= 0:
+        raise ValueError("early_stopping_patience doit etre strictement positif.")
+    if early_stopping_min_delta < 0:
+        raise ValueError("early_stopping_min_delta doit etre >= 0.")
 
     feature_cols = [
         "open_ret",
@@ -598,6 +606,10 @@ def train_model(
     print("b1:", b1.shape)
     print("class_weights:", class_weights)
 
+    no_improve_count = 0
+    best_epoch = 0
+    stop_reason = "max_epochs"
+
     for ep in range(epochs):
         perm = np.random.permutation(N)
         Xp, Yp = X_train[perm], Y_train[perm]
@@ -650,15 +662,17 @@ def train_model(
         train_metrics = evaluate_predictions(y_train, train_preds)
         avg_loss = epoch_loss / N
 
-        if (
-            val_metrics["macro_f1"] > best_macro_f1
-            or (
-                np.isclose(val_metrics["macro_f1"], best_macro_f1)
-                and best is not None
-                and val_metrics["bal_acc"] > best["val_bal_acc"]
-            )
-            or best is None
-        ):
+        macro_improved = val_metrics["macro_f1"] > (best_macro_f1 + early_stopping_min_delta)
+        macro_tie = np.isclose(
+            val_metrics["macro_f1"],
+            best_macro_f1,
+            atol=early_stopping_min_delta,
+        )
+        bal_acc_improved = (
+            best is not None and val_metrics["bal_acc"] > best["val_bal_acc"] + 1e-12
+        )
+
+        if best is None or macro_improved or (macro_tie and bal_acc_improved):
             best_macro_f1 = val_metrics["macro_f1"]
             best = {
                 "W0": W0.copy(),
@@ -677,21 +691,55 @@ def train_model(
                 "val_y_pred": val_preds.copy(),
                 "val_bal_acc": val_metrics["bal_acc"],
                 "best_macro_f1": best_macro_f1,
+                "best_epoch": ep + 1,
             }
+            best_epoch = ep + 1
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
 
-        if ep in {0, 49, 99, 149, 199}:
-            if ep == 0:
-                print("\n Starting training ===========================================")
-            print(
-                f"\nepoch {ep + 1}/{epochs} \n| loss={avg_loss:.4f} "
-                f"| acc(train)={train_metrics['acc']:.3f} | acc(val)={val_metrics['acc']:.3f} "
-                f"| bal_acc(val)={val_metrics['bal_acc']:.3f} | macro_f1(val)={val_metrics['macro_f1']:.3f} \n"
-                f"| precision_buy={val_metrics['precision_buy']:.3f} | recall_buy={val_metrics['recall_buy']:.3f} \n"
-                f"| precision_sell={val_metrics['precision_sell']:.3f} | recall_sell={val_metrics['recall_sell']:.3f} \n"
-                f"| precision_hold={val_metrics['precision_hold']:.3f} | recall_hold={val_metrics['recall_hold']:.3f}"
+        if no_improve_count >= early_stopping_patience:
+            stop_reason = (
+                f"early_stopping(patience = {early_stopping_patience}, "
+                f"min_delta = {early_stopping_min_delta})"
             )
-            if ep == 199:
-                print("\n Ending training ===========================================")
+            print(
+                f"\nEarly stopping at epoch {ep + 1}/{epochs} "
+                f"(best_epoch = {best_epoch}, best_macro_f1 = {best_macro_f1:.3f}, "
+                f"best_bal_acc = {best['val_bal_acc']:.3f})."
+            )
+            break
+
+        #if ep in {0, 49, 99, 149, 199} or ep == epochs - 1:
+        if ep == 0:
+            print("\nStarting training ===========================================")
+            """print(
+                f"\nepoch {ep + 1}/{epochs} \n| loss = {avg_loss:.4f} \n"
+                f"| acc(train) = {train_metrics['acc']:.3f}     | acc(val) = {val_metrics['acc']:.3f} \n"
+                f"| bal_acc(val) = {val_metrics['bal_acc']:.3f}   | macro_f1(val) = {val_metrics['macro_f1']:.3f} \n"
+                f"| precision_buy = {val_metrics['precision_buy']:.3f}  | recall_buy = {val_metrics['recall_buy']:.3f} \n"
+                f"| precision_sell = {val_metrics['precision_sell']:.3f} | recall_sell = {val_metrics['recall_sell']:.3f} \n"
+                f"| precision_hold = {val_metrics['precision_hold']:.3f} | recall_hold = {val_metrics['recall_hold']:.3f}"
+            )"""
+        print(
+                f"\nepoch {ep + 1}/{epochs} \n| loss = {avg_loss:.4f}          "
+                f"| acc(train) = {train_metrics['acc']:.3f}     | acc(val) = {val_metrics['acc']:.3f}       "
+                f"| bal_acc(val) = {val_metrics['bal_acc']:.3f}    | macro_f1(val) = {val_metrics['macro_f1']:.3f} \n"
+                f"| precision_buy = {val_metrics['precision_buy']:.3f}  | precision_sell = {val_metrics['precision_sell']:.3f} "
+                f"| precision_hold = {val_metrics['precision_hold']:.3f} \n| recall_buy = {val_metrics['recall_buy']:.3f}     "
+                f"| recall_sell = {val_metrics['recall_sell']:.3f}    | recall_hold = {val_metrics['recall_hold']:.3f}"
+            )
+        if ep == epochs - 1:
+            print("\nEnding training ===========================================")
+
+    if best is None:
+        raise RuntimeError("Aucun meilleur modele enregistre pendant l'entrainement.")
+    best["stop_reason"] = stop_reason
+    print(
+        "\nTraining stop \n| "
+        f"reason = {best['stop_reason']} | best_epoch = {best['best_epoch']} "
+        f"| best_macro_f1(val) = {best['best_macro_f1']:.3f} | best_bal_acc(val) = {best['val_bal_acc']:.3f}"
+    )
 
     _, _, _, test_probs = forward_pass(X_test, best["W0"], best["b0"], best["W1"], best["b1"])
     test_preds = predict_with_thresholds(test_probs, best["thresholds"][0], best["thresholds"][1])
@@ -711,16 +759,16 @@ def train_model(
     best["benchmark_comparison"] = benchmark_comparison
 
     print(
-        "\nFinal test | "
-        f"acc={test_metrics['acc']:.3f} | bal_acc={test_metrics['bal_acc']:.3f} "
-        f"| macro_f1={test_metrics['macro_f1']:.3f} \n"
-        f"| precision_buy={test_metrics['precision_buy']:.3f} | recall_buy={test_metrics['recall_buy']:.3f} \n"
-        f"| precision_sell={test_metrics['precision_sell']:.3f} | recall_sell={test_metrics['recall_sell']:.3f} \n"
-        f"| precision_hold={test_metrics['precision_hold']:.3f} | recall_hold={test_metrics['recall_hold']:.3f} \n"
-        f"| buy_threshold={best['thresholds'][0]:.2f} | sell_threshold={best['thresholds'][1]:.2f}"
+        "\nFinal test \n| "
+        f"acc = {test_metrics['acc']:.3f} | bal_acc = {test_metrics['bal_acc']:.3f} "
+        f"| macro_f1 = {test_metrics['macro_f1']:.3f} \n"
+        f"| precision_buy = {test_metrics['precision_buy']:.3f}  | recall_buy = {test_metrics['recall_buy']:.3f} \n"
+        f"| precision_sell = {test_metrics['precision_sell']:.3f} | recall_sell = {test_metrics['recall_sell']:.3f} \n"
+        f"| precision_hold = {test_metrics['precision_hold']:.3f} | recall_hold = {test_metrics['recall_hold']:.3f} \n"
+        f"| buy_threshold = {best['thresholds'][0]:.2f}   | sell_threshold = {best['thresholds'][1]:.2f}"
     )
     print(
-        "\nPnL test | "
+        "\nPnL test \n| "
         f"model={benchmark_comparison['model_pnl']:.2f} "
         f"| buy_hold={benchmark_comparison['buy_hold_pnl']:.2f} "
         f"| outperformance={benchmark_comparison['outperformance']:.2f} "
@@ -772,7 +820,7 @@ def plot_signals(df, window=160, price_col="adj_close"):
 
 
 df = read_parquet_dataset(DATA_DIR)
-Air_liquid = df[df["ticker"] == "AI.PA"].copy()
+Air_liquid = df[df["ticker"] == "CS.PA"].copy()
 
 #print(Air_liquid.head())
 #benchmark = compute_benchmark(Air_liquid, CAPITAL)
@@ -780,5 +828,5 @@ Air_liquid = df[df["ticker"] == "AI.PA"].copy()
 #plot_signals(df, window=60)
 
 df, label_stats = labelling(Air_liquid, 20)
-print(f"Label stats :{label_stats}")
+print(f"\nLabel stats :{label_stats}")
 model = train_model(df)
