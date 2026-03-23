@@ -990,19 +990,20 @@ def plot_signals(df, window=160, price_col="adj_close"):
     plt.legend()
     plt.tight_layout()
     plt.show()
+def main():
+    df = read_parquet_dataset(DATA_DIR)
+
+    # Pipeline multi-ticker CAC40
+    df = labelling_all(df, 20)
+    label_stats = (
+        df["Label"]
+        .value_counts()
+        .reindex(["Buy", "Hold", "Sell"], fill_value=0)
+        .to_dict()
+    )
+    print(f"\nLabel stats (multi-ticker): {label_stats}")
+    _ = train_model(df)
 
 
-
-
-df = read_parquet_dataset(DATA_DIR)
-
-# Pipeline multi-ticker CAC40
-df = labelling_all(df, 20)
-label_stats = (
-    df["Label"]
-    .value_counts()
-    .reindex(["Buy", "Hold", "Sell"], fill_value=0)
-    .to_dict()
-)
-print(f"\nLabel stats (multi-ticker): {label_stats}")
-model = train_model(df)
+if __name__ == "__main__":
+    main()
