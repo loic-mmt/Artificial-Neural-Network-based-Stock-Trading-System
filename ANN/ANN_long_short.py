@@ -809,6 +809,310 @@ def train_model(
     return best
 
 
+def train_one_trial(
+    train,
+    epochs=500,
+    alpha=1e-3,
+    hidden=32,
+    do_dropout=False,
+    dropout_percent=0.1,
+    batch_size=32,
+    train_ratio=0.7,
+    val_ratio=0.15,
+    context_len=20,
+    early_stopping_patience=50,
+    early_stopping_min_delta=1e-4,
+):
+    if batch_size <= 0:
+        raise ValueError("batch_size doit etre strictement positif.")
+    if not 0 <= dropout_percent < 1:
+        raise ValueError("dropout_percent doit etre dans [0, 1).")
+    if not isinstance(context_len, (int, np.integer)):
+        raise TypeError("context_len doit etre un entier.")
+    if context_len <= 0:
+        raise ValueError("context_len doit etre strictement positif.")
+    if not isinstance(early_stopping_patience, (int, np.integer)):
+        raise TypeError("early_stopping_patience doit etre un entier.")
+    if early_stopping_patience <= 0:
+        raise ValueError("early_stopping_patience doit etre strictement positif.")
+    if early_stopping_min_delta < 0:
+        raise ValueError("early_stopping_min_delta doit etre >= 0.")
+
+    feature_cols = [
+        "open_ret",
+        "high_ret",
+        "low_ret",
+        "close_ret",
+        "adj_close_ret",
+        "volume_ret",
+        "rsi",
+        "macd",
+        "williams",
+        "range_log",
+        "body_log",
+        "upper_wick_log",
+        "lower_wick_log",
+        "volume_relatif",
+        "volatility_10",
+    ]
+    train = compute_features(train)
+    train = train.dropna(subset=feature_cols + ["Label_id"]).sort_values("date").copy()
+
+    if train.empty:
+        raise ValueError("Aucune ligne exploitable apres calcul des features.")
+
+    train_df, val_df, test_df = chronological_train_val_test_split(
+        train,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+    )
+
+    X_train_raw, y_train = build_context_dataset(train_df, feature_cols, context_len)
+
+    # Build validation windows with train history as context
+    val_prefix_len = min(context_len - 1, len(train_df))
+    val_source = pd.concat([train_df.tail(val_prefix_len), val_df], ignore_index=True)
+    X_val_raw, y_val = build_context_dataset(
+        val_source,
+        feature_cols,
+        context_len,
+        target_start=val_prefix_len,
+    )
+
+    # Build test windows with train+val history as context
+    test_history = pd.concat([train_df, val_df], ignore_index=True)
+    test_prefix_len = min(context_len - 1, len(test_history))
+    test_source = pd.concat([test_history.tail(test_prefix_len), test_df], ignore_index=True)
+    X_test_raw, y_test, test_target_indices = build_context_dataset(
+        test_source,
+        feature_cols,
+        context_len,
+        target_start=test_prefix_len,
+        return_indices=True,
+    )
+
+    if len(X_train_raw) == 0:
+        raise ValueError("Aucun echantillon train apres fenetrage. Reduis context_len.")
+    if len(X_val_raw) == 0:
+        raise ValueError("Aucun echantillon validation apres fenetrage. Reduis context_len.")
+    if len(X_test_raw) == 0:
+        raise ValueError("Aucun echantillon test apres fenetrage. Reduis context_len.")
+
+    Y_train = one_hot(y_train, 3)
+    class_weights = compute_class_weights(y_train, num_classes=3)
+
+    X_train, feature_mean, feature_std = standardize_features(X_train_raw)
+    X_val, _, _ = standardize_features(
+        X_val_raw,
+        mean=feature_mean,
+        std=feature_std,
+    )
+    X_test, _, _ = standardize_features(
+        X_test_raw,
+        mean=feature_mean,
+        std=feature_std,
+    )
+
+    entry = X_train.shape[1]
+    if entry != context_len * len(feature_cols):
+        raise ValueError("Entry size miss-match.")
+    
+    W0 = 0.01 * np.random.randn(entry, hidden).astype(np.float32)
+    b0 = np.zeros((1, hidden), dtype=np.float32)
+    W1 = 0.01 * np.random.randn(hidden, 3).astype(np.float32)
+    b1 = np.zeros((1, 3), dtype=np.float32)
+
+    N = len(X_train)
+    best_macro_f1 = -1.0
+    best = None
+
+    print("\ntrain rows:", len(train_df), "| val rows:", len(val_df), "| test rows:", len(test_df))
+    print("X_train:", X_train.shape)
+    print("X_val:", X_val.shape)
+    print("X_test:", X_test.shape)
+    print("context_len:", context_len, "| feature_dim:", len(feature_cols))
+    print("W0:", W0.shape)
+    print("b0:", b0.shape)
+    print("W1:", W1.shape)
+    print("b1:", b1.shape)
+    print("class_weights:", class_weights)
+
+    no_improve_count = 0
+    best_epoch = 0
+    stop_reason = "max_epochs"
+
+    for ep in range(epochs):
+        perm = np.random.permutation(N)
+        Xp, Yp = X_train[perm], Y_train[perm]
+        epoch_loss = 0.0
+
+        for start in range(0, N, batch_size):
+            xb = Xp[start:start + batch_size]
+            yb = Yp[start:start + batch_size]
+            m = len(xb)
+
+            z1, a1, _, p = forward_pass(xb, W0, b0, W1, b1)
+
+            dropout_applied = False
+            if do_dropout and dropout_percent > 0:
+                m1 = dropout_mask(a1.shape, dropout_percent)
+                a1 *= m1
+                dropout_applied = True
+
+            logits = a1 @ W1 + b1
+            p = softmax(logits)
+            sample_weights = yb @ class_weights
+            weight_sum = sample_weights.sum()
+            batch_loss = -np.sum(yb * np.log(p + 1e-12) * class_weights[None, :]) / weight_sum
+            epoch_loss += batch_loss * m
+
+            dz2 = ((p - yb) * sample_weights[:, None]) / weight_sum
+            dW1 = a1.T @ dz2
+            db1 = dz2.sum(axis=0, keepdims=True)
+
+            da1 = dz2 @ W1.T
+            if dropout_applied:
+                da1 *= m1
+
+            dz1 = da1 * relu_derivative(z1)
+            dW0 = xb.T @ dz1
+            db0 = dz1.sum(axis=0, keepdims=True)
+
+            W1 -= alpha * dW1
+            b1 -= alpha * db1
+            W0 -= alpha * dW0
+            b0 -= alpha * db0
+
+        _, _, _, val_probs = forward_pass(X_val, W0, b0, W1, b1)
+        thresholds = threshold_gridsearch(val_probs, y_val)
+        val_preds = predict_with_thresholds(val_probs, thresholds[0], thresholds[1])
+        val_metrics = evaluate_predictions(y_val, val_preds)
+
+        _, _, _, train_probs = forward_pass(X_train, W0, b0, W1, b1)
+        train_preds = predict_with_thresholds(train_probs, thresholds[0], thresholds[1])
+        train_metrics = evaluate_predictions(y_train, train_preds)
+        avg_loss = epoch_loss / N
+
+        macro_improved = val_metrics["macro_f1"] > (best_macro_f1 + early_stopping_min_delta)
+        macro_tie = np.isclose(
+            val_metrics["macro_f1"],
+            best_macro_f1,
+            atol=early_stopping_min_delta,
+        )
+        bal_acc_improved = (
+            best is not None and val_metrics["bal_acc"] > best["val_bal_acc"] + 1e-12
+        )
+
+        if best is None or macro_improved or (macro_tie and bal_acc_improved):
+            best_macro_f1 = val_metrics["macro_f1"]
+            best = {
+                "W0": W0.copy(),
+                "b0": b0.copy(),
+                "W1": W1.copy(),
+                "b1": b1.copy(),
+                "feature_cols": feature_cols,
+                "feature_mean": feature_mean.copy(),
+                "feature_std": feature_std.copy(),
+                "train_ratio": train_ratio,
+                "val_ratio": val_ratio,
+                "thresholds": thresholds,
+                "train_metrics": train_metrics,
+                "val_metrics": val_metrics,
+                "val_y_true": y_val.copy(),
+                "val_y_pred": val_preds.copy(),
+                "val_bal_acc": val_metrics["bal_acc"],
+                "best_macro_f1": best_macro_f1,
+                "best_epoch": ep + 1,
+            }
+            best_epoch = ep + 1
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
+
+        if no_improve_count >= early_stopping_patience:
+            stop_reason = (
+                f"early_stopping(patience = {early_stopping_patience}, "
+                f"min_delta = {early_stopping_min_delta})"
+            )
+            print(
+                f"\nEarly stopping at epoch {ep + 1}/{epochs} "
+                f"(best_epoch = {best_epoch}, best_macro_f1 = {best_macro_f1:.3f}, "
+                f"best_bal_acc = {best['val_bal_acc']:.3f})."
+            )
+            break
+
+        #if ep in {0, 49, 99, 149, 199} or ep == epochs - 1:
+        if ep == 0:
+            print("\nStarting training ===========================================")
+            """print(
+                f"\nepoch {ep + 1}/{epochs} \n| loss = {avg_loss:.4f} \n"
+                f"| acc(train) = {train_metrics['acc']:.3f}     | acc(val) = {val_metrics['acc']:.3f} \n"
+                f"| bal_acc(val) = {val_metrics['bal_acc']:.3f}   | macro_f1(val) = {val_metrics['macro_f1']:.3f} \n"
+                f"| precision_buy = {val_metrics['precision_buy']:.3f}  | recall_buy = {val_metrics['recall_buy']:.3f} \n"
+                f"| precision_sell = {val_metrics['precision_sell']:.3f} | recall_sell = {val_metrics['recall_sell']:.3f} \n"
+                f"| precision_hold = {val_metrics['precision_hold']:.3f} | recall_hold = {val_metrics['recall_hold']:.3f}"
+            )"""
+        print(
+                f"\nepoch {ep + 1}/{epochs} \n| loss = {avg_loss:.4f}          "
+                f"| acc(train) = {train_metrics['acc']:.3f}     | acc(val) = {val_metrics['acc']:.3f}       "
+                f"| bal_acc(val) = {val_metrics['bal_acc']:.3f}    | macro_f1(val) = {val_metrics['macro_f1']:.3f} \n"
+                f"| precision_buy = {val_metrics['precision_buy']:.3f}  | precision_sell = {val_metrics['precision_sell']:.3f} "
+                f"| precision_hold = {val_metrics['precision_hold']:.3f} \n| recall_buy = {val_metrics['recall_buy']:.3f}     "
+                f"| recall_sell = {val_metrics['recall_sell']:.3f}    | recall_hold = {val_metrics['recall_hold']:.3f}"
+            )
+        if ep == epochs - 1:
+            print("\nEnding training ===========================================")
+
+    if best is None:
+        raise RuntimeError("Aucun meilleur modele enregistre pendant l'entrainement.")
+    best["stop_reason"] = stop_reason
+    print(
+        "\nTraining stop \n| "
+        f"reason = {best['stop_reason']} | best_epoch = {best['best_epoch']} "
+        f"| best_macro_f1(val) = {best['best_macro_f1']:.3f} | best_bal_acc(val) = {best['val_bal_acc']:.3f}"
+    )
+
+    _, _, _, test_probs = forward_pass(X_test, best["W0"], best["b0"], best["W1"], best["b1"])
+    test_preds = predict_with_thresholds(test_probs, best["thresholds"][0], best["thresholds"][1])
+    test_metrics = evaluate_predictions(y_test, test_preds)
+
+    aligned_test_frame = test_source.iloc[test_target_indices].reset_index(drop=True)
+    benchmark_comparison = evaluate_strategy_vs_buy_hold(
+        aligned_test_frame,
+        test_preds,
+        initial_capital=float(CAPITAL),
+        price_col="adj_close",
+    )
+
+    best["test_metrics"] = test_metrics
+    best["test_y_true"] = y_test.copy()
+    best["test_y_pred"] = test_preds.copy()
+    best["benchmark_comparison"] = benchmark_comparison
+
+    print(
+        "\nFinal test \n| "
+        f"acc = {test_metrics['acc']:.3f} | bal_acc = {test_metrics['bal_acc']:.3f} "
+        f"| macro_f1 = {test_metrics['macro_f1']:.3f} \n"
+        f"| precision_buy = {test_metrics['precision_buy']:.3f}  | recall_buy = {test_metrics['recall_buy']:.3f} \n"
+        f"| precision_sell = {test_metrics['precision_sell']:.3f} | recall_sell = {test_metrics['recall_sell']:.3f} \n"
+        f"| precision_hold = {test_metrics['precision_hold']:.3f} | recall_hold = {test_metrics['recall_hold']:.3f} \n"
+        f"| buy_threshold = {best['thresholds'][0]:.2f}   | sell_threshold = {best['thresholds'][1]:.2f}"
+    )
+    print(
+        "\nPnL test \n| "
+        f"model={benchmark_comparison['model_pnl']:.2f} "
+        f"| buy_hold={benchmark_comparison['buy_hold_pnl']:.2f} "
+        f"| outperformance={benchmark_comparison['outperformance']:.2f} "
+        f"| final_model={benchmark_comparison['model_final_capital']:.2f} "
+        f"| final_buy_hold={benchmark_comparison['buy_hold_final_capital']:.2f}\n"
+    )
+
+    #plot_confusion_matrix(best["test_y_true"], best["test_y_pred"])
+
+    return best, test_metrics, benchmark_comparison
+
+
+
 def plot_signals(df, window=160, price_col="adj_close"):
     plot_df = df.sort_values("date").tail(window).copy()
 
@@ -845,19 +1149,82 @@ def plot_signals(df, window=160, price_col="adj_close"):
     plt.show()
 
 
+from itertools import product
+
+def model_grid_search(train_df, fee):
+    grid = {
+        "alpha": [1e-3, 1e-4],
+        "hidden": [16, 32, 64],
+        "do_dropout": [False, True],
+        "dropout_percent": [0.1],
+        "batch_size": [32, 64],
+        "context_len": [10, 20],
+        "window": [10, 20, 30],
+    }
+
+    keys = list(grid.keys())
+    combos = list(product(*(grid[k] for k in keys)))
+
+    best_score = -np.inf
+    best_params = None
+    best_metrics = None
+    rows = []
+
+    for vals in combos:
+        hp = dict(zip(keys, vals))
+
+        # labels avec la window du trial
+        df_labeled, label_stats = labelling(train_df.copy(), hp["window"])
+
+        model, metrics, benchmark = train_one_trial(
+            df_labeled,
+            alpha=hp["alpha"],
+            hidden=hp["hidden"],
+            do_dropout=hp["do_dropout"],
+            dropout_percent=hp["dropout_percent"],
+            batch_size=hp["batch_size"],
+            context_len=hp["context_len"],
+        )
+
+        # score scalaire (important)
+        score = float(benchmark["outperformance"])
+
+        row = {
+            **hp,
+            "score": score,
+            "macro_f1": float(metrics["macro_f1"]),
+            "model_pnl": float(benchmark["model_pnl"]),
+            "buy_hold_pnl": float(benchmark["buy_hold_pnl"]),
+            "outperformance": float(benchmark["outperformance"]),
+            "label_buy": int(label_stats["Buy"]),
+            "label_hold": int(label_stats["Hold"]),
+            "label_sell": int(label_stats["Sell"]),
+        }
+        rows.append(row)
+
+        if score > best_score:
+            best_score = score
+            best_params = hp.copy()
+            best_metrics = row.copy()
+
+    results_df = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+    return best_params, best_metrics, results_df
+
 
 def main():
+    #df = read_parquet_dataset(DATA_DIR)
+    #df = df[df["ticker"] == "EN.PA"].copy()
+    #df, label_stats = labelling(df, 20)
+    #print(f"\nLabel stats :{label_stats}")
+    #model = train_model(df)
+
     df = read_parquet_dataset(DATA_DIR)
-    Air_liquid = df[df["ticker"] == "EN.PA"].copy()
+    df = df[df["ticker"] == "EN.PA"].copy()
+    best_params, best_metrics, results_df = model_grid_search(df, fee=2.0)
+    print(best_params)
+    print(best_metrics)
+    print(results_df.head(20))
 
-    #print(Air_liquid.head())
-    #benchmark = compute_benchmark(Air_liquid, CAPITAL)
-    #print(f"Capital: {CAPITAL} | Benchark : {round(benchmark, 2)}")
-    #plot_signals(df, window=60)
-
-    df, label_stats = labelling(Air_liquid, 20)
-    print(f"\nLabel stats :{label_stats}")
-    model = train_model(df)
 
 if __name__ == "__main__":
     main()

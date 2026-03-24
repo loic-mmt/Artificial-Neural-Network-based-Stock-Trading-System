@@ -568,7 +568,7 @@ def build_context_dataset_with_history(
 
 
 def signals_to_positions(pred_labels):
-    """Convert class predictions to a long/flat position stream."""
+    """Convert class predictions to a short/flat/long position stream."""
     positions = []
     current_position = 0.0
 
@@ -576,31 +576,48 @@ def signals_to_positions(pred_labels):
         if label == 2:  # Buy
             current_position = 1.0
         elif label == 0:  # Sell
-            current_position = 0.0
+            current_position = -1.0
         # Hold keeps previous position
         positions.append(current_position)
 
     return np.asarray(positions, dtype=np.float64)
 
 
-def evaluate_strategy_vs_buy_hold(test_frame, pred_labels, initial_capital=10_000.0, price_col="adj_close"):
+def evaluate_strategy_vs_buy_hold(test_frame, pred_labels, initial_capital=10_000.0, price_col="adj_close", fee_per_trade=1.0):
     """Compute test-period PnL of model signals versus buy-and-hold."""
     if len(test_frame) != len(pred_labels):
         raise ValueError("Mismatch entre nombre de predictions et lignes test.")
     if len(test_frame) < 2:
         raise ValueError("Le set test doit contenir au moins 2 lignes pour calculer un PnL.")
 
-    def _single_curve(frame, labels, capital):
-        prices = frame[price_col].to_numpy(dtype=np.float64)
+    def _single_curve(test_frame, pred_labels, capital):
+        prices = test_frame[price_col].to_numpy(dtype=np.float64)
         forward_returns = np.zeros(len(prices), dtype=np.float64)
         forward_returns[:-1] = (prices[1:] / prices[:-1]) - 1.0
 
-        positions = signals_to_positions(labels)
-        strategy_returns = positions * forward_returns
+        target_positions = signals_to_positions(pred_labels)
+        executed_positions = np.zeros_like(target_positions)
+        executed_positions[1:] = target_positions[:-1]  # signal t applique des t+1
 
-        model_curve = capital * np.cumprod(1.0 + strategy_returns)
-        buy_hold_curve = capital * np.cumprod(1.0 + forward_returns)
-        return float(model_curve[-1]), float(buy_hold_curve[-1])
+        prev_positions = np.zeros_like(executed_positions)
+        prev_positions[1:] = executed_positions[:-1]
+        turnover = np.abs(executed_positions - prev_positions)  # 0, 1 ou 2
+
+        strategy_returns = executed_positions * forward_returns
+        model_curve = np.empty(len(prices), dtype=np.float64)
+        capital = float(initial_capital)
+        for i in range(len(prices)):
+            capital *= (1.0 + strategy_returns[i])
+            capital -= float(fee_per_trade) * turnover[i]
+            if capital < 0:
+                capital = 0.0
+            model_curve[i] = capital
+
+        buy_hold_curve = initial_capital * np.cumprod(1.0 + forward_returns)
+
+        model_final = float(model_curve[-1])
+        buy_hold_final = float(buy_hold_curve[-1])
+        return model_final, buy_hold_final
 
     if "ticker" not in test_frame.columns:
         model_final, buy_hold_final = _single_curve(test_frame, pred_labels, float(initial_capital))
@@ -994,7 +1011,7 @@ def main():
     df = read_parquet_dataset(DATA_DIR)
 
     # Pipeline multi-ticker CAC40
-    df = labelling_all(df, 60)
+    df = labelling_all(df, 10)
     label_stats = (
         df["Label"]
         .value_counts()
