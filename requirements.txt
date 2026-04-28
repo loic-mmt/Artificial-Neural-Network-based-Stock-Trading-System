@@ -1,0 +1,16 @@
+# Core dependencies (data download + ANN scripts)
+numpy
+pandas
+pyarrow
+matplotlib
+TA-Lib
+yfinance
+
+# Backtest/reporting dependencies
+plotly
+ccxt
+scipy
+statsmodels
+hmmlearn
+scikit-learn
+ipython

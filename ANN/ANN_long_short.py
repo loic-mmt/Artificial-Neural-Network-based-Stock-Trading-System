@@ -6,6 +6,11 @@ import pyarrow.dataset as ds
 import talib
 import matplotlib.pyplot as plt
 
+try:
+    from ANN.features import features, compute_market_features
+except ModuleNotFoundError:
+    from features import features, compute_market_features
+
 
 DATA_DIR = "ANN/datasets/cac40_daily.parquet"
 CAPITAL = 10_000
@@ -448,6 +453,108 @@ def signals_to_positions(pred_labels):
     return np.asarray(positions, dtype=np.float64)
 
 
+def pred_labels_to_target_positions(pred_labels):
+    """Map ANN class predictions (0/1/2) to persistent target positions (-1/0/1).
+
+    Mapping:
+    - 2 (Buy)  -> +1
+    - 0 (Sell) -> -1
+    - 1 (Hold) -> keep previous position
+    """
+    positions = []
+    current_position = 0
+
+    for label in np.asarray(pred_labels, dtype=np.int64):
+        if label == 2:
+            current_position = 1
+        elif label == 0:
+            current_position = -1
+        elif label == 1:
+            pass
+        else:
+            raise ValueError(f"Label de prediction inconnu: {label} (attendu: 0,1,2).")
+        positions.append(current_position)
+
+    return np.asarray(positions, dtype=np.int8)
+
+
+def target_positions_to_actions(target_positions):
+    """Derive buy/sell/hold actions from target positions transitions."""
+    target = pd.Series(np.asarray(target_positions, dtype=np.int64)).clip(-1, 1)
+    delta = target.diff().fillna(target)
+    actions = np.where(delta > 0, "buy", np.where(delta < 0, "sell", "hold"))
+    return np.asarray(actions, dtype=object)
+
+
+def _coerce_utc_datetime_index(frame, date_col="date"):
+    if isinstance(frame.index, pd.DatetimeIndex):
+        idx = pd.DatetimeIndex(pd.to_datetime(frame.index, utc=True, errors="coerce"))
+    elif date_col in frame.columns:
+        idx = pd.DatetimeIndex(pd.to_datetime(frame[date_col], utc=True, errors="coerce"))
+    else:
+        raise ValueError(
+            f"Impossible de construire l'index datetime: index non datetime et colonne '{date_col}' absente."
+        )
+
+    if idx.isna().any():
+        raise ValueError("Des timestamps invalides ont ete detectes dans le frame de backtest.")
+    if idx.has_duplicates:
+        raise ValueError("Index datetime du backtest non unique.")
+
+    out = frame.copy()
+    out.index = idx
+    return out.sort_index()
+
+
+def prepare_advanced_backtest_inputs(test_frame, pred_labels, date_col="date"):
+    """Build market + labels payload compatible with backtest_lib.run_backtest_from_labels."""
+    if len(test_frame) != len(pred_labels):
+        raise ValueError("Mismatch entre nombre de lignes du frame test et nombre de predictions.")
+
+    market = _coerce_utc_datetime_index(test_frame.copy(), date_col=date_col)
+
+    if "close" not in market.columns and "adj_close" in market.columns:
+        market["close"] = market["adj_close"]
+    if "close" not in market.columns:
+        raise ValueError("Le frame de backtest doit contenir 'close' ou 'adj_close'.")
+
+    close = pd.to_numeric(market["close"], errors="coerce").astype(float)
+    if close.isna().any():
+        raise ValueError("Colonne close contient des valeurs non numeriques ou NaN.")
+
+    if "open" not in market.columns:
+        market["open"] = close
+    else:
+        market["open"] = pd.to_numeric(market["open"], errors="coerce").astype(float)
+    if "high" not in market.columns:
+        market["high"] = pd.concat([market["open"], close], axis=1).max(axis=1)
+    else:
+        market["high"] = pd.to_numeric(market["high"], errors="coerce").astype(float)
+    if "low" not in market.columns:
+        market["low"] = pd.concat([market["open"], close], axis=1).min(axis=1)
+    else:
+        market["low"] = pd.to_numeric(market["low"], errors="coerce").astype(float)
+    if "volume" not in market.columns:
+        market["volume"] = 0.0
+    else:
+        market["volume"] = pd.to_numeric(market["volume"], errors="coerce").fillna(0.0).astype(float)
+
+    market = market.sort_index()
+    target_positions = pred_labels_to_target_positions(pred_labels)
+    actions = target_positions_to_actions(target_positions)
+
+    labels_df = pd.DataFrame(
+        {
+            "target_position": target_positions.astype(np.int8),
+            "action": actions,
+            "model_label_id": np.asarray(pred_labels, dtype=np.int64),
+        },
+        index=market.index,
+    )
+
+    return market, labels_df
+
+
 def evaluate_strategy_vs_buy_hold(
     test_frame,
     pred_labels,
@@ -773,18 +880,26 @@ def train_model(
     test_preds = predict_with_thresholds(test_probs, best["thresholds"][0], best["thresholds"][1])
     test_metrics = evaluate_predictions(y_test, test_preds)
 
-    aligned_test_frame = test_source.iloc[test_target_indices].reset_index(drop=True)
+    aligned_test_frame = test_source.iloc[test_target_indices].copy()
     benchmark_comparison = evaluate_strategy_vs_buy_hold(
         aligned_test_frame,
         test_preds,
         initial_capital=float(CAPITAL),
         price_col="adj_close",
     )
+    advanced_market_df, advanced_labels_df = prepare_advanced_backtest_inputs(
+        aligned_test_frame,
+        test_preds,
+        date_col="date",
+    )
 
     best["test_metrics"] = test_metrics
     best["test_y_true"] = y_test.copy()
     best["test_y_pred"] = test_preds.copy()
     best["benchmark_comparison"] = benchmark_comparison
+    best["test_aligned_frame"] = aligned_test_frame.copy()
+    best["advanced_backtest_market"] = advanced_market_df
+    best["advanced_backtest_labels"] = advanced_labels_df
 
     print(
         "\nFinal test \n| "
@@ -855,8 +970,10 @@ def train_one_trial(
         "volume_relatif",
         "volatility_10",
     ]
-    train = compute_features(train)
-    train = train.dropna(subset=feature_cols + ["Label_id"]).sort_values("date").copy()
+    #train = compute_features(train)
+    #train = train.dropna(subset=feature_cols + ["Label_id"]).sort_values("date").copy()
+    train = compute_market_features(train)
+    train = train.dropna(subset=features + ["Label_id"]).sort_values("date").copy()
 
     if train.empty:
         raise ValueError("Aucune ligne exploitable apres calcul des features.")
@@ -867,14 +984,14 @@ def train_one_trial(
         val_ratio=val_ratio,
     )
 
-    X_train_raw, y_train = build_context_dataset(train_df, feature_cols, context_len)
+    X_train_raw, y_train = build_context_dataset(train_df, features, context_len)
 
     # Build validation windows with train history as context
     val_prefix_len = min(context_len - 1, len(train_df))
     val_source = pd.concat([train_df.tail(val_prefix_len), val_df], ignore_index=True)
     X_val_raw, y_val = build_context_dataset(
         val_source,
-        feature_cols,
+        features,
         context_len,
         target_start=val_prefix_len,
     )
@@ -885,7 +1002,7 @@ def train_one_trial(
     test_source = pd.concat([test_history.tail(test_prefix_len), test_df], ignore_index=True)
     X_test_raw, y_test, test_target_indices = build_context_dataset(
         test_source,
-        feature_cols,
+        features,
         context_len,
         target_start=test_prefix_len,
         return_indices=True,
@@ -914,7 +1031,7 @@ def train_one_trial(
     )
 
     entry = X_train.shape[1]
-    if entry != context_len * len(feature_cols):
+    if entry != context_len * len(features):
         raise ValueError("Entry size miss-match.")
     
     W0 = 0.01 * np.random.randn(entry, hidden).astype(np.float32)
@@ -930,7 +1047,7 @@ def train_one_trial(
     print("X_train:", X_train.shape)
     print("X_val:", X_val.shape)
     print("X_test:", X_test.shape)
-    print("context_len:", context_len, "| feature_dim:", len(feature_cols))
+    print("context_len:", context_len, "| feature_dim:", len(features))
     print("W0:", W0.shape)
     print("b0:", b0.shape)
     print("W1:", W1.shape)
@@ -1010,7 +1127,7 @@ def train_one_trial(
                 "b0": b0.copy(),
                 "W1": W1.copy(),
                 "b1": b1.copy(),
-                "feature_cols": feature_cols,
+                "features": features,
                 "feature_mean": feature_mean.copy(),
                 "feature_std": feature_std.copy(),
                 "train_ratio": train_ratio,
@@ -1076,18 +1193,26 @@ def train_one_trial(
     test_preds = predict_with_thresholds(test_probs, best["thresholds"][0], best["thresholds"][1])
     test_metrics = evaluate_predictions(y_test, test_preds)
 
-    aligned_test_frame = test_source.iloc[test_target_indices].reset_index(drop=True)
+    aligned_test_frame = test_source.iloc[test_target_indices].copy()
     benchmark_comparison = evaluate_strategy_vs_buy_hold(
         aligned_test_frame,
         test_preds,
         initial_capital=float(CAPITAL),
         price_col="adj_close",
     )
+    advanced_market_df, advanced_labels_df = prepare_advanced_backtest_inputs(
+        aligned_test_frame,
+        test_preds,
+        date_col="date",
+    )
 
     best["test_metrics"] = test_metrics
     best["test_y_true"] = y_test.copy()
     best["test_y_pred"] = test_preds.copy()
     best["benchmark_comparison"] = benchmark_comparison
+    best["test_aligned_frame"] = aligned_test_frame.copy()
+    best["advanced_backtest_market"] = advanced_market_df
+    best["advanced_backtest_labels"] = advanced_labels_df
 
     print(
         "\nFinal test \n| "
@@ -1212,18 +1337,18 @@ def model_grid_search(train_df, fee):
 
 
 def main():
-    #df = read_parquet_dataset(DATA_DIR)
-    #df = df[df["ticker"] == "EN.PA"].copy()
-    #df, label_stats = labelling(df, 20)
-    #print(f"\nLabel stats :{label_stats}")
-    #model = train_model(df)
-
     df = read_parquet_dataset(DATA_DIR)
     df = df[df["ticker"] == "EN.PA"].copy()
-    best_params, best_metrics, results_df = model_grid_search(df, fee=2.0)
-    print(best_params)
-    print(best_metrics)
-    print(results_df.head(20))
+    df, label_stats = labelling(df, 30)
+    print(f"\nLabel stats :{label_stats}")
+    model = train_model(df)
+
+    #df = read_parquet_dataset(DATA_DIR)
+    #df = df[df["ticker"] == "EN.PA"].copy()
+    #best_params, best_metrics, results_df = model_grid_search(df, fee=2.0)
+    #print(best_params)
+    #print(best_metrics)
+    #print(results_df.head(20))
 
 
 if __name__ == "__main__":

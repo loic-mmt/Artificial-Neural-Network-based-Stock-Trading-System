@@ -1,3 +1,4 @@
+from pathlib import Path
 import numpy as np
 import pandas as pd
 
@@ -8,7 +9,7 @@ from ANN import (
     enforce_alternating_signals,
     compute_returns)
 
-DATA_DIR = "ANN/datasets/cac40_daily.parquet"
+DATA_DIR = Path(__file__).resolve().parent / "datasets" / "cac40_daily.parquet"
 
 df = read_parquet_dataset(DATA_DIR)
 df = df[df["ticker"] == "EN.PA"].copy()

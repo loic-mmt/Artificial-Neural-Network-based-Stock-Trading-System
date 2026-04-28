@@ -7,6 +7,12 @@ import talib
 import matplotlib.pyplot as plt
 
 
+try:
+    from ANN.features import features, compute_market_features
+except ModuleNotFoundError:
+    from features import features, compute_market_features
+
+
 DATA_DIR = "ANN/datasets/cac40_daily.parquet"
 CAPITAL = 10_000
 np.random.seed(1)
@@ -956,6 +962,306 @@ def train_model(
     return best
 
 
+def train_model_features(
+    train,
+    epochs=500,
+    alpha=1e-3,
+    hidden=32,
+    do_dropout=False,
+    dropout_percent=0.1,
+    batch_size=32,
+    train_ratio=0.7,
+    val_ratio=0.15,
+    context_len=20,
+    early_stopping_patience=50,
+    early_stopping_min_delta=1e-4,
+):
+    if batch_size <= 0:
+        raise ValueError("batch_size doit etre strictement positif.")
+    if not 0 <= dropout_percent < 1:
+        raise ValueError("dropout_percent doit etre dans [0, 1).")
+    if not isinstance(context_len, (int, np.integer)):
+        raise TypeError("context_len doit etre un entier.")
+    if context_len <= 0:
+        raise ValueError("context_len doit etre strictement positif.")
+    if not isinstance(early_stopping_patience, (int, np.integer)):
+        raise TypeError("early_stopping_patience doit etre un entier.")
+    if early_stopping_patience <= 0:
+        raise ValueError("early_stopping_patience doit etre strictement positif.")
+    if early_stopping_min_delta < 0:
+        raise ValueError("early_stopping_min_delta doit etre >= 0.")
+
+    feature_cols = [
+        "open_ret",
+        "high_ret",
+        "low_ret",
+        "close_ret",
+        "adj_close_ret",
+        "volume_ret",
+        "rsi",
+        "macd",
+        "williams",
+        "range_log",
+        "body_log",
+        "upper_wick_log",
+        "lower_wick_log",
+        "volume_relatif",
+        "volatility_10",
+    ]
+    train = compute_market_features(train)
+    sort_cols = ["ticker", "date"] if "ticker" in train.columns else ["date"]
+    train = train.dropna(subset=features + ["Label_id"]).sort_values(sort_cols).copy()
+
+    if train.empty:
+        raise ValueError("Aucune ligne exploitable apres calcul des features.")
+
+    train_df, val_df, test_df = chronological_train_val_test_split(
+        train,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+    )
+
+    X_train_raw, y_train = build_context_dataset_with_history(
+        train_df,
+        features,
+        context_len,
+        history_df=None,
+    )
+    X_val_raw, y_val = build_context_dataset_with_history(
+        val_df,
+        features,
+        context_len,
+        history_df=train_df,
+    )
+    test_history = pd.concat([train_df, val_df], ignore_index=True)
+    X_test_raw, y_test, aligned_test_frame = build_context_dataset_with_history(
+        test_df,
+        features,
+        context_len,
+        history_df=test_history,
+        return_aligned_rows=True,
+    )
+
+    if len(X_train_raw) == 0:
+        raise ValueError("Aucun echantillon train apres fenetrage. Reduis context_len.")
+    if len(X_val_raw) == 0:
+        raise ValueError("Aucun echantillon validation apres fenetrage. Reduis context_len.")
+    if len(X_test_raw) == 0:
+        raise ValueError("Aucun echantillon test apres fenetrage. Reduis context_len.")
+
+    Y_train = one_hot(y_train, 3)
+    class_weights = compute_class_weights(y_train, num_classes=3)
+
+    X_train, feature_mean, feature_std = standardize_features(X_train_raw)
+    X_val, _, _ = standardize_features(
+        X_val_raw,
+        mean=feature_mean,
+        std=feature_std,
+    )
+    X_test, _, _ = standardize_features(
+        X_test_raw,
+        mean=feature_mean,
+        std=feature_std,
+    )
+
+    entry = X_train.shape[1]
+    if entry != context_len * len(features):
+        raise ValueError("Entry size miss-match.")
+    
+    W0 = 0.01 * np.random.randn(entry, hidden).astype(np.float32)
+    b0 = np.zeros((1, hidden), dtype=np.float32)
+    W1 = 0.01 * np.random.randn(hidden, 3).astype(np.float32)
+    b1 = np.zeros((1, 3), dtype=np.float32)
+
+    N = len(X_train)
+    best_macro_f1 = -1.0
+    best = None
+
+    print("\ntrain rows:", len(train_df), "| val rows:", len(val_df), "| test rows:", len(test_df))
+    print("X_train:", X_train.shape)
+    print("X_val:", X_val.shape)
+    print("X_test:", X_test.shape)
+    print("context_len:", context_len, "| feature_dim:", len(features))
+    print("W0:", W0.shape)
+    print("b0:", b0.shape)
+    print("W1:", W1.shape)
+    print("b1:", b1.shape)
+    print("class_weights:", class_weights)
+
+    no_improve_count = 0
+    best_epoch = 0
+    stop_reason = "max_epochs"
+
+    for ep in range(epochs):
+        perm = np.random.permutation(N)
+        Xp, Yp = X_train[perm], Y_train[perm]
+        epoch_loss = 0.0
+
+        for start in range(0, N, batch_size):
+            xb = Xp[start:start + batch_size]
+            yb = Yp[start:start + batch_size]
+            m = len(xb)
+
+            z1, a1, _, p = forward_pass(xb, W0, b0, W1, b1)
+
+            dropout_applied = False
+            if do_dropout and dropout_percent > 0:
+                m1 = dropout_mask(a1.shape, dropout_percent)
+                a1 *= m1
+                dropout_applied = True
+
+            logits = a1 @ W1 + b1
+            p = softmax(logits)
+            sample_weights = yb @ class_weights
+            weight_sum = sample_weights.sum()
+            batch_loss = -np.sum(yb * np.log(p + 1e-12) * class_weights[None, :]) / weight_sum
+            epoch_loss += batch_loss * m
+
+            dz2 = ((p - yb) * sample_weights[:, None]) / weight_sum
+            dW1 = a1.T @ dz2
+            db1 = dz2.sum(axis=0, keepdims=True)
+
+            da1 = dz2 @ W1.T
+            if dropout_applied:
+                da1 *= m1
+
+            dz1 = da1 * relu_derivative(z1)
+            dW0 = xb.T @ dz1
+            db0 = dz1.sum(axis=0, keepdims=True)
+
+            W1 -= alpha * dW1
+            b1 -= alpha * db1
+            W0 -= alpha * dW0
+            b0 -= alpha * db0
+
+        _, _, _, val_probs = forward_pass(X_val, W0, b0, W1, b1)
+        thresholds = threshold_gridsearch(val_probs, y_val)
+        val_preds = predict_with_thresholds(val_probs, thresholds[0], thresholds[1])
+        val_metrics = evaluate_predictions(y_val, val_preds)
+
+        _, _, _, train_probs = forward_pass(X_train, W0, b0, W1, b1)
+        train_preds = predict_with_thresholds(train_probs, thresholds[0], thresholds[1])
+        train_metrics = evaluate_predictions(y_train, train_preds)
+        avg_loss = epoch_loss / N
+
+        macro_improved = val_metrics["macro_f1"] > (best_macro_f1 + early_stopping_min_delta)
+        macro_tie = np.isclose(
+            val_metrics["macro_f1"],
+            best_macro_f1,
+            atol=early_stopping_min_delta,
+        )
+        bal_acc_improved = (
+            best is not None and val_metrics["bal_acc"] > best["val_bal_acc"] + 1e-12
+        )
+
+        if best is None or macro_improved or (macro_tie and bal_acc_improved):
+            best_macro_f1 = val_metrics["macro_f1"]
+            best = {
+                "W0": W0.copy(),
+                "b0": b0.copy(),
+                "W1": W1.copy(),
+                "b1": b1.copy(),
+                "features": features,
+                "feature_mean": feature_mean.copy(),
+                "feature_std": feature_std.copy(),
+                "train_ratio": train_ratio,
+                "val_ratio": val_ratio,
+                "thresholds": thresholds,
+                "train_metrics": train_metrics,
+                "val_metrics": val_metrics,
+                "val_y_true": y_val.copy(),
+                "val_y_pred": val_preds.copy(),
+                "val_bal_acc": val_metrics["bal_acc"],
+                "best_macro_f1": best_macro_f1,
+                "best_epoch": ep + 1,
+            }
+            best_epoch = ep + 1
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
+
+        if no_improve_count >= early_stopping_patience:
+            stop_reason = (
+                f"early_stopping(patience = {early_stopping_patience}, "
+                f"min_delta = {early_stopping_min_delta})"
+            )
+            print(
+                f"\nEarly stopping at epoch {ep + 1}/{epochs} "
+                f"(best_epoch = {best_epoch}, best_macro_f1 = {best_macro_f1:.3f}, "
+                f"best_bal_acc = {best['val_bal_acc']:.3f})."
+            )
+            break
+
+        #if ep in {0, 49, 99, 149, 199} or ep == epochs - 1:
+        if ep == 0:
+            print("\nStarting training ===========================================")
+            """print(
+                f"\nepoch {ep + 1}/{epochs} \n| loss = {avg_loss:.4f} \n"
+                f"| acc(train) = {train_metrics['acc']:.3f}     | acc(val) = {val_metrics['acc']:.3f} \n"
+                f"| bal_acc(val) = {val_metrics['bal_acc']:.3f}   | macro_f1(val) = {val_metrics['macro_f1']:.3f} \n"
+                f"| precision_buy = {val_metrics['precision_buy']:.3f}  | recall_buy = {val_metrics['recall_buy']:.3f} \n"
+                f"| precision_sell = {val_metrics['precision_sell']:.3f} | recall_sell = {val_metrics['recall_sell']:.3f} \n"
+                f"| precision_hold = {val_metrics['precision_hold']:.3f} | recall_hold = {val_metrics['recall_hold']:.3f}"
+            )"""
+        print(
+                f"\nepoch {ep + 1}/{epochs} \n| loss = {avg_loss:.4f}          "
+                f"| acc(train) = {train_metrics['acc']:.3f}     | acc(val) = {val_metrics['acc']:.3f}       "
+                f"| bal_acc(val) = {val_metrics['bal_acc']:.3f}    | macro_f1(val) = {val_metrics['macro_f1']:.3f} \n"
+                f"| precision_buy = {val_metrics['precision_buy']:.3f}  | precision_sell = {val_metrics['precision_sell']:.3f} "
+                f"| precision_hold = {val_metrics['precision_hold']:.3f} \n| recall_buy = {val_metrics['recall_buy']:.3f}     "
+                f"| recall_sell = {val_metrics['recall_sell']:.3f}    | recall_hold = {val_metrics['recall_hold']:.3f}"
+            )
+        if ep == epochs - 1:
+            print("\nEnding training ===========================================")
+
+    if best is None:
+        raise RuntimeError("Aucun meilleur modele enregistre pendant l'entrainement.")
+    best["stop_reason"] = stop_reason
+    print(
+        "\nTraining stop \n| "
+        f"reason = {best['stop_reason']} | best_epoch = {best['best_epoch']} "
+        f"| best_macro_f1(val) = {best['best_macro_f1']:.3f} | best_bal_acc(val) = {best['val_bal_acc']:.3f}"
+    )
+
+    _, _, _, test_probs = forward_pass(X_test, best["W0"], best["b0"], best["W1"], best["b1"])
+    test_preds = predict_with_thresholds(test_probs, best["thresholds"][0], best["thresholds"][1])
+    test_metrics = evaluate_predictions(y_test, test_preds)
+
+    benchmark_comparison = evaluate_strategy_vs_buy_hold(
+        aligned_test_frame,
+        test_preds,
+        initial_capital=float(CAPITAL),
+        price_col="adj_close",
+    )
+
+    best["test_metrics"] = test_metrics
+    best["test_y_true"] = y_test.copy()
+    best["test_y_pred"] = test_preds.copy()
+    best["benchmark_comparison"] = benchmark_comparison
+
+    print(
+        "\nFinal test \n| "
+        f"acc = {test_metrics['acc']:.3f} | bal_acc = {test_metrics['bal_acc']:.3f} "
+        f"| macro_f1 = {test_metrics['macro_f1']:.3f} \n"
+        f"| precision_buy = {test_metrics['precision_buy']:.3f}  | recall_buy = {test_metrics['recall_buy']:.3f} \n"
+        f"| precision_sell = {test_metrics['precision_sell']:.3f} | recall_sell = {test_metrics['recall_sell']:.3f} \n"
+        f"| precision_hold = {test_metrics['precision_hold']:.3f} | recall_hold = {test_metrics['recall_hold']:.3f} \n"
+        f"| buy_threshold = {best['thresholds'][0]:.2f}   | sell_threshold = {best['thresholds'][1]:.2f}"
+    )
+    print(
+        "\nPnL test \n| "
+        f"model={benchmark_comparison['model_pnl']:.2f} "
+        f"| buy_hold={benchmark_comparison['buy_hold_pnl']:.2f} "
+        f"| outperformance={benchmark_comparison['outperformance']:.2f} "
+        f"| final_model={benchmark_comparison['model_final_capital']:.2f} "
+        f"| final_buy_hold={benchmark_comparison['buy_hold_final_capital']:.2f}\n"
+    )
+
+    plot_confusion_matrix(best["test_y_true"], best["test_y_pred"])
+
+    return best
+
+
 def plot_signals(df, window=160, price_col="adj_close"):
     plot_df = df.sort_values("date").tail(window).copy()
 
@@ -990,11 +1296,13 @@ def plot_signals(df, window=160, price_col="adj_close"):
     plt.legend()
     plt.tight_layout()
     plt.show()
+
+
 def main():
     df = read_parquet_dataset(DATA_DIR)
 
     # Pipeline multi-ticker CAC40
-    df = labelling_all(df, 60)
+    df = labelling_all(df, 30)
     label_stats = (
         df["Label"]
         .value_counts()
