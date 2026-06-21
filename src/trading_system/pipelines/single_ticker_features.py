@@ -6,9 +6,21 @@ import pyarrow.dataset as ds
 import talib
 import matplotlib.pyplot as plt
 
+from trading_system.features.market import compute_market_features, features
+from trading_system.labels.oracle_dp import build_oracle_labels_train_only
+from trading_system.paths import default_market_dataset_path, default_oracle_labels_path
 
-DATA_DIR = "ANN/datasets/cac40_daily.parquet"
+    
+DATA_DIR = default_market_dataset_path()
 CAPITAL = 10_000
+TICKER = "EN.PA"
+PRICE_COL = "adj_close"
+LABEL_WINDOW = 30
+TRAIN_RATIO = 0.70
+VAL_RATIO = 0.15
+ORACLE_LABEL_MODE = "all"  # "none" | "train_only" | "all"
+ORACLE_FEE_PER_TRADE = 2.0
+ORACLE_TRAIN_CSV = default_oracle_labels_path()
 np.random.seed(1)
 
 def read_parquet_dataset(
@@ -234,6 +246,91 @@ def labelling_all(df, window, price_col="adj_close"):
         return pd.concat(parts).sort_index()
     
     return _one_ticker(df)
+
+
+def merge_oracle_labels_on_train_only(
+    labeled_df: pd.DataFrame,
+    oracle_csv_path: Path,
+    train_ratio: float,
+    val_ratio: float,
+) -> pd.DataFrame:
+    """Replace Label/Label_id on train split with oracle labels, keep val/test unchanged."""
+    work = labeled_df.sort_values("date").reset_index(drop=True).copy()
+    train_df, val_df, test_df = chronological_train_val_test_split(
+        work, train_ratio=train_ratio, val_ratio=val_ratio
+    )
+
+    oracle_path = Path(oracle_csv_path)
+    if not oracle_path.exists():
+        print(f"[warn] oracle csv introuvable: {oracle_path}. Fallback labels standards.")
+        return work
+
+    oracle = pd.read_csv(oracle_path)
+    required = {"date", "Label_id"}
+    missing = required - set(oracle.columns)
+    if missing:
+        raise ValueError(f"Colonnes manquantes dans oracle csv: {sorted(missing)}")
+
+    oracle = oracle.copy()
+    oracle["date"] = pd.to_datetime(oracle["date"], errors="coerce")
+    oracle = oracle.dropna(subset=["date"])
+    oracle = oracle.drop_duplicates(subset=["date"], keep="last")
+    oracle = oracle[["date", "Label_id"]].rename(columns={"Label_id": "Label_id_oracle"})
+
+    merged_train = train_df.merge(oracle, on="date", how="left")
+    replaced_mask = merged_train["Label_id_oracle"].notna()
+    replaced_count = int(replaced_mask.sum())
+    if replaced_count == 0:
+        print("[warn] Aucun label train remplace par l'oracle (dates non alignées).")
+    else:
+        merged_train.loc[replaced_mask, "Label_id"] = (
+            merged_train.loc[replaced_mask, "Label_id_oracle"].astype(int)
+        )
+
+    id_to_label = {0: "Sell", 1: "Hold", 2: "Buy"}
+    merged_train["Label"] = merged_train["Label_id"].astype(int).map(id_to_label)
+    merged_train = merged_train.drop(columns=["Label_id_oracle"])
+
+    out = pd.concat([merged_train, val_df, test_df], ignore_index=True)
+    out = out.sort_values("date").reset_index(drop=True)
+    out["Label_id"] = out["Label_id"].astype(int)
+
+    train_rows = len(train_df)
+    coverage = (replaced_count / train_rows) if train_rows > 0 else 0.0
+    print(
+        f"[info] Oracle train merge | replaced={replaced_count}/{train_rows} "
+        f"({coverage:.1%}) | val/test labels=standards"
+    )
+
+    return out
+
+
+def apply_oracle_labels_on_all_data(
+    df: pd.DataFrame,
+    price_col: str,
+    capital: float,
+    fee_per_trade: float,
+) -> pd.DataFrame:
+    """Compute oracle labels on the full timeseries (train+val+test)."""
+    work = df.sort_values("date").reset_index(drop=True).copy()
+    oracle_df, report = build_oracle_labels_train_only(
+        train_df=work,
+        price_col=price_col,
+        initial_capital=float(capital),
+        fee_per_trade=float(fee_per_trade),
+    )
+    label_stats = {
+        "Buy": int((oracle_df["Label"] == "Buy").sum()),
+        "Hold": int((oracle_df["Label"] == "Hold").sum()),
+        "Sell": int((oracle_df["Label"] == "Sell").sum()),
+    }
+    print(
+        f"[info] Oracle ALL labels | fee={fee_per_trade:.2f} "
+        f"| outperf_vs_bh={report['outperformance_vs_buy_hold']:.2f} "
+        f"| n_trades={report['n_trades']}"
+    )
+    print(f"[info] Oracle ALL label stats ({TICKER}) = {label_stats}")
+    return oracle_df
 
 
 def recall_for_label(y_true, y_pred, label):
@@ -526,7 +623,8 @@ def train_model(
         "volume_relatif",
         "volatility_10",
     ]
-    train = compute_features(train)
+    feature_cols = list(features)
+    train = compute_market_features(train)
     train = train.dropna(subset=feature_cols + ["Label_id"]).sort_values("date").copy()
 
     if train.empty:
@@ -822,16 +920,45 @@ def plot_signals(df, window=160, price_col="adj_close"):
 
 def main():
     df = read_parquet_dataset(DATA_DIR)
-    Air_liquid = df[df["ticker"] == "TTE.PA"].copy()
+    if "date" not in df.columns:
+        raise ValueError("Colonne 'date' manquante dans le dataset source.")
 
-    #print(Air_liquid.head())
-    #benchmark = compute_benchmark(Air_liquid, CAPITAL)
-    #print(f"Capital: {CAPITAL} | Benchark : {round(benchmark, 2)}")
-    #plot_signals(df, window=60)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).copy()
 
-    df, label_stats = labelling(Air_liquid, 20)
-    print(f"\nLabel stats :{label_stats}")
-    model = train_model(df)
+    if "ticker" in df.columns:
+        work = df[df["ticker"] == TICKER].copy()
+    else:
+        work = df.copy()
+
+    if work.empty:
+        raise ValueError(f"Aucune ligne pour ticker={TICKER}")
+
+    if ORACLE_LABEL_MODE == "all":
+        labeled_df = apply_oracle_labels_on_all_data(
+            df=work,
+            price_col=PRICE_COL,
+            capital=float(CAPITAL),
+            fee_per_trade=float(ORACLE_FEE_PER_TRADE),
+        )
+    else:
+        labeled_df, label_stats = labelling(work, LABEL_WINDOW, price_col=PRICE_COL)
+        print(f"[info] Base label stats ({TICKER}) = {label_stats}")
+
+    if ORACLE_LABEL_MODE == "train_only":
+        labeled_df = merge_oracle_labels_on_train_only(
+            labeled_df=labeled_df,
+            oracle_csv_path=ORACLE_TRAIN_CSV,
+            train_ratio=TRAIN_RATIO,
+            val_ratio=VAL_RATIO,
+        )
+
+    model = train_model(
+        labeled_df,
+        train_ratio=TRAIN_RATIO,
+        val_ratio=VAL_RATIO,
+    )
+    return model
 
 if __name__ == "__main__":
     main()

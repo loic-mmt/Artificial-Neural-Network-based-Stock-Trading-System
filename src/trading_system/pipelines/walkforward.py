@@ -11,10 +11,8 @@ try:
 except Exception:
     ds = None
 
-try:
-    from ANN.features import features, compute_market_features
-except ModuleNotFoundError:
-    from features import features, compute_market_features
+from trading_system.features.market import compute_market_features, features
+from trading_system.paths import default_market_dataset_path
 
 LABEL_ID_TO_NAME = {0: "Sell", 1: "Hold", 2: "Buy"}
 N_CLASSES = 3
@@ -981,7 +979,7 @@ def walk_forward_oracle_ann(
 
 
 def _default_data_dir() -> Path:
-    return Path(__file__).resolve().parent / "datasets" / "cac40_daily.parquet"
+    return default_market_dataset_path()
 
 
 def _build_parser():
@@ -1043,7 +1041,19 @@ def main():
 
     for col in [args.price_col] + feature_cols:
         df_feat[col] = pd.to_numeric(df_feat[col], errors="coerce")
-    df_feat = df_feat.dropna(subset=[args.price_col] + feature_cols).reset_index(drop=True)
+
+    # Some features are intentionally sparse at this stage: rolling windows need
+    # warm-up rows, commodity histories start later than equities, and Yahoo
+    # metadata can be absent for a ticker. The training path already computes
+    # median fill values from the train split, falling back to 0 for all-missing
+    # features, so only the target price must be mandatory here.
+    fully_missing_features = [col for col in feature_cols if df_feat[col].isna().all()]
+    if fully_missing_features:
+        print(
+            "[warn] Features entierement manquantes, remplies ensuite par 0: "
+            + ", ".join(fully_missing_features)
+        )
+    df_feat = df_feat.dropna(subset=[args.price_col]).reset_index(drop=True)
 
     if len(df_feat) < args.context_len + 50:
         raise ValueError("Trop peu de lignes apres feature engineering.")

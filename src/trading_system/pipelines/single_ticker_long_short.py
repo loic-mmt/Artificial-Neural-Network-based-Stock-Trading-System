@@ -6,13 +6,10 @@ import pyarrow.dataset as ds
 import talib
 import matplotlib.pyplot as plt
 
-try:
-    from ANN.features import features, compute_market_features
-except ModuleNotFoundError:
-    from features import features, compute_market_features
+from trading_system.features.market import compute_market_features, features
+from trading_system.paths import default_market_dataset_path
 
-
-DATA_DIR = "ANN/datasets/cac40_daily.parquet"
+DATA_DIR = default_market_dataset_path()
 CAPITAL = 10_000
 np.random.seed(1)
 

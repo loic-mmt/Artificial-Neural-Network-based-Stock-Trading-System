@@ -10,6 +10,7 @@ try:
 except Exception:
     ds = None
 
+from trading_system.paths import default_market_dataset_path, derived_data_dir
 
 LABEL_ID_TO_NAME = {0: "Sell", 1: "Hold", 2: "Buy"}
 LABEL_NAME_TO_ID = {name: idx for idx, name in LABEL_ID_TO_NAME.items()}
@@ -331,12 +332,12 @@ def build_oracle_labels_train_only(
 
 
 def _default_data_dir() -> Path:
-    return Path(__file__).resolve().parent / "datasets" / "cac40_daily.parquet"
+    return default_market_dataset_path()
 
 
 def _default_output_path(ticker: str | None) -> Path:
     safe = "all_tickers" if not ticker else ticker.replace("/", "_").replace(".", "_")
-    return Path(__file__).resolve().parent / "datasets" / f"oracle_labels_train_{safe}.csv"
+    return derived_data_dir() / f"oracle_labels_train_{safe}.csv"
 
 
 def _build_parser() -> argparse.ArgumentParser:

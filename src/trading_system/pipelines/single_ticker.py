@@ -6,8 +6,9 @@ import pyarrow.dataset as ds
 import talib
 import matplotlib.pyplot as plt
 
+from trading_system.paths import default_market_dataset_path
 
-DATA_DIR = "ANN/datasets/cac40_daily.parquet"
+DATA_DIR = default_market_dataset_path()
 CAPITAL = 10_000
 np.random.seed(1)
 
@@ -33,6 +34,8 @@ def read_parquet_dataset(
         Materialized data as a pandas DataFrame.
     """
     dataset = ds.dataset(str(base_dir), format="parquet", partitioning="hive")
+    if not dataset or dataset is None:
+        raise ValueError("dataset empty")
     table = dataset.to_table(filter=filter_expr, columns=columns)
     return table.to_pandas()
 
@@ -91,7 +94,7 @@ def to_train_test(df, split_index):
     return train, test
 
 
-def chronological_train_val_test_split(df, train_ratio=0.7, val_ratio=0.15, group_col="ticker"):
+def chronological_train_val_test_split(df, train_ratio=0.7, val_ratio=0.15):
     if not 0 < train_ratio < 1:
         raise ValueError("train_ratio doit etre dans l'intervalle ]0, 1[.")
     if not 0 < val_ratio < 1:
@@ -101,83 +104,34 @@ def chronological_train_val_test_split(df, train_ratio=0.7, val_ratio=0.15, grou
     if len(df) < 3:
         raise ValueError("Il faut au moins 3 lignes pour faire un split train/val/test.")
 
-    def _split_one(group):
-        if len(group) < 3:
-            return None
+    train_end = int(len(df) * train_ratio)
+    val_end = int(len(df) * (train_ratio + val_ratio))
 
-        train_end = int(len(group) * train_ratio)
-        val_end = int(len(group) * (train_ratio + val_ratio))
+    train_end = min(max(train_end, 1), len(df) - 2)
+    val_end = min(max(val_end, train_end + 1), len(df) - 1)
 
-        train_end = min(max(train_end, 1), len(group) - 2)
-        val_end = min(max(val_end, train_end + 1), len(group) - 1)
-
-        train_part = group.iloc[:train_end].copy()
-        val_part = group.iloc[train_end:val_end].copy()
-        test_part = group.iloc[val_end:].copy()
-        return train_part, val_part, test_part
-
-    if group_col in df.columns:
-        train_parts, val_parts, test_parts = [], [], []
-        skipped = 0
-
-        for _, group in df.groupby(group_col, sort=False):
-            group = group.sort_values("date").copy()
-            split = _split_one(group)
-            if split is None:
-                skipped += 1
-                continue
-            train_part, val_part, test_part = split
-            train_parts.append(train_part)
-            val_parts.append(val_part)
-            test_parts.append(test_part)
-
-        if not train_parts:
-            raise ValueError("Aucun ticker exploitable pour le split train/val/test.")
-
-        if skipped > 0:
-            print(f"[split] tickers ignores (moins de 3 lignes): {skipped}")
-
-        train_df = pd.concat(train_parts, ignore_index=True)
-        val_df = pd.concat(val_parts, ignore_index=True)
-        test_df = pd.concat(test_parts, ignore_index=True)
-
-        sort_cols = [group_col, "date"]
-        train_df = train_df.sort_values(sort_cols).reset_index(drop=True)
-        val_df = val_df.sort_values(sort_cols).reset_index(drop=True)
-        test_df = test_df.sort_values(sort_cols).reset_index(drop=True)
-        return train_df, val_df, test_df
-
-    df = df.sort_values("date").reset_index(drop=True)
-    split = _split_one(df)
-    if split is None:
-        raise ValueError("Serie trop courte pour split train/val/test.")
-    return split
+    train_df = df.iloc[:train_end].copy()
+    val_df = df.iloc[train_end:val_end].copy()
+    test_df = df.iloc[val_end:].copy()
+    return train_df, val_df, test_df
 
 
 def compute_features(df):
-    def _compute_one(group):
-        group = group.sort_values("date").copy()
-        group = compute_returns(group, cols=["open", "high", "low", "close", "adj_close", "volume"])
-        group = normalize_prices(group, cols=["open", "high", "low", "close", "adj_close"])
+    df = df.sort_values("date").copy()
+    df = compute_returns(df, cols=["open", "high", "low", "close", "adj_close", "volume"])
+    df = normalize_prices(df, cols=["open", "high", "low", "close", "adj_close"])
 
-        macd, _, _ = talib.MACD(group["log_adj_close"])
-        group["rsi"] = talib.RSI(group["log_adj_close"])
-        group["macd"] = macd
-        group["williams"] = talib.WILLR(group["log_high"], group["log_low"], group["log_close"])
-        group["range_log"] = group["log_high"] - group["log_low"]
-        group["body_log"] = group["log_close"] - group["log_open"]
-        group["upper_wick_log"] = group["log_high"] - np.maximum(group["log_open"], group["log_close"])
-        group["lower_wick_log"] = np.minimum(group["log_open"], group["log_close"]) - group["log_low"]
-        group["volume_relatif"] = group["volume"] / group["volume"].rolling(10).mean()
-        group["volatility_10"] = group["adj_close_ret"].rolling(10).std()
-        return group
-
-    if "ticker" in df.columns:
-        parts = [_compute_one(group) for _, group in df.groupby("ticker", sort=False)]
-        out = pd.concat(parts, ignore_index=True)
-        return out.sort_values(["ticker", "date"]).reset_index(drop=True)
-
-    return _compute_one(df).sort_values("date").reset_index(drop=True)
+    macd, _, _ = talib.MACD(df["log_adj_close"])
+    df["rsi"] = talib.RSI(df["log_adj_close"])
+    df["macd"] = macd
+    df["williams"] = talib.WILLR(df["log_high"], df["log_low"], df["log_close"])
+    df["range_log"] = df["log_high"] - df["log_low"]
+    df["body_log"] = df["log_close"] - df["log_open"]
+    df["upper_wick_log"] = df["log_high"] - np.maximum(df["log_open"], df["log_close"])
+    df["lower_wick_log"] = np.minimum(df["log_open"], df["log_close"]) - df["log_low"]
+    df["volume_relatif"] = df["volume"] / df["volume"].rolling(10).mean()
+    df["volatility_10"] = df["adj_close_ret"].rolling(10).std()
+    return df
 
 
 def relu(x):
@@ -481,94 +435,8 @@ def build_context_dataset(df, feature_cols, context_len, target_start=0, return_
     return X, y
 
 
-def build_context_dataset_with_history(
-    target_df,
-    feature_cols,
-    context_len,
-    history_df=None,
-    group_col="ticker",
-    return_aligned_rows=False,
-):
-    if not isinstance(context_len, (int, np.integer)):
-        raise TypeError("context_len doit etre un entier.")
-    if context_len <= 0:
-        raise ValueError("context_len doit etre strictement positif.")
-
-    target_df = target_df.copy()
-    if history_df is not None:
-        history_df = history_df.copy()
-
-    if group_col in target_df.columns:
-        X_parts, y_parts, aligned_parts = [], [], []
-        tickers = pd.unique(target_df[group_col].dropna())
-
-        for ticker in tickers:
-            target_group = target_df[target_df[group_col] == ticker].sort_values("date").copy()
-            if target_group.empty:
-                continue
-
-            if history_df is None or group_col not in history_df.columns:
-                history_group = target_group.iloc[0:0].copy()
-            else:
-                history_group = history_df[history_df[group_col] == ticker].sort_values("date").copy()
-
-            prefix_len = min(context_len - 1, len(history_group))
-            source = pd.concat([history_group.tail(prefix_len), target_group], ignore_index=True)
-
-            Xg, yg, idxg = build_context_dataset(
-                source,
-                feature_cols,
-                context_len,
-                target_start=prefix_len,
-                return_indices=True,
-            )
-            if len(Xg) == 0:
-                continue
-
-            X_parts.append(Xg)
-            y_parts.append(yg)
-            if return_aligned_rows:
-                aligned_parts.append(source.iloc[idxg].copy().reset_index(drop=True))
-
-        if not X_parts:
-            empty_x = np.empty((0, context_len * len(feature_cols)), dtype=np.float32)
-            empty_y = np.empty((0,), dtype=np.int64)
-            if return_aligned_rows:
-                return empty_x, empty_y, target_df.iloc[0:0].copy()
-            return empty_x, empty_y
-
-        X = np.concatenate(X_parts, axis=0)
-        y = np.concatenate(y_parts, axis=0)
-        if return_aligned_rows:
-            aligned = pd.concat(aligned_parts, ignore_index=True)
-            return X, y, aligned
-        return X, y
-
-    target_sorted = target_df.sort_values("date").copy()
-    if history_df is None:
-        source = target_sorted
-        target_start = 0
-    else:
-        history_sorted = history_df.sort_values("date").copy()
-        prefix_len = min(context_len - 1, len(history_sorted))
-        source = pd.concat([history_sorted.tail(prefix_len), target_sorted], ignore_index=True)
-        target_start = prefix_len
-
-    X, y, idx = build_context_dataset(
-        source,
-        feature_cols,
-        context_len,
-        target_start=target_start,
-        return_indices=True,
-    )
-    if return_aligned_rows:
-        aligned = source.iloc[idx].copy().reset_index(drop=True) if len(idx) > 0 else source.iloc[0:0].copy()
-        return X, y, aligned
-    return X, y
-
-
 def signals_to_positions(pred_labels):
-    """Convert class predictions to a short/flat/long position stream."""
+    """Convert class predictions to a long/flat position stream."""
     positions = []
     current_position = 0.0
 
@@ -576,100 +444,40 @@ def signals_to_positions(pred_labels):
         if label == 2:  # Buy
             current_position = 1.0
         elif label == 0:  # Sell
-            current_position = -1.0
+            current_position = 0.0
         # Hold keeps previous position
         positions.append(current_position)
 
     return np.asarray(positions, dtype=np.float64)
 
 
-def evaluate_strategy_vs_buy_hold(test_frame, pred_labels, initial_capital=10_000.0, price_col="adj_close", fee_per_trade=1.0):
+def evaluate_strategy_vs_buy_hold(test_frame, pred_labels, initial_capital=10_000.0, price_col="adj_close"):
     """Compute test-period PnL of model signals versus buy-and-hold."""
     if len(test_frame) != len(pred_labels):
         raise ValueError("Mismatch entre nombre de predictions et lignes test.")
     if len(test_frame) < 2:
         raise ValueError("Le set test doit contenir au moins 2 lignes pour calculer un PnL.")
 
-    def _single_curve(test_frame, pred_labels, capital):
-        prices = test_frame[price_col].to_numpy(dtype=np.float64)
-        forward_returns = np.zeros(len(prices), dtype=np.float64)
-        forward_returns[:-1] = (prices[1:] / prices[:-1]) - 1.0
+    prices = test_frame[price_col].to_numpy(dtype=np.float64)
+    forward_returns = np.zeros(len(prices), dtype=np.float64)
+    forward_returns[:-1] = (prices[1:] / prices[:-1]) - 1.0
 
-        target_positions = signals_to_positions(pred_labels)
-        executed_positions = np.zeros_like(target_positions)
-        executed_positions[1:] = target_positions[:-1]  # signal t applique des t+1
+    positions = signals_to_positions(pred_labels)
+    strategy_returns = positions * forward_returns
 
-        prev_positions = np.zeros_like(executed_positions)
-        prev_positions[1:] = executed_positions[:-1]
-        turnover = np.abs(executed_positions - prev_positions)  # 0, 1 ou 2
+    model_curve = initial_capital * np.cumprod(1.0 + strategy_returns)
+    buy_hold_curve = initial_capital * np.cumprod(1.0 + forward_returns)
 
-        strategy_returns = executed_positions * forward_returns
-        model_curve = np.empty(len(prices), dtype=np.float64)
-        capital = float(initial_capital)
-        for i in range(len(prices)):
-            capital *= (1.0 + strategy_returns[i])
-            capital -= float(fee_per_trade) * turnover[i]
-            if capital < 0:
-                capital = 0.0
-            model_curve[i] = capital
+    model_final = float(model_curve[-1])
+    buy_hold_final = float(buy_hold_curve[-1])
 
-        buy_hold_curve = initial_capital * np.cumprod(1.0 + forward_returns)
-
-        model_final = float(model_curve[-1])
-        buy_hold_final = float(buy_hold_curve[-1])
-        return model_final, buy_hold_final
-
-    if "ticker" not in test_frame.columns:
-        model_final, buy_hold_final = _single_curve(test_frame, pred_labels, float(initial_capital))
-        return {
-            "initial_capital": float(initial_capital),
-            "model_final_capital": model_final,
-            "buy_hold_final_capital": buy_hold_final,
-            "model_pnl": model_final - float(initial_capital),
-            "buy_hold_pnl": buy_hold_final - float(initial_capital),
-            "outperformance": model_final - buy_hold_final,
-        }
-
-    pred_labels = np.asarray(pred_labels)
-    groups = list(test_frame.groupby("ticker", sort=False))
-    if not groups:
-        raise ValueError("Aucun ticker present dans le set test.")
-
-    capital_per_ticker = float(initial_capital) / len(groups)
-    offset = 0
-    model_total = 0.0
-    buy_hold_total = 0.0
-    used_groups = 0
-
-    for _, frame in groups:
-        frame = frame.reset_index(drop=True)
-        n = len(frame)
-        group_preds = pred_labels[offset : offset + n]
-        offset += n
-
-        if len(group_preds) != n:
-            raise ValueError("Mismatch entre predictions et lignes d'un ticker.")
-        if n < 2:
-            continue
-
-        model_final, buy_hold_final = _single_curve(frame, group_preds, capital_per_ticker)
-        model_total += model_final
-        buy_hold_total += buy_hold_final
-        used_groups += 1
-
-    if offset != len(pred_labels):
-        raise ValueError("Des predictions n'ont pas ete consommees pendant l'evaluation PnL.")
-    if used_groups == 0:
-        raise ValueError("Aucun ticker test exploitable (minimum 2 lignes requises).")
-
-    initial_used = capital_per_ticker * used_groups
     return {
-        "initial_capital": float(initial_used),
-        "model_final_capital": float(model_total),
-        "buy_hold_final_capital": float(buy_hold_total),
-        "model_pnl": float(model_total - initial_used),
-        "buy_hold_pnl": float(buy_hold_total - initial_used),
-        "outperformance": float(model_total - buy_hold_total),
+        "initial_capital": float(initial_capital),
+        "model_final_capital": model_final,
+        "buy_hold_final_capital": buy_hold_final,
+        "model_pnl": model_final - float(initial_capital),
+        "buy_hold_pnl": buy_hold_final - float(initial_capital),
+        "outperformance": model_final - buy_hold_final,
     }
 
 
@@ -720,8 +528,7 @@ def train_model(
         "volatility_10",
     ]
     train = compute_features(train)
-    sort_cols = ["ticker", "date"] if "ticker" in train.columns else ["date"]
-    train = train.dropna(subset=feature_cols + ["Label_id"]).sort_values(sort_cols).copy()
+    train = train.dropna(subset=feature_cols + ["Label_id"]).sort_values("date").copy()
 
     if train.empty:
         raise ValueError("Aucune ligne exploitable apres calcul des features.")
@@ -732,25 +539,28 @@ def train_model(
         val_ratio=val_ratio,
     )
 
-    X_train_raw, y_train = build_context_dataset_with_history(
-        train_df,
+    X_train_raw, y_train = build_context_dataset(train_df, feature_cols, context_len)
+
+    # Build validation windows with train history as context
+    val_prefix_len = min(context_len - 1, len(train_df))
+    val_source = pd.concat([train_df.tail(val_prefix_len), val_df], ignore_index=True)
+    X_val_raw, y_val = build_context_dataset(
+        val_source,
         feature_cols,
         context_len,
-        history_df=None,
+        target_start=val_prefix_len,
     )
-    X_val_raw, y_val = build_context_dataset_with_history(
-        val_df,
-        feature_cols,
-        context_len,
-        history_df=train_df,
-    )
+
+    # Build test windows with train+val history as context
     test_history = pd.concat([train_df, val_df], ignore_index=True)
-    X_test_raw, y_test, aligned_test_frame = build_context_dataset_with_history(
-        test_df,
+    test_prefix_len = min(context_len - 1, len(test_history))
+    test_source = pd.concat([test_history.tail(test_prefix_len), test_df], ignore_index=True)
+    X_test_raw, y_test, test_target_indices = build_context_dataset(
+        test_source,
         feature_cols,
         context_len,
-        history_df=test_history,
-        return_aligned_rows=True,
+        target_start=test_prefix_len,
+        return_indices=True,
     )
 
     if len(X_train_raw) == 0:
@@ -938,6 +748,7 @@ def train_model(
     test_preds = predict_with_thresholds(test_probs, best["thresholds"][0], best["thresholds"][1])
     test_metrics = evaluate_predictions(y_test, test_preds)
 
+    aligned_test_frame = test_source.iloc[test_target_indices].reset_index(drop=True)
     benchmark_comparison = evaluate_strategy_vs_buy_hold(
         aligned_test_frame,
         test_preds,
@@ -1007,20 +818,21 @@ def plot_signals(df, window=160, price_col="adj_close"):
     plt.legend()
     plt.tight_layout()
     plt.show()
+
+
+
 def main():
     df = read_parquet_dataset(DATA_DIR)
+    Air_liquid = df[df["ticker"] == "TTE.PA"].copy()
 
-    # Pipeline multi-ticker CAC40
-    df = labelling_all(df, 10)
-    label_stats = (
-        df["Label"]
-        .value_counts()
-        .reindex(["Buy", "Hold", "Sell"], fill_value=0)
-        .to_dict()
-    )
-    print(f"\nLabel stats (multi-ticker): {label_stats}")
-    _ = train_model(df)
+    #print(Air_liquid.head())
+    #benchmark = compute_benchmark(Air_liquid, CAPITAL)
+    #print(f"Capital: {CAPITAL} | Benchark : {round(benchmark, 2)}")
+    #plot_signals(df, window=60)
 
+    df, label_stats = labelling(Air_liquid, 20)
+    print(f"\nLabel stats :{label_stats}")
+    model = train_model(df)
 
 if __name__ == "__main__":
     main()

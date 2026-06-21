@@ -22,7 +22,7 @@ SECTOR_BUCKETS = [
 ]
 SECTOR_ONE_HOT_FEATURES = [f"sector_{bucket}" for bucket in SECTOR_BUCKETS]
 
-# Exact feature list requested for model import.
+# Feature list for model import.
 features = [
     # Multi-horizon returns
     "ret_2",
@@ -94,8 +94,8 @@ features = [
     "frt10y",
     "spread_2s10s",
     "delta_10y_5d",
-    "credit_spread",
-    "credit_spread_5d",
+    # credit_spread depends on optional FRED access in data.py, so model
+    # feature engineering must not require it to complete.
     # Commodities / FX
     "oil_ret_5",
     "dxy_ret_5",
@@ -132,7 +132,6 @@ EXTERNAL_REQUIRED_COLUMNS = [
     "ust10y",
     "frt2y",
     "frt10y",
-    "credit_spread",
     "market_cap",
     "book_value",
     "trailing_eps",
@@ -311,9 +310,24 @@ def _compute_one_symbol_base(
 
 
 def _add_market_level_features(out: pd.DataFrame, date_col: str) -> pd.DataFrame:
-    daily = out[[date_col, "market_close", "vix_close", "oil_close", "dxy_close", "gold_close", "ust2y", "ust10y", "frt2y", "frt10y", "credit_spread"]].drop_duplicates(
-        subset=[date_col]
-    ).sort_values(date_col).copy()
+    market_cols = [
+        date_col,
+        "market_close",
+        "vix_close",
+        "oil_close",
+        "dxy_close",
+        "gold_close",
+        "ust2y",
+        "ust10y",
+        "frt2y",
+        "frt10y",
+    ]
+    daily = (
+        out[market_cols]
+        .drop_duplicates(subset=[date_col])
+        .sort_values(date_col)
+        .copy()
+    )
 
     market_close = daily["market_close"].astype(float).clip(lower=EPS)
     market_ret_1 = market_close.pct_change()
@@ -332,10 +346,8 @@ def _add_market_level_features(out: pd.DataFrame, date_col: str) -> pd.DataFrame
     daily["ust10y"] = daily["ust10y"].astype(float)
     daily["frt2y"] = daily["frt2y"].astype(float)
     daily["frt10y"] = daily["frt10y"].astype(float)
-    daily["credit_spread"] = daily["credit_spread"].astype(float)
     daily["spread_2s10s"] = daily["ust10y"] - daily["ust2y"]
     daily["delta_10y_5d"] = daily["ust10y"].diff(5)
-    daily["credit_spread_5d"] = daily["credit_spread"].diff(5)
 
     daily["oil_ret_5"] = daily["oil_close"].astype(float).pct_change(5)
     daily["dxy_ret_5"] = daily["dxy_close"].astype(float).pct_change(5)
@@ -356,13 +368,16 @@ def _add_market_level_features(out: pd.DataFrame, date_col: str) -> pd.DataFrame
         "frt10y",
         "spread_2s10s",
         "delta_10y_5d",
-        "credit_spread",
-        "credit_spread_5d",
         "oil_ret_5",
         "dxy_ret_5",
         "gold_ret_5",
     ]
     daily = daily[keep_cols]
+    overlapping_feature_cols = [
+        col for col in keep_cols if col != date_col and col in out.columns
+    ]
+    if overlapping_feature_cols:
+        out = out.drop(columns=overlapping_feature_cols)
     return out.merge(daily, on=date_col, how="left")
 
 
@@ -473,7 +488,10 @@ def _add_firm_micro_features(
     )
     short_pct = _numeric_or_nan("short_percent_float")
     short_ratio = _numeric_or_nan("short_ratio")
-    out["short_interest"] = short_pct.where(short_pct.notna(), short_ratio)
+    # Yahoo often exposes the short-interest fields for European tickers but
+    # leaves every value empty. Treat that as neutral information; otherwise a
+    # strict model-side dropna removes the whole ticker history.
+    out["short_interest"] = short_pct.where(short_pct.notna(), short_ratio).fillna(0.0)
     return out
 
 
@@ -526,8 +544,10 @@ def compute_market_features(
     _require_columns(work, EXTERNAL_REQUIRED_COLUMNS, "external feature engineering")
     if "sector_bucket" not in work.columns and "sector" not in work.columns:
         raise ValueError("Missing sector information: expected `sector_bucket` or `sector`.")
-    if "short_percent_float" not in work.columns and "short_ratio" not in work.columns:
-        raise ValueError("Missing short interest inputs: expected `short_percent_float` or `short_ratio`.")
+    if "short_percent_float" not in work.columns:
+        work["short_percent_float"] = np.nan
+    if "short_ratio" not in work.columns:
+        work["short_ratio"] = np.nan
 
     if "sector_bucket" not in work.columns:
         industry = work["industry"] if "industry" in work.columns else None

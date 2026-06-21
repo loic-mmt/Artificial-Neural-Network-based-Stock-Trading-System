@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-system"
+version = "0.1.0"
+description = "ANN-based stock trading experiments, data pipelines, and backtesting tools."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "matplotlib",
+    "TA-Lib",
+    "yfinance",
+    "plotly",
+    "ccxt",
+    "scipy",
+    "statsmodels",
+    "hmmlearn",
+    "scikit-learn",
+    "ipython",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

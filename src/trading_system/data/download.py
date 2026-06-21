@@ -5,14 +5,16 @@ import argparse
 import importlib
 import time
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from trading_system.paths import processed_data_dir
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_OUTPUT_BASE = SCRIPT_DIR / "datasets" / "cac40_daily"
+DEFAULT_OUTPUT_BASE = processed_data_dir() / "cac40_daily"
 
 # Composition courante du CAC 40 au 22 decembre 2025.
 # Source de reference utilisee pour figer une liste stable a date.
@@ -90,13 +92,20 @@ YAHOO_MACRO_TICKERS = {
     "GC=F": "gold_close",
 }
 
-FRED_SERIES = {
-    "DGS2": "ust2y",
-    "DGS10": "ust10y",
-    "IR3TIB01FRM156N": "frt2y",
-    "IRLTLT01FRM156N": "frt10y",
-    "BAMLH0A0HYM2": "credit_spread",
+TREASURY_YIELD_COLUMNS = {
+    "2 Yr": "ust2y",
+    "10 Yr": "ust10y",
 }
+
+OECD_FINMARK_SERIES = {
+    "IR3TIB": "frt2y",
+    "IRLT": "frt10y",
+}
+
+CREDIT_SPREAD_FRED_SERIES_ID = "BAMLH0A0HYM2"
+CREDIT_SPREAD_COLUMN = "credit_spread"
+RATE_MACRO_COLUMNS = list(TREASURY_YIELD_COLUMNS.values()) + list(OECD_FINMARK_SERIES.values())
+OPTIONAL_MACRO_COLUMNS = [CREDIT_SPREAD_COLUMN]
 
 SECTOR_BUCKETS = [
     "energy",
@@ -117,6 +126,10 @@ SECTOR_BUCKETS = [
 
 
 class FredDownloadError(RuntimeError):
+    pass
+
+
+class MacroDownloadError(RuntimeError):
     pass
 
 
@@ -190,20 +203,31 @@ def parse_args() -> argparse.Namespace:
         "--fred-timeout",
         type=int,
         default=120,
-        help="Timeout reseau en secondes pour chaque serie FRED. Defaut: 120.",
+        help=(
+            "Timeout reseau en secondes pour les sources macro externes "
+            "(Treasury/OECD/FRED optionnel). Defaut: 120."
+        ),
     )
     parser.add_argument(
         "--fred-retries",
         type=int,
         default=3,
-        help="Nombre de tentatives par serie FRED. Defaut: 3.",
+        help="Nombre de tentatives par source macro externe. Defaut: 3.",
     )
     parser.add_argument(
         "--allow-missing-fred",
         action="store_true",
         help=(
-            "Sauvegarde quand meme le dataset si FRED est inaccessible, "
-            "avec les colonnes FRED remplies par des valeurs manquantes."
+            "Compatibilite: credit_spread est desormais optionnel et rempli "
+            "avec des valeurs manquantes si FRED est inaccessible."
+        ),
+    )
+    parser.add_argument(
+        "--include-credit-spread",
+        action="store_true",
+        help=(
+            "Tente d'ajouter credit_spread depuis FRED/BAMLH0A0HYM2. "
+            "Par defaut, cette colonne optionnelle est creee vide."
         ),
     )
     return parser.parse_args()
@@ -416,6 +440,386 @@ def download_yahoo_macro_series(
     return merged
 
 
+def _read_csv_url_with_retries(
+    pandas_module: Any,
+    url: str,
+    label: str,
+    timeout: int,
+    retries: int,
+    headers: dict[str, str] | None = None,
+) -> Any:
+    if timeout <= 0:
+        raise SystemExit("--fred-timeout doit etre superieur a 0.")
+    if retries <= 0:
+        raise SystemExit("--fred-retries doit etre superieur a 0.")
+
+    last_error: Exception | None = None
+    request_headers = {
+        "Accept": "text/csv,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0",
+    }
+    if headers:
+        request_headers.update(headers)
+
+    for attempt in range(1, retries + 1):
+        request = Request(url, headers=request_headers)
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                return pandas_module.read_csv(response)
+        except Exception as exc:
+            last_error = exc
+            if attempt == retries:
+                raise MacroDownloadError(
+                    f"Impossible de telecharger `{label}` "
+                    f"apres {retries} tentative(s): {exc}"
+                ) from exc
+            wait_seconds = min(2 ** (attempt - 1), 10)
+            print(
+                f"  - {label}: tentative {attempt}/{retries} echouee "
+                f"({exc}); nouvelle tentative dans {wait_seconds}s"
+            )
+            time.sleep(wait_seconds)
+
+    raise MacroDownloadError(f"Impossible de telecharger `{label}`: {last_error}")
+
+
+def _read_text_url_with_retries(
+    url: str,
+    label: str,
+    timeout: int,
+    retries: int,
+    headers: dict[str, str] | None = None,
+) -> str:
+    if timeout <= 0:
+        raise SystemExit("--fred-timeout doit etre superieur a 0.")
+    if retries <= 0:
+        raise SystemExit("--fred-retries doit etre superieur a 0.")
+
+    last_error: Exception | None = None
+    request_headers = {
+        "Accept": "text/html,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0",
+    }
+    if headers:
+        request_headers.update(headers)
+
+    for attempt in range(1, retries + 1):
+        request = Request(url, headers=request_headers)
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                return response.read().decode("utf-8", errors="replace")
+        except Exception as exc:
+            last_error = exc
+            if attempt == retries:
+                raise MacroDownloadError(
+                    f"Impossible de telecharger `{label}` "
+                    f"apres {retries} tentative(s): {exc}"
+                ) from exc
+            wait_seconds = min(2 ** (attempt - 1), 10)
+            print(
+                f"  - {label}: tentative {attempt}/{retries} echouee "
+                f"({exc}); nouvelle tentative dans {wait_seconds}s"
+            )
+            time.sleep(wait_seconds)
+
+    raise MacroDownloadError(f"Impossible de telecharger `{label}`: {last_error}")
+
+
+class _FirstHtmlTableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[list[str]] = []
+        self._in_table = False
+        self._finished = False
+        self._current_row: list[str] | None = None
+        self._current_cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self._finished:
+            return
+        if tag == "table" and not self._in_table:
+            self._in_table = True
+            return
+        if not self._in_table:
+            return
+        if tag == "tr":
+            self._current_row = []
+        elif tag in {"th", "td"}:
+            self._current_cell = []
+
+    def handle_data(self, data: str) -> None:
+        if self._in_table and self._current_cell is not None:
+            self._current_cell.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self._in_table or self._finished:
+            return
+        if tag in {"th", "td"} and self._current_row is not None:
+            text = " ".join("".join(self._current_cell or []).split())
+            self._current_row.append(text)
+            self._current_cell = None
+        elif tag == "tr":
+            if self._current_row:
+                self.rows.append(self._current_row)
+            self._current_row = None
+        elif tag == "table":
+            self._in_table = False
+            self._finished = True
+
+
+def _parse_first_html_table(pandas_module: Any, html_text: str) -> Any:
+    # Treasury.gov exposes the data as a public HTML table. The CSV endpoint is
+    # easier to parse, but can answer 403 to non-browser clients, so we parse the
+    # first table to keep this source free and usable without an API key.
+    parser = _FirstHtmlTableParser()
+    parser.feed(html_text)
+    rows = parser.rows
+    if len(rows) < 2:
+        raise MacroDownloadError("Aucun tableau exploitable dans la reponse HTML.")
+
+    header = rows[0]
+    body = []
+    for row in rows[1:]:
+        if len(row) < len(header):
+            row = row + [""] * (len(header) - len(row))
+        body.append(row[: len(header)])
+
+    return pandas_module.DataFrame(body, columns=header)
+
+
+def _estimate_treasury_start_page(start: str) -> int:
+    try:
+        start_year = datetime.strptime(start, "%Y-%m-%d").year
+    except ValueError:
+        return 0
+    estimated_rows_before_start = max(0, start_year - 1990) * 252
+    return max(0, estimated_rows_before_start // 300 - 2)
+
+
+def _shift_month_period(date_str: str, month_delta: int) -> str:
+    date_value = datetime.strptime(validate_date(date_str), "%Y-%m-%d").date()
+    month_index = date_value.year * 12 + date_value.month - 1 + month_delta
+    year = month_index // 12
+    month = month_index % 12 + 1
+    return f"{year:04d}-{month:02d}"
+
+
+def download_treasury_yield_series(
+    pandas_module: Any,
+    start: str,
+    end_inclusive: str,
+    timeout: int,
+    retries: int,
+) -> Any:
+    print("[macro-treasury] Telechargement U.S. Treasury -> ust2y, ust10y")
+    base_url = (
+        "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
+        "TextView?type=daily_treasury_yield_curve"
+    )
+    start_ts = pandas_module.to_datetime(start, errors="coerce")
+    end_ts = pandas_module.to_datetime(end_inclusive, errors="coerce")
+    page = _estimate_treasury_start_page(start)
+    frames = []
+
+    while True:
+        url = f"{base_url}&page={page}"
+        try:
+            html_text = _read_text_url_with_retries(
+                url=url,
+                label=f"U.S. Treasury yield curve page {page}",
+                timeout=timeout,
+                retries=retries,
+                headers={"Referer": "https://home.treasury.gov/"},
+            )
+            page_frame = _parse_first_html_table(pandas_module, html_text)
+        except MacroDownloadError:
+            if frames:
+                break
+            raise
+
+        if page_frame.empty:
+            break
+
+        page_frame = page_frame.rename(
+            columns={col: str(col).strip() for col in page_frame.columns}
+        )
+        date_col = next(
+            (col for col in page_frame.columns if col.lower() == "date"),
+            None,
+        )
+        if date_col is None:
+            raise MacroDownloadError("Reponse U.S. Treasury sans colonne Date.")
+
+        page_dates = pandas_module.to_datetime(page_frame[date_col], errors="coerce")
+        if page_dates.notna().any() and page_dates.max() >= start_ts:
+            frames.append(page_frame)
+        if page_dates.notna().any() and page_dates.max() >= end_ts:
+            break
+        if len(page_frame) < 300:
+            break
+
+        page += 1
+        if page > 200:
+            raise MacroDownloadError("Pagination U.S. Treasury anormalement longue.")
+
+    if not frames:
+        raise MacroDownloadError("Aucune page U.S. Treasury exploitable.")
+
+    frame = pandas_module.concat(frames, ignore_index=True)
+
+    frame = frame.rename(columns={col: str(col).strip() for col in frame.columns})
+    date_col = next((col for col in frame.columns if col.lower() == "date"), None)
+    normalized_columns = {str(col).strip().lower(): col for col in frame.columns}
+
+    missing_source_cols = [
+        source_col
+        for source_col in TREASURY_YIELD_COLUMNS
+        if source_col.lower() not in normalized_columns
+    ]
+    if date_col is None or missing_source_cols:
+        received = ", ".join(str(col) for col in frame.columns[:12]) or "aucune"
+        raise MacroDownloadError(
+            "Reponse U.S. Treasury invalide. "
+            f"Colonnes manquantes: {missing_source_cols}. "
+            f"Colonnes recues: {received}."
+        )
+
+    out = pandas_module.DataFrame()
+    out["date"] = pandas_module.to_datetime(frame[date_col], errors="coerce")
+    for source_col, target_col in TREASURY_YIELD_COLUMNS.items():
+        actual_col = normalized_columns[source_col.lower()]
+        out[target_col] = pandas_module.to_numeric(frame[actual_col], errors="coerce")
+
+    out = out.dropna(subset=["date"]).copy()
+    out = out[(out["date"] >= start_ts) & (out["date"] <= end_ts)].copy()
+    out = out.sort_values("date").reset_index(drop=True)
+    if out.empty:
+        raise MacroDownloadError("Aucune donnee U.S. Treasury apres filtrage date.")
+    return out
+
+
+def _download_oecd_finmark_series(
+    pandas_module: Any,
+    measure: str,
+    target_col: str,
+    start: str,
+    end_inclusive: str,
+    timeout: int,
+    retries: int,
+) -> Any:
+    # OECD can return HTTP 404 instead of an empty CSV when the requested start
+    # month has no published observation yet, especially for IRLT. Query a few
+    # months before --start; build_exogenous_daily_panel then forward-fills onto
+    # the CAC40 trading calendar and filters back to the requested window.
+    start_period = _shift_month_period(start, -3)
+    end_period = end_inclusive[:7]
+    path = f"@DF_FINMARK,4.0/FRA.M.{measure}.PA....."
+    query = urlencode(
+        {
+            "startPeriod": start_period,
+            "endPeriod": end_period,
+            "dimensionAtObservation": "AllDimensions",
+        }
+    )
+    url = f"https://sdmx.oecd.org/public/rest/data/OECD.SDD.STES,DSD_STES{path}?{query}"
+    label = f"OECD {measure}"
+    print(f"[macro-oecd] Telechargement {measure} -> {target_col}")
+    frame = _read_csv_url_with_retries(
+        pandas_module=pandas_module,
+        url=url,
+        label=label,
+        timeout=timeout,
+        retries=retries,
+        headers={"Accept": "application/vnd.sdmx.data+csv; charset=utf-8,*/*;q=0.8"},
+    )
+
+    required_cols = {"TIME_PERIOD", "OBS_VALUE"}
+    if not required_cols.issubset(frame.columns):
+        received = ", ".join(str(col) for col in frame.columns[:12]) or "aucune"
+        raise MacroDownloadError(
+            f"Reponse OECD invalide pour `{measure}`. Colonnes recues: {received}."
+        )
+
+    if "MEASURE" in frame.columns:
+        frame = frame[frame["MEASURE"].astype(str).eq(measure)].copy()
+    if "REF_AREA" in frame.columns:
+        frame = frame[frame["REF_AREA"].astype(str).eq("FRA")].copy()
+    if "FREQ" in frame.columns:
+        frame = frame[frame["FREQ"].astype(str).eq("M")].copy()
+
+    out = pandas_module.DataFrame()
+    out["date"] = pandas_module.to_datetime(
+        frame["TIME_PERIOD"].astype(str) + "-01",
+        errors="coerce",
+    )
+    out[target_col] = pandas_module.to_numeric(frame["OBS_VALUE"], errors="coerce")
+    out = out.dropna(subset=["date"]).copy()
+    out = out.sort_values("date").reset_index(drop=True)
+    if out.empty:
+        raise MacroDownloadError(f"Aucune donnee OECD pour `{measure}`.")
+    return out
+
+
+def download_oecd_rate_series(
+    pandas_module: Any,
+    start: str,
+    end_inclusive: str,
+    timeout: int,
+    retries: int,
+) -> Any:
+    merged = None
+
+    for measure, target_col in OECD_FINMARK_SERIES.items():
+        frame = _download_oecd_finmark_series(
+            pandas_module=pandas_module,
+            measure=measure,
+            target_col=target_col,
+            start=start,
+            end_inclusive=end_inclusive,
+            timeout=timeout,
+            retries=retries,
+        )
+
+        if merged is None:
+            merged = frame
+        else:
+            merged = merged.merge(frame, on="date", how="outer")
+
+    if merged is None or merged.empty:
+        raise MacroDownloadError("Aucune serie OECD n'a ete telechargee.")
+
+    merged = merged.sort_values("date").reset_index(drop=True)
+    return merged
+
+
+def download_rate_macro_series(
+    pandas_module: Any,
+    start: str,
+    end_inclusive: str,
+    timeout: int,
+    retries: int,
+) -> Any:
+    treasury = download_treasury_yield_series(
+        pandas_module=pandas_module,
+        start=start,
+        end_inclusive=end_inclusive,
+        timeout=timeout,
+        retries=retries,
+    )
+    oecd = download_oecd_rate_series(
+        pandas_module=pandas_module,
+        start=start,
+        end_inclusive=end_inclusive,
+        timeout=timeout,
+        retries=retries,
+    )
+    return (
+        treasury.merge(oecd, on="date", how="outer")
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+
 def _download_fred_series(
     pandas_module: Any,
     series_id: str,
@@ -424,44 +828,18 @@ def _download_fred_series(
     timeout: int,
     retries: int,
 ) -> Any:
-    if timeout <= 0:
-        raise SystemExit("--fred-timeout doit etre superieur a 0.")
-    if retries <= 0:
-        raise SystemExit("--fred-retries doit etre superieur a 0.")
-
     query = urlencode({"id": series_id, "cosd": start, "coed": end_inclusive})
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?{query}"
-    last_error: Exception | None = None
-
-    for attempt in range(1, retries + 1):
-        request = Request(
-            url,
-            headers={
-                "Accept": "text/csv,*/*;q=0.8",
-                "User-Agent": "Mozilla/5.0",
-            },
+    try:
+        frame = _read_csv_url_with_retries(
+            pandas_module=pandas_module,
+            url=url,
+            label=f"FRED {series_id}",
+            timeout=timeout,
+            retries=retries,
         )
-        try:
-            with urlopen(request, timeout=timeout) as response:
-                frame = pandas_module.read_csv(response)
-            break
-        except Exception as exc:
-            last_error = exc
-            if attempt == retries:
-                raise FredDownloadError(
-                    f"Impossible de telecharger la serie FRED `{series_id}` "
-                    f"apres {retries} tentative(s): {exc}"
-                ) from exc
-            wait_seconds = min(2 ** (attempt - 1), 10)
-            print(
-                f"  - FRED {series_id}: tentative {attempt}/{retries} echouee "
-                f"({exc}); nouvelle tentative dans {wait_seconds}s"
-            )
-            time.sleep(wait_seconds)
-    else:
-        raise FredDownloadError(
-            f"Impossible de telecharger la serie FRED `{series_id}`: {last_error}"
-        )
+    except MacroDownloadError as exc:
+        raise FredDownloadError(str(exc)) from exc
 
     date_col = next(
         (col for col in ("DATE", "date", "observation_date") if col in frame.columns),
@@ -493,52 +871,43 @@ def _download_fred_series(
     return out
 
 
-def download_fred_macro_series(
+def download_credit_spread_series(
     pandas_module: Any,
     start: str,
     end_inclusive: str,
     timeout: int,
     retries: int,
 ) -> Any:
-    merged = None
-
-    for series_id, target_col in FRED_SERIES.items():
-        print(f"[macro-fred] Telechargement {series_id} -> {target_col}")
-        frame = _download_fred_series(
-            pandas_module=pandas_module,
-            series_id=series_id,
-            start=start,
-            end_inclusive=end_inclusive,
-            timeout=timeout,
-            retries=retries,
+    print(
+        f"[macro-fred] Telechargement optionnel "
+        f"{CREDIT_SPREAD_FRED_SERIES_ID} -> {CREDIT_SPREAD_COLUMN}"
+    )
+    frame = _download_fred_series(
+        pandas_module=pandas_module,
+        series_id=CREDIT_SPREAD_FRED_SERIES_ID,
+        start=start,
+        end_inclusive=end_inclusive,
+        timeout=timeout,
+        retries=retries,
+    )
+    if frame.empty:
+        raise FredDownloadError(
+            f"Aucune donnee FRED pour la serie `{CREDIT_SPREAD_FRED_SERIES_ID}`."
         )
-        if frame.empty:
-            raise FredDownloadError(
-                f"Aucune donnee FRED pour la serie `{series_id}`."
-            )
-        frame = frame.rename(columns={"value": target_col})
-
-        if merged is None:
-            merged = frame
-        else:
-            merged = merged.merge(frame, on="date", how="outer")
-
-    if merged is None or merged.empty:
-        raise FredDownloadError("Aucune serie FRED n'a ete telechargee.")
-
-    merged = merged.sort_values("date").reset_index(drop=True)
-    return merged
+    return frame.rename(columns={"value": CREDIT_SPREAD_COLUMN})
 
 
-def build_missing_fred_macro_frame(pandas_module: Any, dataset: Any) -> Any:
+def build_missing_credit_spread_frame(pandas_module: Any, dataset: Any) -> Any:
+    # FRED was the unstable dependency in the original pipeline. Keep the column
+    # for dataset schema compatibility, but make it all-missing unless the user
+    # explicitly opts into --include-credit-spread.
     frame = (
         dataset[["date"]]
         .drop_duplicates()
         .sort_values("date")
         .reset_index(drop=True)
     )
-    for target_col in FRED_SERIES.values():
-        frame[target_col] = pandas_module.NA
+    frame[CREDIT_SPREAD_COLUMN] = pandas_module.NA
     return frame
 
 
@@ -663,26 +1032,45 @@ def build_exogenous_daily_panel(
     pandas_module: Any,
     dataset: Any,
     yahoo_macro: Any,
-    fred_macro: Any,
-    allow_missing_fred: bool = False,
+    rate_macro: Any,
+    credit_macro: Any,
 ) -> Any:
     calendar = dataset[["date"]].copy()
     calendar["date"] = pandas_module.to_datetime(calendar["date"], errors="coerce")
-    calendar = calendar.dropna(subset=["date"]).drop_duplicates().sort_values("date").reset_index(drop=True)
+    calendar = (
+        calendar.dropna(subset=["date"])
+        .drop_duplicates()
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+    calendar_dates = calendar["date"]
 
     yahoo_macro = yahoo_macro.copy()
     yahoo_macro["date"] = pandas_module.to_datetime(yahoo_macro["date"], errors="coerce")
     yahoo_macro = yahoo_macro.dropna(subset=["date"]).copy()
 
-    fred_macro = fred_macro.copy()
-    fred_macro["date"] = pandas_module.to_datetime(fred_macro["date"], errors="coerce")
-    fred_macro = fred_macro.dropna(subset=["date"]).copy()
+    rate_macro = rate_macro.copy()
+    rate_macro["date"] = pandas_module.to_datetime(rate_macro["date"], errors="coerce")
+    rate_macro = rate_macro.dropna(subset=["date"]).copy()
 
-    exo = calendar.merge(yahoo_macro, on="date", how="left")
-    exo = exo.merge(fred_macro, on="date", how="left")
+    credit_macro = credit_macro.copy()
+    credit_macro["date"] = pandas_module.to_datetime(credit_macro["date"], errors="coerce")
+    credit_macro = credit_macro.dropna(subset=["date"]).copy()
+
+    # Rates have mixed calendars: Yahoo/Treasury are daily, OECD is monthly and
+    # often lands on a non-trading day. Merge on the union of dates first so the
+    # monthly OECD observations can be carried forward, then return to the CAC40
+    # trading calendar.
+    exo = calendar.merge(yahoo_macro, on="date", how="outer")
+    exo = exo.merge(rate_macro, on="date", how="outer")
+    exo = exo.merge(credit_macro, on="date", how="outer")
     exo = exo.sort_values("date").reset_index(drop=True)
 
-    numeric_cols = list(YAHOO_MACRO_TICKERS.values()) + list(FRED_SERIES.values())
+    numeric_cols = (
+        list(YAHOO_MACRO_TICKERS.values())
+        + RATE_MACRO_COLUMNS
+        + OPTIONAL_MACRO_COLUMNS
+    )
     for col in numeric_cols:
         if col not in exo.columns:
             exo[col] = pandas_module.NA
@@ -690,10 +1078,9 @@ def build_exogenous_daily_panel(
 
     # Policy locked: forward-fill only, no backward-fill.
     exo[numeric_cols] = exo[numeric_cols].ffill()
+    exo = exo[exo["date"].isin(calendar_dates)].copy()
 
-    required_numeric_cols = list(YAHOO_MACRO_TICKERS.values())
-    if not allow_missing_fred:
-        required_numeric_cols += list(FRED_SERIES.values())
+    required_numeric_cols = list(YAHOO_MACRO_TICKERS.values()) + RATE_MACRO_COLUMNS
 
     fully_missing = [
         col for col in required_numeric_cols if exo[col].notna().sum() == 0
@@ -732,7 +1119,6 @@ def enrich_dataset(
         "ust10y",
         "frt2y",
         "frt10y",
-        "credit_spread",
         "sector",
         "industry",
         "sector_bucket",
@@ -748,7 +1134,11 @@ def enrich_dataset(
         missing_label = ", ".join(missing)
         raise SystemExit(f"Colonnes manquantes apres enrichissement: {missing_label}")
 
-    for col in required_columns:
+    for col in OPTIONAL_MACRO_COLUMNS:
+        if col not in out.columns:
+            out[col] = pandas_module.NA
+
+    for col in required_columns + OPTIONAL_MACRO_COLUMNS:
         if col in {"sector", "industry", "sector_bucket"}:
             continue
         out[col] = pandas_module.to_numeric(out[col], errors="coerce")
@@ -886,23 +1276,36 @@ def main() -> None:
         start=start,
         end=end_for_yf,
     )
-    try:
-        fred_macro = download_fred_macro_series(
-            pandas_module=pandas_module,
-            start=start,
-            end_inclusive=end_inclusive,
-            timeout=args.fred_timeout,
-            retries=args.fred_retries,
-        )
-    except FredDownloadError as exc:
-        if not args.allow_missing_fred:
-            raise SystemExit(str(exc)) from exc
-        print(f"[macro-fred] Avertissement: {exc}")
-        print("[macro-fred] Colonnes FRED remplies avec des valeurs manquantes.")
-        fred_macro = build_missing_fred_macro_frame(
+    rate_macro = download_rate_macro_series(
+        pandas_module=pandas_module,
+        start=start,
+        end_inclusive=end_inclusive,
+        timeout=args.fred_timeout,
+        retries=args.fred_retries,
+    )
+
+    if args.include_credit_spread:
+        try:
+            credit_macro = download_credit_spread_series(
+                pandas_module=pandas_module,
+                start=start,
+                end_inclusive=end_inclusive,
+                timeout=args.fred_timeout,
+                retries=args.fred_retries,
+            )
+        except FredDownloadError as exc:
+            print(f"[macro-fred] Avertissement: {exc}")
+            print("[macro-fred] credit_spread rempli avec des valeurs manquantes.")
+            credit_macro = build_missing_credit_spread_frame(
+                pandas_module=pandas_module,
+                dataset=dataset,
+            )
+    else:
+        credit_macro = build_missing_credit_spread_frame(
             pandas_module=pandas_module,
             dataset=dataset,
         )
+
     metadata = download_yahoo_snapshot_metadata(
         pandas_module=pandas_module,
         yfinance_module=yfinance_module,
@@ -913,8 +1316,8 @@ def main() -> None:
         pandas_module=pandas_module,
         dataset=dataset,
         yahoo_macro=yahoo_macro,
-        fred_macro=fred_macro,
-        allow_missing_fred=args.allow_missing_fred,
+        rate_macro=rate_macro,
+        credit_macro=credit_macro,
     )
     dataset = enrich_dataset(
         pandas_module=pandas_module,

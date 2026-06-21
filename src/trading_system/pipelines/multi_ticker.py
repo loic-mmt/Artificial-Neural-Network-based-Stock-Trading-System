@@ -6,26 +6,11 @@ import pyarrow.dataset as ds
 import talib
 import matplotlib.pyplot as plt
 
-try:
-    from ANN.features import features, compute_market_features
-except ModuleNotFoundError:
-    from features import features, compute_market_features
-try:
-    from ANN.label_gridsearch_oracle_dp import build_oracle_labels_train_only
-except ModuleNotFoundError:
-    from label_gridsearch_oracle_dp import build_oracle_labels_train_only
+from trading_system.features.market import compute_market_features, features
+from trading_system.paths import default_market_dataset_path
 
-    
-DATA_DIR = "ANN/datasets/cac40_daily.parquet"
+DATA_DIR = default_market_dataset_path()
 CAPITAL = 10_000
-TICKER = "EN.PA"
-PRICE_COL = "adj_close"
-LABEL_WINDOW = 30
-TRAIN_RATIO = 0.70
-VAL_RATIO = 0.15
-ORACLE_LABEL_MODE = "all"  # "none" | "train_only" | "all"
-ORACLE_FEE_PER_TRADE = 2.0
-ORACLE_TRAIN_CSV = Path("ANN/datasets/oracle_labels_train_EN_PA.csv")
 np.random.seed(1)
 
 def read_parquet_dataset(
@@ -50,8 +35,6 @@ def read_parquet_dataset(
         Materialized data as a pandas DataFrame.
     """
     dataset = ds.dataset(str(base_dir), format="parquet", partitioning="hive")
-    if not dataset or dataset is None:
-        raise ValueError("dataset empty")
     table = dataset.to_table(filter=filter_expr, columns=columns)
     return table.to_pandas()
 
@@ -110,7 +93,7 @@ def to_train_test(df, split_index):
     return train, test
 
 
-def chronological_train_val_test_split(df, train_ratio=0.7, val_ratio=0.15):
+def chronological_train_val_test_split(df, train_ratio=0.7, val_ratio=0.15, group_col="ticker"):
     if not 0 < train_ratio < 1:
         raise ValueError("train_ratio doit etre dans l'intervalle ]0, 1[.")
     if not 0 < val_ratio < 1:
@@ -120,34 +103,83 @@ def chronological_train_val_test_split(df, train_ratio=0.7, val_ratio=0.15):
     if len(df) < 3:
         raise ValueError("Il faut au moins 3 lignes pour faire un split train/val/test.")
 
-    train_end = int(len(df) * train_ratio)
-    val_end = int(len(df) * (train_ratio + val_ratio))
+    def _split_one(group):
+        if len(group) < 3:
+            return None
 
-    train_end = min(max(train_end, 1), len(df) - 2)
-    val_end = min(max(val_end, train_end + 1), len(df) - 1)
+        train_end = int(len(group) * train_ratio)
+        val_end = int(len(group) * (train_ratio + val_ratio))
 
-    train_df = df.iloc[:train_end].copy()
-    val_df = df.iloc[train_end:val_end].copy()
-    test_df = df.iloc[val_end:].copy()
-    return train_df, val_df, test_df
+        train_end = min(max(train_end, 1), len(group) - 2)
+        val_end = min(max(val_end, train_end + 1), len(group) - 1)
+
+        train_part = group.iloc[:train_end].copy()
+        val_part = group.iloc[train_end:val_end].copy()
+        test_part = group.iloc[val_end:].copy()
+        return train_part, val_part, test_part
+
+    if group_col in df.columns:
+        train_parts, val_parts, test_parts = [], [], []
+        skipped = 0
+
+        for _, group in df.groupby(group_col, sort=False):
+            group = group.sort_values("date").copy()
+            split = _split_one(group)
+            if split is None:
+                skipped += 1
+                continue
+            train_part, val_part, test_part = split
+            train_parts.append(train_part)
+            val_parts.append(val_part)
+            test_parts.append(test_part)
+
+        if not train_parts:
+            raise ValueError("Aucun ticker exploitable pour le split train/val/test.")
+
+        if skipped > 0:
+            print(f"[split] tickers ignores (moins de 3 lignes): {skipped}")
+
+        train_df = pd.concat(train_parts, ignore_index=True)
+        val_df = pd.concat(val_parts, ignore_index=True)
+        test_df = pd.concat(test_parts, ignore_index=True)
+
+        sort_cols = [group_col, "date"]
+        train_df = train_df.sort_values(sort_cols).reset_index(drop=True)
+        val_df = val_df.sort_values(sort_cols).reset_index(drop=True)
+        test_df = test_df.sort_values(sort_cols).reset_index(drop=True)
+        return train_df, val_df, test_df
+
+    df = df.sort_values("date").reset_index(drop=True)
+    split = _split_one(df)
+    if split is None:
+        raise ValueError("Serie trop courte pour split train/val/test.")
+    return split
 
 
 def compute_features(df):
-    df = df.sort_values("date").copy()
-    df = compute_returns(df, cols=["open", "high", "low", "close", "adj_close", "volume"])
-    df = normalize_prices(df, cols=["open", "high", "low", "close", "adj_close"])
+    def _compute_one(group):
+        group = group.sort_values("date").copy()
+        group = compute_returns(group, cols=["open", "high", "low", "close", "adj_close", "volume"])
+        group = normalize_prices(group, cols=["open", "high", "low", "close", "adj_close"])
 
-    macd, _, _ = talib.MACD(df["log_adj_close"])
-    df["rsi"] = talib.RSI(df["log_adj_close"])
-    df["macd"] = macd
-    df["williams"] = talib.WILLR(df["log_high"], df["log_low"], df["log_close"])
-    df["range_log"] = df["log_high"] - df["log_low"]
-    df["body_log"] = df["log_close"] - df["log_open"]
-    df["upper_wick_log"] = df["log_high"] - np.maximum(df["log_open"], df["log_close"])
-    df["lower_wick_log"] = np.minimum(df["log_open"], df["log_close"]) - df["log_low"]
-    df["volume_relatif"] = df["volume"] / df["volume"].rolling(10).mean()
-    df["volatility_10"] = df["adj_close_ret"].rolling(10).std()
-    return df
+        macd, _, _ = talib.MACD(group["log_adj_close"])
+        group["rsi"] = talib.RSI(group["log_adj_close"])
+        group["macd"] = macd
+        group["williams"] = talib.WILLR(group["log_high"], group["log_low"], group["log_close"])
+        group["range_log"] = group["log_high"] - group["log_low"]
+        group["body_log"] = group["log_close"] - group["log_open"]
+        group["upper_wick_log"] = group["log_high"] - np.maximum(group["log_open"], group["log_close"])
+        group["lower_wick_log"] = np.minimum(group["log_open"], group["log_close"]) - group["log_low"]
+        group["volume_relatif"] = group["volume"] / group["volume"].rolling(10).mean()
+        group["volatility_10"] = group["adj_close_ret"].rolling(10).std()
+        return group
+
+    if "ticker" in df.columns:
+        parts = [_compute_one(group) for _, group in df.groupby("ticker", sort=False)]
+        out = pd.concat(parts, ignore_index=True)
+        return out.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+    return _compute_one(df).sort_values("date").reset_index(drop=True)
 
 
 def relu(x):
@@ -251,91 +283,6 @@ def labelling_all(df, window, price_col="adj_close"):
         return pd.concat(parts).sort_index()
     
     return _one_ticker(df)
-
-
-def merge_oracle_labels_on_train_only(
-    labeled_df: pd.DataFrame,
-    oracle_csv_path: Path,
-    train_ratio: float,
-    val_ratio: float,
-) -> pd.DataFrame:
-    """Replace Label/Label_id on train split with oracle labels, keep val/test unchanged."""
-    work = labeled_df.sort_values("date").reset_index(drop=True).copy()
-    train_df, val_df, test_df = chronological_train_val_test_split(
-        work, train_ratio=train_ratio, val_ratio=val_ratio
-    )
-
-    oracle_path = Path(oracle_csv_path)
-    if not oracle_path.exists():
-        print(f"[warn] oracle csv introuvable: {oracle_path}. Fallback labels standards.")
-        return work
-
-    oracle = pd.read_csv(oracle_path)
-    required = {"date", "Label_id"}
-    missing = required - set(oracle.columns)
-    if missing:
-        raise ValueError(f"Colonnes manquantes dans oracle csv: {sorted(missing)}")
-
-    oracle = oracle.copy()
-    oracle["date"] = pd.to_datetime(oracle["date"], errors="coerce")
-    oracle = oracle.dropna(subset=["date"])
-    oracle = oracle.drop_duplicates(subset=["date"], keep="last")
-    oracle = oracle[["date", "Label_id"]].rename(columns={"Label_id": "Label_id_oracle"})
-
-    merged_train = train_df.merge(oracle, on="date", how="left")
-    replaced_mask = merged_train["Label_id_oracle"].notna()
-    replaced_count = int(replaced_mask.sum())
-    if replaced_count == 0:
-        print("[warn] Aucun label train remplace par l'oracle (dates non alignées).")
-    else:
-        merged_train.loc[replaced_mask, "Label_id"] = (
-            merged_train.loc[replaced_mask, "Label_id_oracle"].astype(int)
-        )
-
-    id_to_label = {0: "Sell", 1: "Hold", 2: "Buy"}
-    merged_train["Label"] = merged_train["Label_id"].astype(int).map(id_to_label)
-    merged_train = merged_train.drop(columns=["Label_id_oracle"])
-
-    out = pd.concat([merged_train, val_df, test_df], ignore_index=True)
-    out = out.sort_values("date").reset_index(drop=True)
-    out["Label_id"] = out["Label_id"].astype(int)
-
-    train_rows = len(train_df)
-    coverage = (replaced_count / train_rows) if train_rows > 0 else 0.0
-    print(
-        f"[info] Oracle train merge | replaced={replaced_count}/{train_rows} "
-        f"({coverage:.1%}) | val/test labels=standards"
-    )
-
-    return out
-
-
-def apply_oracle_labels_on_all_data(
-    df: pd.DataFrame,
-    price_col: str,
-    capital: float,
-    fee_per_trade: float,
-) -> pd.DataFrame:
-    """Compute oracle labels on the full timeseries (train+val+test)."""
-    work = df.sort_values("date").reset_index(drop=True).copy()
-    oracle_df, report = build_oracle_labels_train_only(
-        train_df=work,
-        price_col=price_col,
-        initial_capital=float(capital),
-        fee_per_trade=float(fee_per_trade),
-    )
-    label_stats = {
-        "Buy": int((oracle_df["Label"] == "Buy").sum()),
-        "Hold": int((oracle_df["Label"] == "Hold").sum()),
-        "Sell": int((oracle_df["Label"] == "Sell").sum()),
-    }
-    print(
-        f"[info] Oracle ALL labels | fee={fee_per_trade:.2f} "
-        f"| outperf_vs_bh={report['outperformance_vs_buy_hold']:.2f} "
-        f"| n_trades={report['n_trades']}"
-    )
-    print(f"[info] Oracle ALL label stats ({TICKER}) = {label_stats}")
-    return oracle_df
 
 
 def recall_for_label(y_true, y_pred, label):
@@ -536,6 +483,92 @@ def build_context_dataset(df, feature_cols, context_len, target_start=0, return_
     return X, y
 
 
+def build_context_dataset_with_history(
+    target_df,
+    feature_cols,
+    context_len,
+    history_df=None,
+    group_col="ticker",
+    return_aligned_rows=False,
+):
+    if not isinstance(context_len, (int, np.integer)):
+        raise TypeError("context_len doit etre un entier.")
+    if context_len <= 0:
+        raise ValueError("context_len doit etre strictement positif.")
+
+    target_df = target_df.copy()
+    if history_df is not None:
+        history_df = history_df.copy()
+
+    if group_col in target_df.columns:
+        X_parts, y_parts, aligned_parts = [], [], []
+        tickers = pd.unique(target_df[group_col].dropna())
+
+        for ticker in tickers:
+            target_group = target_df[target_df[group_col] == ticker].sort_values("date").copy()
+            if target_group.empty:
+                continue
+
+            if history_df is None or group_col not in history_df.columns:
+                history_group = target_group.iloc[0:0].copy()
+            else:
+                history_group = history_df[history_df[group_col] == ticker].sort_values("date").copy()
+
+            prefix_len = min(context_len - 1, len(history_group))
+            source = pd.concat([history_group.tail(prefix_len), target_group], ignore_index=True)
+
+            Xg, yg, idxg = build_context_dataset(
+                source,
+                feature_cols,
+                context_len,
+                target_start=prefix_len,
+                return_indices=True,
+            )
+            if len(Xg) == 0:
+                continue
+
+            X_parts.append(Xg)
+            y_parts.append(yg)
+            if return_aligned_rows:
+                aligned_parts.append(source.iloc[idxg].copy().reset_index(drop=True))
+
+        if not X_parts:
+            empty_x = np.empty((0, context_len * len(feature_cols)), dtype=np.float32)
+            empty_y = np.empty((0,), dtype=np.int64)
+            if return_aligned_rows:
+                return empty_x, empty_y, target_df.iloc[0:0].copy()
+            return empty_x, empty_y
+
+        X = np.concatenate(X_parts, axis=0)
+        y = np.concatenate(y_parts, axis=0)
+        if return_aligned_rows:
+            aligned = pd.concat(aligned_parts, ignore_index=True)
+            return X, y, aligned
+        return X, y
+
+    target_sorted = target_df.sort_values("date").copy()
+    if history_df is None:
+        source = target_sorted
+        target_start = 0
+    else:
+        history_sorted = history_df.sort_values("date").copy()
+        prefix_len = min(context_len - 1, len(history_sorted))
+        source = pd.concat([history_sorted.tail(prefix_len), target_sorted], ignore_index=True)
+        target_start = prefix_len
+
+    X, y, idx = build_context_dataset(
+        source,
+        feature_cols,
+        context_len,
+        target_start=target_start,
+        return_indices=True,
+    )
+    if return_aligned_rows:
+        aligned = source.iloc[idx].copy().reset_index(drop=True) if len(idx) > 0 else source.iloc[0:0].copy()
+        return X, y, aligned
+    return X, y
+
+
 def signals_to_positions(pred_labels):
     """Convert class predictions to a long/flat position stream."""
     positions = []
@@ -559,26 +592,69 @@ def evaluate_strategy_vs_buy_hold(test_frame, pred_labels, initial_capital=10_00
     if len(test_frame) < 2:
         raise ValueError("Le set test doit contenir au moins 2 lignes pour calculer un PnL.")
 
-    prices = test_frame[price_col].to_numpy(dtype=np.float64)
-    forward_returns = np.zeros(len(prices), dtype=np.float64)
-    forward_returns[:-1] = (prices[1:] / prices[:-1]) - 1.0
+    def _single_curve(frame, labels, capital):
+        prices = frame[price_col].to_numpy(dtype=np.float64)
+        forward_returns = np.zeros(len(prices), dtype=np.float64)
+        forward_returns[:-1] = (prices[1:] / prices[:-1]) - 1.0
 
-    positions = signals_to_positions(pred_labels)
-    strategy_returns = positions * forward_returns
+        positions = signals_to_positions(labels)
+        strategy_returns = positions * forward_returns
 
-    model_curve = initial_capital * np.cumprod(1.0 + strategy_returns)
-    buy_hold_curve = initial_capital * np.cumprod(1.0 + forward_returns)
+        model_curve = capital * np.cumprod(1.0 + strategy_returns)
+        buy_hold_curve = capital * np.cumprod(1.0 + forward_returns)
+        return float(model_curve[-1]), float(buy_hold_curve[-1])
 
-    model_final = float(model_curve[-1])
-    buy_hold_final = float(buy_hold_curve[-1])
+    if "ticker" not in test_frame.columns:
+        model_final, buy_hold_final = _single_curve(test_frame, pred_labels, float(initial_capital))
+        return {
+            "initial_capital": float(initial_capital),
+            "model_final_capital": model_final,
+            "buy_hold_final_capital": buy_hold_final,
+            "model_pnl": model_final - float(initial_capital),
+            "buy_hold_pnl": buy_hold_final - float(initial_capital),
+            "outperformance": model_final - buy_hold_final,
+        }
 
+    pred_labels = np.asarray(pred_labels)
+    groups = list(test_frame.groupby("ticker", sort=False))
+    if not groups:
+        raise ValueError("Aucun ticker present dans le set test.")
+
+    capital_per_ticker = float(initial_capital) / len(groups)
+    offset = 0
+    model_total = 0.0
+    buy_hold_total = 0.0
+    used_groups = 0
+
+    for _, frame in groups:
+        frame = frame.reset_index(drop=True)
+        n = len(frame)
+        group_preds = pred_labels[offset : offset + n]
+        offset += n
+
+        if len(group_preds) != n:
+            raise ValueError("Mismatch entre predictions et lignes d'un ticker.")
+        if n < 2:
+            continue
+
+        model_final, buy_hold_final = _single_curve(frame, group_preds, capital_per_ticker)
+        model_total += model_final
+        buy_hold_total += buy_hold_final
+        used_groups += 1
+
+    if offset != len(pred_labels):
+        raise ValueError("Des predictions n'ont pas ete consommees pendant l'evaluation PnL.")
+    if used_groups == 0:
+        raise ValueError("Aucun ticker test exploitable (minimum 2 lignes requises).")
+
+    initial_used = capital_per_ticker * used_groups
     return {
-        "initial_capital": float(initial_capital),
-        "model_final_capital": model_final,
-        "buy_hold_final_capital": buy_hold_final,
-        "model_pnl": model_final - float(initial_capital),
-        "buy_hold_pnl": buy_hold_final - float(initial_capital),
-        "outperformance": model_final - buy_hold_final,
+        "initial_capital": float(initial_used),
+        "model_final_capital": float(model_total),
+        "buy_hold_final_capital": float(buy_hold_total),
+        "model_pnl": float(model_total - initial_used),
+        "buy_hold_pnl": float(buy_hold_total - initial_used),
+        "outperformance": float(model_total - buy_hold_total),
     }
 
 
@@ -628,9 +704,9 @@ def train_model(
         "volume_relatif",
         "volatility_10",
     ]
-    feature_cols = list(features)
-    train = compute_market_features(train)
-    train = train.dropna(subset=feature_cols + ["Label_id"]).sort_values("date").copy()
+    train = compute_features(train)
+    sort_cols = ["ticker", "date"] if "ticker" in train.columns else ["date"]
+    train = train.dropna(subset=feature_cols + ["Label_id"]).sort_values(sort_cols).copy()
 
     if train.empty:
         raise ValueError("Aucune ligne exploitable apres calcul des features.")
@@ -641,28 +717,25 @@ def train_model(
         val_ratio=val_ratio,
     )
 
-    X_train_raw, y_train = build_context_dataset(train_df, feature_cols, context_len)
-
-    # Build validation windows with train history as context
-    val_prefix_len = min(context_len - 1, len(train_df))
-    val_source = pd.concat([train_df.tail(val_prefix_len), val_df], ignore_index=True)
-    X_val_raw, y_val = build_context_dataset(
-        val_source,
+    X_train_raw, y_train = build_context_dataset_with_history(
+        train_df,
         feature_cols,
         context_len,
-        target_start=val_prefix_len,
+        history_df=None,
     )
-
-    # Build test windows with train+val history as context
-    test_history = pd.concat([train_df, val_df], ignore_index=True)
-    test_prefix_len = min(context_len - 1, len(test_history))
-    test_source = pd.concat([test_history.tail(test_prefix_len), test_df], ignore_index=True)
-    X_test_raw, y_test, test_target_indices = build_context_dataset(
-        test_source,
+    X_val_raw, y_val = build_context_dataset_with_history(
+        val_df,
         feature_cols,
         context_len,
-        target_start=test_prefix_len,
-        return_indices=True,
+        history_df=train_df,
+    )
+    test_history = pd.concat([train_df, val_df], ignore_index=True)
+    X_test_raw, y_test, aligned_test_frame = build_context_dataset_with_history(
+        test_df,
+        feature_cols,
+        context_len,
+        history_df=test_history,
+        return_aligned_rows=True,
     )
 
     if len(X_train_raw) == 0:
@@ -850,7 +923,306 @@ def train_model(
     test_preds = predict_with_thresholds(test_probs, best["thresholds"][0], best["thresholds"][1])
     test_metrics = evaluate_predictions(y_test, test_preds)
 
-    aligned_test_frame = test_source.iloc[test_target_indices].reset_index(drop=True)
+    benchmark_comparison = evaluate_strategy_vs_buy_hold(
+        aligned_test_frame,
+        test_preds,
+        initial_capital=float(CAPITAL),
+        price_col="adj_close",
+    )
+
+    best["test_metrics"] = test_metrics
+    best["test_y_true"] = y_test.copy()
+    best["test_y_pred"] = test_preds.copy()
+    best["benchmark_comparison"] = benchmark_comparison
+
+    print(
+        "\nFinal test \n| "
+        f"acc = {test_metrics['acc']:.3f} | bal_acc = {test_metrics['bal_acc']:.3f} "
+        f"| macro_f1 = {test_metrics['macro_f1']:.3f} \n"
+        f"| precision_buy = {test_metrics['precision_buy']:.3f}  | recall_buy = {test_metrics['recall_buy']:.3f} \n"
+        f"| precision_sell = {test_metrics['precision_sell']:.3f} | recall_sell = {test_metrics['recall_sell']:.3f} \n"
+        f"| precision_hold = {test_metrics['precision_hold']:.3f} | recall_hold = {test_metrics['recall_hold']:.3f} \n"
+        f"| buy_threshold = {best['thresholds'][0]:.2f}   | sell_threshold = {best['thresholds'][1]:.2f}"
+    )
+    print(
+        "\nPnL test \n| "
+        f"model={benchmark_comparison['model_pnl']:.2f} "
+        f"| buy_hold={benchmark_comparison['buy_hold_pnl']:.2f} "
+        f"| outperformance={benchmark_comparison['outperformance']:.2f} "
+        f"| final_model={benchmark_comparison['model_final_capital']:.2f} "
+        f"| final_buy_hold={benchmark_comparison['buy_hold_final_capital']:.2f}\n"
+    )
+
+    plot_confusion_matrix(best["test_y_true"], best["test_y_pred"])
+
+    return best
+
+
+def train_model_features(
+    train,
+    epochs=500,
+    alpha=1e-3,
+    hidden=32,
+    do_dropout=False,
+    dropout_percent=0.1,
+    batch_size=32,
+    train_ratio=0.7,
+    val_ratio=0.15,
+    context_len=20,
+    early_stopping_patience=50,
+    early_stopping_min_delta=1e-4,
+):
+    if batch_size <= 0:
+        raise ValueError("batch_size doit etre strictement positif.")
+    if not 0 <= dropout_percent < 1:
+        raise ValueError("dropout_percent doit etre dans [0, 1).")
+    if not isinstance(context_len, (int, np.integer)):
+        raise TypeError("context_len doit etre un entier.")
+    if context_len <= 0:
+        raise ValueError("context_len doit etre strictement positif.")
+    if not isinstance(early_stopping_patience, (int, np.integer)):
+        raise TypeError("early_stopping_patience doit etre un entier.")
+    if early_stopping_patience <= 0:
+        raise ValueError("early_stopping_patience doit etre strictement positif.")
+    if early_stopping_min_delta < 0:
+        raise ValueError("early_stopping_min_delta doit etre >= 0.")
+
+    feature_cols = [
+        "open_ret",
+        "high_ret",
+        "low_ret",
+        "close_ret",
+        "adj_close_ret",
+        "volume_ret",
+        "rsi",
+        "macd",
+        "williams",
+        "range_log",
+        "body_log",
+        "upper_wick_log",
+        "lower_wick_log",
+        "volume_relatif",
+        "volatility_10",
+    ]
+    train = compute_market_features(train)
+    sort_cols = ["ticker", "date"] if "ticker" in train.columns else ["date"]
+    train = train.dropna(subset=features + ["Label_id"]).sort_values(sort_cols).copy()
+
+    if train.empty:
+        raise ValueError("Aucune ligne exploitable apres calcul des features.")
+
+    train_df, val_df, test_df = chronological_train_val_test_split(
+        train,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+    )
+
+    X_train_raw, y_train = build_context_dataset_with_history(
+        train_df,
+        features,
+        context_len,
+        history_df=None,
+    )
+    X_val_raw, y_val = build_context_dataset_with_history(
+        val_df,
+        features,
+        context_len,
+        history_df=train_df,
+    )
+    test_history = pd.concat([train_df, val_df], ignore_index=True)
+    X_test_raw, y_test, aligned_test_frame = build_context_dataset_with_history(
+        test_df,
+        features,
+        context_len,
+        history_df=test_history,
+        return_aligned_rows=True,
+    )
+
+    if len(X_train_raw) == 0:
+        raise ValueError("Aucun echantillon train apres fenetrage. Reduis context_len.")
+    if len(X_val_raw) == 0:
+        raise ValueError("Aucun echantillon validation apres fenetrage. Reduis context_len.")
+    if len(X_test_raw) == 0:
+        raise ValueError("Aucun echantillon test apres fenetrage. Reduis context_len.")
+
+    Y_train = one_hot(y_train, 3)
+    class_weights = compute_class_weights(y_train, num_classes=3)
+
+    X_train, feature_mean, feature_std = standardize_features(X_train_raw)
+    X_val, _, _ = standardize_features(
+        X_val_raw,
+        mean=feature_mean,
+        std=feature_std,
+    )
+    X_test, _, _ = standardize_features(
+        X_test_raw,
+        mean=feature_mean,
+        std=feature_std,
+    )
+
+    entry = X_train.shape[1]
+    if entry != context_len * len(features):
+        raise ValueError("Entry size miss-match.")
+    
+    W0 = 0.01 * np.random.randn(entry, hidden).astype(np.float32)
+    b0 = np.zeros((1, hidden), dtype=np.float32)
+    W1 = 0.01 * np.random.randn(hidden, 3).astype(np.float32)
+    b1 = np.zeros((1, 3), dtype=np.float32)
+
+    N = len(X_train)
+    best_macro_f1 = -1.0
+    best = None
+
+    print("\ntrain rows:", len(train_df), "| val rows:", len(val_df), "| test rows:", len(test_df))
+    print("X_train:", X_train.shape)
+    print("X_val:", X_val.shape)
+    print("X_test:", X_test.shape)
+    print("context_len:", context_len, "| feature_dim:", len(features))
+    print("W0:", W0.shape)
+    print("b0:", b0.shape)
+    print("W1:", W1.shape)
+    print("b1:", b1.shape)
+    print("class_weights:", class_weights)
+
+    no_improve_count = 0
+    best_epoch = 0
+    stop_reason = "max_epochs"
+
+    for ep in range(epochs):
+        perm = np.random.permutation(N)
+        Xp, Yp = X_train[perm], Y_train[perm]
+        epoch_loss = 0.0
+
+        for start in range(0, N, batch_size):
+            xb = Xp[start:start + batch_size]
+            yb = Yp[start:start + batch_size]
+            m = len(xb)
+
+            z1, a1, _, p = forward_pass(xb, W0, b0, W1, b1)
+
+            dropout_applied = False
+            if do_dropout and dropout_percent > 0:
+                m1 = dropout_mask(a1.shape, dropout_percent)
+                a1 *= m1
+                dropout_applied = True
+
+            logits = a1 @ W1 + b1
+            p = softmax(logits)
+            sample_weights = yb @ class_weights
+            weight_sum = sample_weights.sum()
+            batch_loss = -np.sum(yb * np.log(p + 1e-12) * class_weights[None, :]) / weight_sum
+            epoch_loss += batch_loss * m
+
+            dz2 = ((p - yb) * sample_weights[:, None]) / weight_sum
+            dW1 = a1.T @ dz2
+            db1 = dz2.sum(axis=0, keepdims=True)
+
+            da1 = dz2 @ W1.T
+            if dropout_applied:
+                da1 *= m1
+
+            dz1 = da1 * relu_derivative(z1)
+            dW0 = xb.T @ dz1
+            db0 = dz1.sum(axis=0, keepdims=True)
+
+            W1 -= alpha * dW1
+            b1 -= alpha * db1
+            W0 -= alpha * dW0
+            b0 -= alpha * db0
+
+        _, _, _, val_probs = forward_pass(X_val, W0, b0, W1, b1)
+        thresholds = threshold_gridsearch(val_probs, y_val)
+        val_preds = predict_with_thresholds(val_probs, thresholds[0], thresholds[1])
+        val_metrics = evaluate_predictions(y_val, val_preds)
+
+        _, _, _, train_probs = forward_pass(X_train, W0, b0, W1, b1)
+        train_preds = predict_with_thresholds(train_probs, thresholds[0], thresholds[1])
+        train_metrics = evaluate_predictions(y_train, train_preds)
+        avg_loss = epoch_loss / N
+
+        macro_improved = val_metrics["macro_f1"] > (best_macro_f1 + early_stopping_min_delta)
+        macro_tie = np.isclose(
+            val_metrics["macro_f1"],
+            best_macro_f1,
+            atol=early_stopping_min_delta,
+        )
+        bal_acc_improved = (
+            best is not None and val_metrics["bal_acc"] > best["val_bal_acc"] + 1e-12
+        )
+
+        if best is None or macro_improved or (macro_tie and bal_acc_improved):
+            best_macro_f1 = val_metrics["macro_f1"]
+            best = {
+                "W0": W0.copy(),
+                "b0": b0.copy(),
+                "W1": W1.copy(),
+                "b1": b1.copy(),
+                "features": features,
+                "feature_mean": feature_mean.copy(),
+                "feature_std": feature_std.copy(),
+                "train_ratio": train_ratio,
+                "val_ratio": val_ratio,
+                "thresholds": thresholds,
+                "train_metrics": train_metrics,
+                "val_metrics": val_metrics,
+                "val_y_true": y_val.copy(),
+                "val_y_pred": val_preds.copy(),
+                "val_bal_acc": val_metrics["bal_acc"],
+                "best_macro_f1": best_macro_f1,
+                "best_epoch": ep + 1,
+            }
+            best_epoch = ep + 1
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
+
+        if no_improve_count >= early_stopping_patience:
+            stop_reason = (
+                f"early_stopping(patience = {early_stopping_patience}, "
+                f"min_delta = {early_stopping_min_delta})"
+            )
+            print(
+                f"\nEarly stopping at epoch {ep + 1}/{epochs} "
+                f"(best_epoch = {best_epoch}, best_macro_f1 = {best_macro_f1:.3f}, "
+                f"best_bal_acc = {best['val_bal_acc']:.3f})."
+            )
+            break
+
+        #if ep in {0, 49, 99, 149, 199} or ep == epochs - 1:
+        if ep == 0:
+            print("\nStarting training ===========================================")
+            """print(
+                f"\nepoch {ep + 1}/{epochs} \n| loss = {avg_loss:.4f} \n"
+                f"| acc(train) = {train_metrics['acc']:.3f}     | acc(val) = {val_metrics['acc']:.3f} \n"
+                f"| bal_acc(val) = {val_metrics['bal_acc']:.3f}   | macro_f1(val) = {val_metrics['macro_f1']:.3f} \n"
+                f"| precision_buy = {val_metrics['precision_buy']:.3f}  | recall_buy = {val_metrics['recall_buy']:.3f} \n"
+                f"| precision_sell = {val_metrics['precision_sell']:.3f} | recall_sell = {val_metrics['recall_sell']:.3f} \n"
+                f"| precision_hold = {val_metrics['precision_hold']:.3f} | recall_hold = {val_metrics['recall_hold']:.3f}"
+            )"""
+        print(
+                f"\nepoch {ep + 1}/{epochs} \n| loss = {avg_loss:.4f}          "
+                f"| acc(train) = {train_metrics['acc']:.3f}     | acc(val) = {val_metrics['acc']:.3f}       "
+                f"| bal_acc(val) = {val_metrics['bal_acc']:.3f}    | macro_f1(val) = {val_metrics['macro_f1']:.3f} \n"
+                f"| precision_buy = {val_metrics['precision_buy']:.3f}  | precision_sell = {val_metrics['precision_sell']:.3f} "
+                f"| precision_hold = {val_metrics['precision_hold']:.3f} \n| recall_buy = {val_metrics['recall_buy']:.3f}     "
+                f"| recall_sell = {val_metrics['recall_sell']:.3f}    | recall_hold = {val_metrics['recall_hold']:.3f}"
+            )
+        if ep == epochs - 1:
+            print("\nEnding training ===========================================")
+
+    if best is None:
+        raise RuntimeError("Aucun meilleur modele enregistre pendant l'entrainement.")
+    best["stop_reason"] = stop_reason
+    print(
+        "\nTraining stop \n| "
+        f"reason = {best['stop_reason']} | best_epoch = {best['best_epoch']} "
+        f"| best_macro_f1(val) = {best['best_macro_f1']:.3f} | best_bal_acc(val) = {best['val_bal_acc']:.3f}"
+    )
+
+    _, _, _, test_probs = forward_pass(X_test, best["W0"], best["b0"], best["W1"], best["b1"])
+    test_preds = predict_with_thresholds(test_probs, best["thresholds"][0], best["thresholds"][1])
+    test_metrics = evaluate_predictions(y_test, test_preds)
+
     benchmark_comparison = evaluate_strategy_vs_buy_hold(
         aligned_test_frame,
         test_preds,
@@ -922,48 +1294,20 @@ def plot_signals(df, window=160, price_col="adj_close"):
     plt.show()
 
 
-
 def main():
     df = read_parquet_dataset(DATA_DIR)
-    if "date" not in df.columns:
-        raise ValueError("Colonne 'date' manquante dans le dataset source.")
 
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"]).copy()
-
-    if "ticker" in df.columns:
-        work = df[df["ticker"] == TICKER].copy()
-    else:
-        work = df.copy()
-
-    if work.empty:
-        raise ValueError(f"Aucune ligne pour ticker={TICKER}")
-
-    if ORACLE_LABEL_MODE == "all":
-        labeled_df = apply_oracle_labels_on_all_data(
-            df=work,
-            price_col=PRICE_COL,
-            capital=float(CAPITAL),
-            fee_per_trade=float(ORACLE_FEE_PER_TRADE),
-        )
-    else:
-        labeled_df, label_stats = labelling(work, LABEL_WINDOW, price_col=PRICE_COL)
-        print(f"[info] Base label stats ({TICKER}) = {label_stats}")
-
-    if ORACLE_LABEL_MODE == "train_only":
-        labeled_df = merge_oracle_labels_on_train_only(
-            labeled_df=labeled_df,
-            oracle_csv_path=ORACLE_TRAIN_CSV,
-            train_ratio=TRAIN_RATIO,
-            val_ratio=VAL_RATIO,
-        )
-
-    model = train_model(
-        labeled_df,
-        train_ratio=TRAIN_RATIO,
-        val_ratio=VAL_RATIO,
+    # Pipeline multi-ticker CAC40
+    df = labelling_all(df, 30)
+    label_stats = (
+        df["Label"]
+        .value_counts()
+        .reindex(["Buy", "Hold", "Sell"], fill_value=0)
+        .to_dict()
     )
-    return model
+    print(f"\nLabel stats (multi-ticker): {label_stats}")
+    _ = train_model(df)
+
 
 if __name__ == "__main__":
     main()

@@ -1,19 +1,18 @@
+import argparse
 from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ANN import (
+from trading_system.paths import default_market_dataset_path
+from trading_system.pipelines.single_ticker import (
     read_parquet_dataset,
     chronological_train_val_test_split,
     evaluate_strategy_vs_buy_hold,
     enforce_alternating_signals,
-    compute_returns)
+    compute_returns,
+)
 
-DATA_DIR = Path(__file__).resolve().parent / "datasets" / "cac40_daily.parquet"
-
-df = read_parquet_dataset(DATA_DIR)
-df = df[df["ticker"] == "EN.PA"].copy()
-train, val, test = chronological_train_val_test_split(df, train_ratio=0.7, val_ratio=0.15)
+DATA_DIR = default_market_dataset_path()
 
 
 def benchmark(df, price_col="adj_close", capital = 10_000):
@@ -302,13 +301,45 @@ def label_gridsearch_long_short(df, price_col="adj_close", fees=1.0, capital=10_
     results_df = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
     return best_params, best_metrics, results_df
 
+def load_default_validation_split(
+    ticker: str = "EN.PA",
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    df = read_parquet_dataset(DATA_DIR)
+    df = df[df["ticker"] == ticker].copy()
+    return chronological_train_val_test_split(df, train_ratio=train_ratio, val_ratio=val_ratio)
 
-best_params, best_metrics, results_df = label_gridsearch(val, fees=2.0)
-print(best_params)
-print(best_metrics)
-print(results_df)
 
-best_params, best_metrics, results_df = label_gridsearch_long_short(val, fees=2.0)
-print(best_params)
-print(best_metrics)
-print(results_df)
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Grid search on breakout labels over validation split.")
+    parser.add_argument("--ticker", default="EN.PA")
+    parser.add_argument("--fees", type=float, default=2.0)
+    parser.add_argument("--capital", type=float, default=10_000.0)
+    parser.add_argument("--price-col", default="adj_close")
+    parser.add_argument("--mode", choices=("long_only", "long_short"), default="long_only")
+    args = parser.parse_args()
+
+    _, val, _ = load_default_validation_split(ticker=args.ticker)
+    if args.mode == "long_short":
+        best_params, best_metrics, results_df = label_gridsearch_long_short(
+            val,
+            price_col=args.price_col,
+            fees=args.fees,
+            capital=args.capital,
+        )
+    else:
+        best_params, best_metrics, results_df = label_gridsearch(
+            val,
+            price_col=args.price_col,
+            fees=args.fees,
+            capital=args.capital,
+        )
+
+    print(best_params)
+    print(best_metrics)
+    print(results_df.head(20))
+
+
+if __name__ == "__main__":
+    main()

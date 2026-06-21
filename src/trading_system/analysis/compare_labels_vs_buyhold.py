@@ -1,27 +1,15 @@
-from pathlib import Path
-import importlib.util
 import numpy as np
 import pandas as pd
 
+from trading_system.paths import default_market_dataset_path
+from trading_system.pipelines.multi_ticker import (
+    evaluate_strategy_vs_buy_hold,
+    labelling_all,
+    read_parquet_dataset,
+)
 
 WINDOW = 20
 CAPITAL = 10_000.0
-
-
-def load_multi_ticker_module():
-    ann_dir = Path(__file__).resolve().parent
-    module_path = ann_dir / "ANN_multi-ticker.py"
-
-    if not module_path.exists():
-        raise FileNotFoundError(f"Module introuvable: {module_path}")
-
-    spec = importlib.util.spec_from_file_location("ann_multi_ticker_module", module_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Impossible de charger le module: {module_path}")
-
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def ensure_no_ticker_mixing(df):
@@ -54,12 +42,7 @@ def ensure_no_ticker_mixing(df):
 
 
 def main():
-    mod = load_multi_ticker_module()
-    read_parquet_dataset = mod.read_parquet_dataset
-    labelling_all = mod.labelling_all
-    evaluate_strategy_vs_buy_hold = mod.evaluate_strategy_vs_buy_hold
-
-    data_dir = Path(__file__).resolve().parent / "datasets" / "cac40_daily.parquet"
+    data_dir = default_market_dataset_path()
     df = read_parquet_dataset(data_dir)
     df = labelling_all(df, WINDOW)
     df = ensure_no_ticker_mixing(df)
@@ -76,4 +59,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

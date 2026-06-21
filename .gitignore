@@ -1,6 +1,11 @@
-/.venv
-ANN/datasets
-ANN/__pycache__
-ANN/backtest_lib.py
-ANN/backtest.ipynb
-/research
+.venv/
+.cache/
+__pycache__/
+*.py[cod]
+.DS_Store
+ANN/__pycache__/
+ANN/datasets/
+data/processed/
+data/derived/
+artifacts/
+notebooks/.ipynb_checkpoints/

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import importlib.util
 import io
 import itertools
 import json
@@ -14,6 +13,9 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
+from trading_system.paths import default_market_dataset_path, gridsearch_dir
+from trading_system.pipelines import walkforward as wf
 
 
 @dataclass(frozen=True)
@@ -29,22 +31,6 @@ class TrialConfig:
     batch_size: int
     decision_mode: str
     min_action_rate: float
-
-
-def load_walkforward_module():
-    ann_dir = Path(__file__).resolve().parent
-    module_path = ann_dir / "ANN_oracle_walkforward.py"
-    if not module_path.exists():
-        raise FileNotFoundError(f"Module introuvable: {module_path}")
-
-    spec = importlib.util.spec_from_file_location("ann_oracle_walkforward_module", module_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Impossible de charger le module: {module_path}")
-
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
 
 def parse_int_list(raw: str) -> list[int]:
     vals = [x.strip() for x in raw.split(",") if x.strip()]
@@ -136,11 +122,11 @@ def objective_value(row: dict[str, Any], objective: str) -> float:
 def build_parser():
     p = argparse.ArgumentParser(
         description=(
-            "Grid search walk-forward pour ANN_oracle_walkforward.py "
+            "Grid search walk-forward pour pipeline walkforward.py "
             "(objectif principal: outperformance)."
         )
     )
-    p.add_argument("--data-dir", type=Path, default=Path("ANN/datasets/cac40_daily.parquet"))
+    p.add_argument("--data-dir", type=Path, default=default_market_dataset_path())
     p.add_argument("--ticker", type=str, default="EN.PA")
     p.add_argument("--price-col", type=str, default="adj_close")
     p.add_argument("--capital", type=float, default=10_000.0)
@@ -184,7 +170,6 @@ def main():
     if args.show_inner_logs:
         args.suppress_inner_logs = False
 
-    wf = load_walkforward_module()
     data_dir = Path(args.data_dir).expanduser().resolve()
 
     df = wf.read_parquet_dataset(data_dir)
@@ -373,8 +358,8 @@ def main():
     top_df = ok_df.head(max(1, int(args.top_k))) if not ok_df.empty else ok_df
 
     now_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    default_csv = Path("ANN/datasets") / f"gridsearch_walkforward_{now_tag}.csv"
-    default_json = Path("ANN/datasets") / f"gridsearch_walkforward_{now_tag}.json"
+    default_csv = gridsearch_dir() / f"gridsearch_walkforward_{now_tag}.csv"
+    default_json = gridsearch_dir() / f"gridsearch_walkforward_{now_tag}.json"
     out_csv = Path(args.output_csv) if args.output_csv is not None else default_csv
     out_json = Path(args.output_json) if args.output_json is not None else default_json
     out_csv = out_csv.expanduser().resolve()
