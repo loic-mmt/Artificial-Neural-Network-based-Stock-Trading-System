@@ -9,3 +9,5 @@ data/processed/
 data/derived/
 artifacts/
 notebooks/.ipynb_checkpoints/
+archive/
+tmp/
