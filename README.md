@@ -2,7 +2,13 @@
 
 ## Layout
 
-- `src/trading_system/`: importable package with data, features, labels, pipelines, and backtest code
+- `src/trading_system/data/`: loading, chronological splits, context windows, scaling
+- `src/trading_system/features/`: technical and full-market feature builders
+- `src/trading_system/labels/`: shared label schema, breakout, forward-return, and oracle labels
+- `src/trading_system/models/`: common classifier contract, manual ANN, estimator adapters
+- `src/trading_system/experiments/`: model-neutral static, walk-forward, and search runners
+- `src/trading_system/pipelines/`: thin CLI/configuration wrappers
+- `src/trading_system/backtest/`: positions, timing, fees, benchmarks, and advanced backtests
 - `scripts/`: runnable entrypoints
 - `data/processed/`: local market datasets
 - `data/derived/`: generated labels and derived tables
@@ -11,7 +17,7 @@
 
 ## Quick Start
 
-Install deps from [requirements.txt](/Users/loic/Documents/Code/DL/Artificial-Neural-Network-based-Stock-Trading-System/requirements.txt), then run scripts from repo root:
+Install deps from [requirements.txt](requirements.txt), then run scripts from repo root:
 
 ```bash
 python scripts/download_market_data.py
@@ -19,6 +25,19 @@ python scripts/run_single_ticker.py
 python scripts/run_walkforward.py
 python scripts/run_gridsearch_walkforward.py
 ```
+
+Run tests with development dependencies:
+
+```bash
+python -m pip install -e ".[dev]"
+pytest
+```
+
+## Adding another model
+
+Implement `fit(...)` and `predict_proba(...)` from `ProbabilisticClassifier`, or wrap a scikit-learn-style estimator with `SklearnClassifierAdapter`. Pass model into `run_experiment`; feature preparation, thresholds, metrics, and backtest stay unchanged.
+
+See [restructuring plan](docs/restructuring-plan.md) for ownership rules and migration record.
 
 ## Inspiration
 

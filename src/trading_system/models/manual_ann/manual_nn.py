@@ -1,0 +1,276 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from trading_system.labels.schema import N_CLASSES
+from trading_system.models.base import FitResult, TrainingHistory
+from trading_system.training.weights import compute_class_weights
+
+
+def relu(values: np.ndarray) -> np.ndarray:
+    return np.maximum(0.0, values)
+
+
+def relu_derivative(values: np.ndarray) -> np.ndarray:
+    return (values > 0.0).astype(np.float32)
+
+
+def softmax(logits: np.ndarray) -> np.ndarray:
+    values = np.asarray(logits, dtype=np.float32)
+    shifted = values - values.max(axis=1, keepdims=True)
+    exponentials = np.exp(shifted)
+    return (exponentials / exponentials.sum(axis=1, keepdims=True)).astype(np.float32)
+
+
+def one_hot(labels: np.ndarray, num_classes: int = N_CLASSES) -> np.ndarray:
+    y = np.asarray(labels, dtype=np.int64)
+    if y.ndim != 1 or (y < 0).any() or (y >= num_classes).any():
+        raise ValueError("labels must be a 1D array inside the configured class range.")
+    encoded = np.zeros((len(y), num_classes), dtype=np.float32)
+    encoded[np.arange(len(y)), y] = 1.0
+    return encoded
+
+
+def dropout_mask(
+    shape: tuple[int, ...],
+    probability: float,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    if not 0.0 <= probability < 1.0:
+        raise ValueError("dropout probability must be in [0, 1).")
+    generator = rng or np.random.default_rng()
+    keep_probability = 1.0 - probability
+    return (generator.random(shape) < keep_probability).astype(
+        np.float32
+    ) / keep_probability
+
+
+def forward_pass(
+    X: np.ndarray,
+    W0: np.ndarray,
+    b0: np.ndarray,
+    W1: np.ndarray,
+    b1: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    z1 = np.asarray(X, dtype=np.float32) @ W0 + b0
+    a1 = relu(z1)
+    logits = a1 @ W1 + b1
+    return z1, a1, logits, softmax(logits)
+
+
+@dataclass(frozen=True)
+class ManualANNConfig:
+    hidden_size: int = 32
+    learning_rate: float = 1e-3
+    epochs: int = 500
+    batch_size: int = 32
+    dropout_probability: float = 0.0
+    early_stopping_patience: int = 50
+    early_stopping_min_delta: float = 1e-4
+    seed: int = 1
+    num_classes: int = N_CLASSES
+
+    def __post_init__(self) -> None:
+        if self.hidden_size <= 0 or self.epochs <= 0 or self.batch_size <= 0:
+            raise ValueError("hidden_size, epochs, and batch_size must be positive.")
+        if self.learning_rate <= 0:
+            raise ValueError("learning_rate must be positive.")
+        if not 0.0 <= self.dropout_probability < 1.0:
+            raise ValueError("dropout_probability must be in [0, 1).")
+        if self.early_stopping_patience <= 0 or self.early_stopping_min_delta < 0:
+            raise ValueError("Invalid early-stopping configuration.")
+        if self.num_classes <= 1:
+            raise ValueError("num_classes must exceed one.")
+
+
+class ManualANNClassifier:
+    """One-hidden-layer neural classifier implemented only with NumPy."""
+
+    def __init__(self, config: ManualANNConfig | None = None):
+        self.config = config or ManualANNConfig()
+        self.classes_ = np.arange(self.config.num_classes, dtype=np.int64)
+        self.W0_: np.ndarray | None = None
+        self.b0_: np.ndarray | None = None
+        self.W1_: np.ndarray | None = None
+        self.b1_: np.ndarray | None = None
+        self.fit_result_: FitResult | None = None
+
+    @staticmethod
+    def _validate_X(
+        X: np.ndarray, *, expected_features: int | None = None
+    ) -> np.ndarray:
+        values = np.asarray(X, dtype=np.float32)
+        if values.ndim != 2 or len(values) == 0 or not np.isfinite(values).all():
+            raise ValueError("X must be a non-empty finite 2D array.")
+        if expected_features is not None and values.shape[1] != expected_features:
+            raise ValueError("X feature count does not match fitted model.")
+        return values
+
+    def _validate_y(self, y: np.ndarray, expected_rows: int) -> np.ndarray:
+        labels = np.asarray(y, dtype=np.int64)
+        if labels.ndim != 1 or len(labels) != expected_rows:
+            raise ValueError("y must be a 1D array aligned with X.")
+        if (labels < 0).any() or (labels >= self.config.num_classes).any():
+            raise ValueError("y contains labels outside configured class range.")
+        return labels
+
+    @staticmethod
+    def _weighted_cross_entropy(
+        probabilities: np.ndarray,
+        labels: np.ndarray,
+        class_weights: np.ndarray,
+    ) -> float:
+        sample_weights = class_weights[labels]
+        selected = probabilities[np.arange(len(labels)), labels]
+        return float(
+            -np.sum(sample_weights * np.log(selected + 1e-12)) / sample_weights.sum()
+        )
+
+    def _state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if any(weight is None for weight in (self.W0_, self.b0_, self.W1_, self.b1_)):
+            raise RuntimeError("ManualANNClassifier is not fitted.")
+        assert self.W0_ is not None and self.b0_ is not None
+        assert self.W1_ is not None and self.b1_ is not None
+        return self.W0_, self.b0_, self.W1_, self.b1_
+
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        *,
+        X_val: np.ndarray | None = None,
+        y_val: np.ndarray | None = None,
+        class_weights: np.ndarray | None = None,
+    ) -> FitResult:
+        X = self._validate_X(X_train)
+        y = self._validate_y(y_train, len(X))
+        if (X_val is None) != (y_val is None):
+            raise ValueError("X_val and y_val must be supplied together.")
+        validation_X = (
+            None
+            if X_val is None
+            else self._validate_X(X_val, expected_features=X.shape[1])
+        )
+        validation_y = (
+            None if y_val is None else self._validate_y(y_val, len(validation_X))
+        )
+        weights = (
+            compute_class_weights(y, self.config.num_classes)
+            if class_weights is None
+            else np.asarray(class_weights, dtype=np.float32)
+        )
+        if weights.shape != (self.config.num_classes,) or (weights <= 0).any():
+            raise ValueError("class_weights must contain one positive value per class.")
+
+        rng = np.random.default_rng(self.config.seed)
+        input_size = X.shape[1]
+        self.W0_ = (
+            0.01 * rng.standard_normal((input_size, self.config.hidden_size))
+        ).astype(np.float32)
+        self.b0_ = np.zeros((1, self.config.hidden_size), dtype=np.float32)
+        self.W1_ = (
+            0.01
+            * rng.standard_normal((self.config.hidden_size, self.config.num_classes))
+        ).astype(np.float32)
+        self.b1_ = np.zeros((1, self.config.num_classes), dtype=np.float32)
+
+        history = TrainingHistory()
+        best_state: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
+        best_loss = np.inf
+        best_epoch = 0
+        epochs_without_improvement = 0
+        stop_reason = "max_epochs"
+
+        for epoch in range(self.config.epochs):
+            permutation = rng.permutation(len(X))
+            shuffled_X = X[permutation]
+            shuffled_y = y[permutation]
+            for start in range(0, len(X), self.config.batch_size):
+                batch_X = shuffled_X[start : start + self.config.batch_size]
+                batch_y = shuffled_y[start : start + self.config.batch_size]
+                encoded_y = one_hot(batch_y, self.config.num_classes)
+                W0, b0, W1, b1 = self._state()
+                z1 = batch_X @ W0 + b0
+                hidden = relu(z1)
+                mask = None
+                if self.config.dropout_probability > 0:
+                    mask = dropout_mask(
+                        hidden.shape, self.config.dropout_probability, rng
+                    )
+                    hidden = hidden * mask
+                probabilities = softmax(hidden @ W1 + b1)
+                sample_weights = weights[batch_y]
+                weight_sum = float(sample_weights.sum())
+                output_gradient = (
+                    (probabilities - encoded_y) * sample_weights[:, None]
+                ) / weight_sum
+                dW1 = hidden.T @ output_gradient
+                db1 = output_gradient.sum(axis=0, keepdims=True)
+                hidden_gradient = output_gradient @ W1.T
+                if mask is not None:
+                    hidden_gradient *= mask
+                hidden_gradient *= relu_derivative(z1)
+                dW0 = batch_X.T @ hidden_gradient
+                db0 = hidden_gradient.sum(axis=0, keepdims=True)
+                self.W1_ = W1 - self.config.learning_rate * dW1
+                self.b1_ = b1 - self.config.learning_rate * db1
+                self.W0_ = W0 - self.config.learning_rate * dW0
+                self.b0_ = b0 - self.config.learning_rate * db0
+
+            train_probabilities = self.predict_proba(X)
+            train_loss = self._weighted_cross_entropy(train_probabilities, y, weights)
+            history.train_loss.append(train_loss)
+            if validation_X is not None and validation_y is not None:
+                validation_probabilities = self.predict_proba(validation_X)
+                selection_loss = self._weighted_cross_entropy(
+                    validation_probabilities,
+                    validation_y,
+                    weights,
+                )
+                history.val_loss.append(selection_loss)
+            else:
+                selection_loss = train_loss
+
+            if selection_loss < best_loss - self.config.early_stopping_min_delta:
+                best_loss = selection_loss
+                best_epoch = epoch + 1
+                best_state = tuple(weight.copy() for weight in self._state())
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+            if epochs_without_improvement >= self.config.early_stopping_patience:
+                stop_reason = "early_stopping"
+                break
+
+        if best_state is None:
+            raise RuntimeError("Training failed to record model weights.")
+        self.W0_, self.b0_, self.W1_, self.b1_ = best_state
+        self.fit_result_ = FitResult(
+            best_epoch=best_epoch,
+            stop_reason=stop_reason,
+            history=history,
+        )
+        return self.fit_result_
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        W0, b0, W1, b1 = self._state()
+        values = self._validate_X(X, expected_features=W0.shape[0])
+        return forward_pass(values, W0, b0, W1, b1)[-1]
+
+    def state_dict(self) -> dict[str, np.ndarray]:
+        W0, b0, W1, b1 = self._state()
+        return {"W0": W0.copy(), "b0": b0.copy(), "W1": W1.copy(), "b1": b1.copy()}
+
+
+__all__ = [
+    "ManualANNClassifier",
+    "ManualANNConfig",
+    "dropout_mask",
+    "forward_pass",
+    "one_hot",
+    "relu",
+    "relu_derivative",
+    "softmax",
+]

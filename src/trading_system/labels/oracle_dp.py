@@ -5,263 +5,133 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-try:
-    import pyarrow.dataset as ds
-except Exception:
-    ds = None
 
+from trading_system.backtest.engine import evaluate_strategy_vs_buy_hold
+from trading_system.data.io import read_parquet_dataset
+from trading_system.data.splits import chronological_train_val_test_split
 from trading_system.paths import default_market_dataset_path, derived_data_dir
 
-LABEL_ID_TO_NAME = {0: "Sell", 1: "Hold", 2: "Buy"}
-LABEL_NAME_TO_ID = {name: idx for idx, name in LABEL_ID_TO_NAME.items()}
+from .schema import LABEL_ID_TO_NAME, TradeLabel
 
 
-def read_parquet_dataset(base_dir: Path) -> pd.DataFrame:
-    base_dir = Path(base_dir)
-    if not base_dir.exists():
-        raise FileNotFoundError(base_dir)
-
-    if ds is not None:
-        dataset = ds.dataset(str(base_dir), format="parquet", partitioning="hive")
-        return dataset.to_table().to_pandas()
-
-    if not hasattr(pd, "read_parquet"):
-        raise RuntimeError(
-            "Lecture parquet indisponible: ni pyarrow.dataset ni pandas.read_parquet ne sont disponibles."
-        )
-
-    if base_dir.is_file():
-        return pd.read_parquet(base_dir)
-
-    parquet_files = sorted(base_dir.rglob("*.parquet"))
-    if not parquet_files:
-        raise FileNotFoundError(f"Aucun fichier parquet trouve dans: {base_dir}")
-    parts = [pd.read_parquet(path) for path in parquet_files]
-    return pd.concat(parts, ignore_index=True)
-
-
-def chronological_train_val_test_split(df, train_ratio=0.7, val_ratio=0.15):
-    if not 0 < train_ratio < 1:
-        raise ValueError("train_ratio doit etre dans l'intervalle ]0, 1[.")
-    if not 0 < val_ratio < 1:
-        raise ValueError("val_ratio doit etre dans l'intervalle ]0, 1[.")
-    if train_ratio + val_ratio >= 1:
-        raise ValueError("train_ratio + val_ratio doit etre strictement inferieur a 1.")
-    if len(df) < 3:
-        raise ValueError("Il faut au moins 3 lignes pour faire un split train/val/test.")
-
-    train_end = int(len(df) * train_ratio)
-    val_end = int(len(df) * (train_ratio + val_ratio))
-
-    train_end = min(max(train_end, 1), len(df) - 2)
-    val_end = min(max(val_end, train_end + 1), len(df) - 1)
-
-    train_df = df.iloc[:train_end].copy()
-    val_df = df.iloc[train_end:val_end].copy()
-    test_df = df.iloc[val_end:].copy()
-    return train_df, val_df, test_df
-
-
-def _signals_to_positions(pred_labels: np.ndarray) -> np.ndarray:
-    positions = []
-    current_position = 0.0
-    for label in pred_labels:
-        if label == 2:
-            current_position = 1.0
-        elif label == 0:
-            current_position = -1.0
-        positions.append(current_position)
-    return np.asarray(positions, dtype=np.float64)
-
-
-def evaluate_strategy_vs_buy_hold(
-    test_frame: pd.DataFrame,
-    pred_labels: np.ndarray,
-    initial_capital: float = 10_000.0,
-    price_col: str = "adj_close",
-    fee_per_trade: float = 0.0,
-) -> dict:
-    if len(test_frame) != len(pred_labels):
-        raise ValueError("Mismatch entre nombre de predictions et lignes.")
-    if len(test_frame) < 2:
-        raise ValueError("Il faut au moins 2 lignes pour calculer un PnL.")
-    if fee_per_trade < 0:
-        raise ValueError("fee_per_trade doit etre >= 0.")
-
-    prices = test_frame[price_col].to_numpy(dtype=np.float64)
-    forward_returns = np.zeros(len(prices), dtype=np.float64)
-    forward_returns[:-1] = (prices[1:] / prices[:-1]) - 1.0
-
-    target_positions = _signals_to_positions(np.asarray(pred_labels, dtype=np.int64))
-    executed_positions = np.zeros_like(target_positions)
-    executed_positions[1:] = target_positions[:-1]
-
-    prev_positions = np.zeros_like(executed_positions)
-    prev_positions[1:] = executed_positions[:-1]
-    turnover = np.abs(executed_positions - prev_positions)
-
-    strategy_returns = executed_positions * forward_returns
-    model_curve = np.empty(len(prices), dtype=np.float64)
-    capital = float(initial_capital)
-    for i in range(len(prices)):
-        capital *= (1.0 + strategy_returns[i])
-        capital -= float(fee_per_trade) * turnover[i]
-        if capital < 0:
-            capital = 0.0
-        model_curve[i] = capital
-
-    buy_hold_curve = initial_capital * np.cumprod(1.0 + forward_returns)
-
-    model_final = float(model_curve[-1])
-    buy_hold_final = float(buy_hold_curve[-1])
-
-    return {
-        "initial_capital": float(initial_capital),
-        "model_final_capital": model_final,
-        "buy_hold_final_capital": buy_hold_final,
-        "model_pnl": model_final - float(initial_capital),
-        "buy_hold_pnl": buy_hold_final - float(initial_capital),
-        "outperformance": model_final - buy_hold_final,
-    }
-
-
-def _allowed_next_executed_positions(prev_pos: int) -> tuple[int, ...]:
-    if prev_pos == 0:
+def _allowed_next_executed_positions(previous_position: int) -> tuple[int, ...]:
+    if previous_position == 0:
         return (-1, 0, 1)
-    if prev_pos in (-1, 1):
+    if previous_position in (-1, 1):
         return (-1, 1)
-    raise ValueError(f"Position invalide: {prev_pos}")
+    raise ValueError(f"Invalid position: {previous_position}")
 
 
-def _compute_forward_returns(prices: np.ndarray) -> np.ndarray:
-    if prices.ndim != 1:
-        raise ValueError("prices doit etre un vecteur 1D.")
-    if len(prices) == 0:
-        raise ValueError("prices vide.")
-
-    out = np.zeros(len(prices), dtype=np.float64)
-    if len(prices) > 1:
-        out[:-1] = (prices[1:] / prices[:-1]) - 1.0
-    return out
+def compute_forward_returns(prices: np.ndarray) -> np.ndarray:
+    values = np.asarray(prices, dtype=np.float64)
+    if values.ndim != 1 or len(values) == 0:
+        raise ValueError("prices must be a non-empty 1D array.")
+    if not np.isfinite(values).all() or (values <= 0).any():
+        raise ValueError("prices must contain finite positive values.")
+    result = np.zeros(len(values), dtype=np.float64)
+    if len(values) > 1:
+        result[:-1] = (values[1:] / values[:-1]) - 1.0
+    return result
 
 
 def solve_oracle_executed_positions_dp(
     forward_returns: np.ndarray,
     fee_per_trade: float = 0.0,
     initial_capital: float = 10_000.0,
-) -> dict:
-    """Find the globally-optimal executed-position path with DP.
+) -> dict[str, object]:
+    """Find globally optimal executed positions under current transition rules."""
 
-    State e_t is the executed position at bar t in {-1, 0, +1}.
-    Transition constraints are aligned with current label semantics:
-    - From 0: can stay 0, go +1, or go -1
-    - From +/-1: can stay same side or flip side (cannot go back flat)
-    """
     if fee_per_trade < 0:
-        raise ValueError("fee_per_trade doit etre >= 0.")
+        raise ValueError("fee_per_trade must be non-negative.")
     if initial_capital <= 0:
-        raise ValueError("initial_capital doit etre > 0.")
+        raise ValueError("initial_capital must be positive.")
+    returns = np.asarray(forward_returns, dtype=np.float64)
+    if returns.ndim != 1 or len(returns) < 2 or not np.isfinite(returns).all():
+        raise ValueError(
+            "forward_returns must be a finite 1D array with at least two values."
+        )
 
-    r = np.asarray(forward_returns, dtype=np.float64)
-    if r.ndim != 1 or len(r) < 2:
-        raise ValueError("forward_returns doit etre un vecteur 1D de longueur >= 2.")
+    states = np.asarray([-1, 0, 1], dtype=np.int8)
+    state_to_index = {int(state): index for index, state in enumerate(states)}
+    capital = np.full((len(returns), len(states)), -np.inf, dtype=np.float64)
+    parent = np.full((len(returns), len(states)), -1, dtype=np.int8)
+    flat_index = state_to_index[0]
+    capital[0, flat_index] = float(initial_capital)
+    parent[0, flat_index] = flat_index
 
-    state_values = np.asarray([-1, 0, 1], dtype=np.int8)
-    state_to_idx = {int(s): i for i, s in enumerate(state_values)}
-
-    n = len(r)
-    dp_capital = np.full((n, len(state_values)), -np.inf, dtype=np.float64)
-    parent_idx = np.full((n, len(state_values)), -1, dtype=np.int8)
-
-    start_idx = state_to_idx[0]
-    dp_capital[0, start_idx] = float(initial_capital)
-    parent_idx[0, start_idx] = start_idx
-
-    for t in range(1, n):
-        rt = float(r[t])
-        for prev_i, prev_state in enumerate(state_values):
-            prev_cap = dp_capital[t - 1, prev_i]
-            if not np.isfinite(prev_cap):
+    for time_index in range(1, len(returns)):
+        period_return = float(returns[time_index])
+        for previous_index, previous_state in enumerate(states):
+            previous_capital = capital[time_index - 1, previous_index]
+            if not np.isfinite(previous_capital):
                 continue
+            for next_state in _allowed_next_executed_positions(int(previous_state)):
+                next_index = state_to_index[next_state]
+                next_capital = previous_capital * (1.0 + next_state * period_return)
+                next_capital -= fee_per_trade * abs(next_state - int(previous_state))
+                next_capital = max(next_capital, 0.0)
+                if next_capital > capital[time_index, next_index]:
+                    capital[time_index, next_index] = next_capital
+                    parent[time_index, next_index] = previous_index
 
-            for next_state in _allowed_next_executed_positions(int(prev_state)):
-                next_i = state_to_idx[int(next_state)]
-
-                next_cap = prev_cap * (1.0 + float(next_state) * rt)
-                next_cap -= float(fee_per_trade) * abs(int(next_state) - int(prev_state))
-                if next_cap < 0.0:
-                    next_cap = 0.0
-
-                if next_cap > dp_capital[t, next_i]:
-                    dp_capital[t, next_i] = next_cap
-                    parent_idx[t, next_i] = prev_i
-
-    end_i = int(np.argmax(dp_capital[-1]))
-    best_final_capital = float(dp_capital[-1, end_i])
-    if not np.isfinite(best_final_capital):
-        raise RuntimeError("Echec DP: aucun chemin valide trouve.")
-
-    best_state_indices = np.empty(n, dtype=np.int8)
-    best_state_indices[-1] = end_i
-    for t in range(n - 1, 0, -1):
-        prev_i = int(parent_idx[t, int(best_state_indices[t])])
-        if prev_i < 0:
-            raise RuntimeError(f"Echec backtracking DP a t={t}.")
-        best_state_indices[t - 1] = prev_i
-
-    executed_positions = state_values[best_state_indices].astype(np.int8, copy=False)
-    turnover = np.abs(np.diff(executed_positions.astype(np.int16)))
-    n_trades = int(turnover.sum())
-
+    final_index = int(np.argmax(capital[-1]))
+    final_capital = float(capital[-1, final_index])
+    if not np.isfinite(final_capital):
+        raise RuntimeError("Oracle DP found no valid path.")
+    state_indices = np.empty(len(returns), dtype=np.int8)
+    state_indices[-1] = final_index
+    for time_index in range(len(returns) - 1, 0, -1):
+        previous_index = int(parent[time_index, int(state_indices[time_index])])
+        if previous_index < 0:
+            raise RuntimeError(f"Oracle DP backtracking failed at index {time_index}.")
+        state_indices[time_index - 1] = previous_index
+    executed = states[state_indices].astype(np.int8, copy=False)
+    trades = int(np.abs(np.diff(executed.astype(np.int16))).sum())
     return {
-        "executed_positions": executed_positions,
-        "final_capital": best_final_capital,
-        "pnl": best_final_capital - float(initial_capital),
-        "n_trades": n_trades,
+        "executed_positions": executed,
+        "final_capital": final_capital,
+        "pnl": final_capital - float(initial_capital),
+        "n_trades": trades,
     }
 
 
 def executed_to_target_positions(executed_positions: np.ndarray) -> np.ndarray:
-    """Convert executed positions e_t to target positions inferred from labels."""
-    e = np.asarray(executed_positions, dtype=np.int8)
-    if e.ndim != 1 or len(e) == 0:
-        raise ValueError("executed_positions invalide.")
-
-    target = np.empty_like(e)
-    if len(e) == 1:
+    executed = np.asarray(executed_positions, dtype=np.int8)
+    if executed.ndim != 1 or len(executed) == 0:
+        raise ValueError("executed_positions must be a non-empty 1D array.")
+    target = np.empty_like(executed)
+    if len(executed) == 1:
         target[0] = 0
-        return target
-
-    target[:-1] = e[1:]
-    target[-1] = e[-1]
+    else:
+        target[:-1] = executed[1:]
+        target[-1] = executed[-1]
     return target
 
 
-def target_positions_to_labels(target_positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Build canonical Sell/Hold/Buy labels from target positions."""
+def target_positions_to_labels(
+    target_positions: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
     target = np.asarray(target_positions, dtype=np.int8)
     if target.ndim != 1 or len(target) == 0:
-        raise ValueError("target_positions invalide.")
-
-    labels = np.full(len(target), "Hold", dtype=object)
-    label_ids = np.full(len(target), LABEL_NAME_TO_ID["Hold"], dtype=np.int64)
-
-    prev = 0
-    for i, pos in enumerate(target.tolist()):
-        if pos == prev:
-            labels[i] = "Hold"
-            label_ids[i] = LABEL_NAME_TO_ID["Hold"]
-        elif pos == 1:
-            labels[i] = "Buy"
-            label_ids[i] = LABEL_NAME_TO_ID["Buy"]
-        elif pos == -1:
-            labels[i] = "Sell"
-            label_ids[i] = LABEL_NAME_TO_ID["Sell"]
+        raise ValueError("target_positions must be a non-empty 1D array.")
+    names = np.full(len(target), "Hold", dtype=object)
+    label_ids = np.full(len(target), TradeLabel.HOLD.value, dtype=np.int64)
+    previous = 0
+    for index, position in enumerate(target.tolist()):
+        if position == previous:
+            pass
+        elif position == 1:
+            names[index] = "Buy"
+            label_ids[index] = TradeLabel.BUY.value
+        elif position == -1:
+            names[index] = "Sell"
+            label_ids[index] = TradeLabel.SELL.value
         else:
-            raise ValueError(f"Transition non representable vers pos={pos} (prev={prev})")
-        prev = pos
-
-    return labels, label_ids
+            raise ValueError(
+                f"Position transition cannot be represented: {previous} -> {position}"
+            )
+        previous = position
+    return names, label_ids
 
 
 def build_oracle_labels_train_only(
@@ -269,158 +139,189 @@ def build_oracle_labels_train_only(
     price_col: str = "adj_close",
     initial_capital: float = 10_000.0,
     fee_per_trade: float = 0.0,
-) -> tuple[pd.DataFrame, dict]:
+) -> tuple[pd.DataFrame, dict[str, float | int]]:
     if train_df is None or train_df.empty:
-        raise ValueError("train_df vide.")
-    if price_col not in train_df.columns:
-        raise ValueError(f"Colonne prix manquante: {price_col}")
-    if "date" not in train_df.columns:
-        raise ValueError("Colonne date manquante.")
-
-    work = train_df.sort_values("date").copy()
-    prices = pd.to_numeric(work[price_col], errors="coerce").to_numpy(np.float64)
-    if np.isnan(prices).any():
-        raise ValueError(f"{price_col} contient des NaN/non numeriques.")
-    if len(prices) < 2:
-        raise ValueError("Train trop court: besoin d'au moins 2 lignes.")
-
-    forward_returns = _compute_forward_returns(prices)
-    dp_out = solve_oracle_executed_positions_dp(
-        forward_returns=forward_returns,
+        raise ValueError("train_df cannot be empty.")
+    missing = [
+        column for column in ("date", price_col) if column not in train_df.columns
+    ]
+    if missing:
+        raise ValueError(f"Missing oracle columns: {missing}")
+    work = train_df.sort_values("date").reset_index(drop=True).copy()
+    prices = pd.to_numeric(work[price_col], errors="coerce").to_numpy(dtype=np.float64)
+    if len(prices) < 2 or not np.isfinite(prices).all():
+        raise ValueError(
+            "Oracle training prices must contain at least two finite values."
+        )
+    forward_returns = compute_forward_returns(prices)
+    solution = solve_oracle_executed_positions_dp(
+        forward_returns,
         fee_per_trade=fee_per_trade,
         initial_capital=initial_capital,
     )
+    executed = np.asarray(solution["executed_positions"], dtype=np.int8)
+    target = executed_to_target_positions(executed)
+    label_names, label_ids = target_positions_to_labels(target)
+    work["Label"] = label_names
+    work["Label_id"] = label_ids
+    work["oracle_target_position"] = target
+    work["oracle_executed_position"] = executed
+    work["oracle_forward_return"] = forward_returns
 
-    target_positions = executed_to_target_positions(dp_out["executed_positions"])
-    labels, label_ids = target_positions_to_labels(target_positions)
-
-    out = work.copy()
-    out["Label"] = labels
-    out["Label_id"] = label_ids
-    out["oracle_target_position"] = target_positions
-    out["oracle_executed_position"] = dp_out["executed_positions"]
-    out["oracle_forward_return"] = forward_returns
-
-    eval_out = evaluate_strategy_vs_buy_hold(
-        out,
+    evaluation = evaluate_strategy_vs_buy_hold(
+        work,
         label_ids,
         initial_capital=initial_capital,
         price_col=price_col,
         fee_per_trade=fee_per_trade,
+        position_mode="long_short",
+        execution_delay=1,
     )
-
-    report = {
-        "oracle_final_capital_dp": float(dp_out["final_capital"]),
-        "oracle_final_capital_eval": float(eval_out["model_final_capital"]),
-        "oracle_pnl": float(eval_out["model_pnl"]),
-        "buy_hold_final_capital": float(eval_out["buy_hold_final_capital"]),
-        "buy_hold_pnl": float(eval_out["buy_hold_pnl"]),
-        "outperformance_vs_buy_hold": float(eval_out["outperformance"]),
-        "n_trades": int(dp_out["n_trades"]),
-        "n_rows_train": int(len(out)),
+    used_returns = forward_returns[1:]
+    report: dict[str, float | int] = {
+        "oracle_final_capital_dp": float(solution["final_capital"]),
+        "oracle_final_capital_eval": float(evaluation["model_final_capital"]),
+        "oracle_pnl": float(evaluation["model_pnl"]),
+        "buy_hold_final_capital": float(evaluation["buy_hold_final_capital"]),
+        "buy_hold_pnl": float(evaluation["buy_hold_pnl"]),
+        "outperformance_vs_buy_hold": float(evaluation["outperformance"]),
+        "n_trades": int(solution["n_trades"]),
+        "n_rows_train": int(len(work)),
+        "mean_abs_return_used": float(np.mean(np.abs(used_returns)))
+        if len(used_returns)
+        else 0.0,
+        "oracle_abs_sign_no_fee_final": float(
+            initial_capital * np.prod(1.0 + np.abs(used_returns))
+        )
+        if len(used_returns)
+        else float(initial_capital),
     }
-    used_rets = forward_returns[1:] if len(forward_returns) > 1 else np.asarray([], dtype=np.float64)
-    report["mean_abs_return_used"] = float(np.mean(np.abs(used_rets))) if len(used_rets) else 0.0
-    report["oracle_abs_sign_no_fee_final"] = float(
-        initial_capital * np.prod(1.0 + np.abs(used_rets))
-    ) if len(used_rets) else float(initial_capital)
     report["dp_eval_abs_gap"] = abs(
-        report["oracle_final_capital_dp"] - report["oracle_final_capital_eval"]
+        float(report["oracle_final_capital_dp"])
+        - float(report["oracle_final_capital_eval"])
+    )
+    return work, report
+
+
+def merge_oracle_labels_on_train_only(
+    labeled_df: pd.DataFrame,
+    oracle_csv_path: str | Path,
+    train_ratio: float,
+    val_ratio: float,
+) -> pd.DataFrame:
+    work = labeled_df.sort_values("date").reset_index(drop=True).copy()
+    train, val, test = chronological_train_val_test_split(
+        work,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+    )
+    path = Path(oracle_csv_path)
+    if not path.exists():
+        return work
+    oracle = pd.read_csv(path)
+    missing = {"date", "Label_id"} - set(oracle.columns)
+    if missing:
+        raise ValueError(f"Missing oracle CSV columns: {sorted(missing)}")
+    oracle["date"] = pd.to_datetime(oracle["date"], errors="coerce")
+    oracle = oracle.dropna(subset=["date"]).drop_duplicates("date", keep="last")
+    oracle = oracle[["date", "Label_id"]].rename(
+        columns={"Label_id": "oracle_label_id"}
+    )
+    train["date"] = pd.to_datetime(train["date"], errors="coerce")
+    merged = train.merge(oracle, on="date", how="left")
+    use_oracle = merged["oracle_label_id"].notna()
+    merged.loc[use_oracle, "Label_id"] = merged.loc[
+        use_oracle, "oracle_label_id"
+    ].astype(int)
+    merged["Label_id"] = merged["Label_id"].astype(np.int64)
+    merged["Label"] = merged["Label_id"].map(LABEL_ID_TO_NAME)
+    merged = merged.drop(columns=["oracle_label_id"])
+    return (
+        pd.concat([merged, val, test], ignore_index=True)
+        .sort_values("date")
+        .reset_index(drop=True)
     )
 
-    return out, report
 
-
-def _default_data_dir() -> Path:
-    return default_market_dataset_path()
+def apply_oracle_labels_on_all_data(
+    df: pd.DataFrame,
+    price_col: str = "adj_close",
+    capital: float = 10_000.0,
+    fee_per_trade: float = 0.0,
+) -> pd.DataFrame:
+    labels, _ = build_oracle_labels_train_only(
+        df.sort_values("date").reset_index(drop=True),
+        price_col=price_col,
+        initial_capital=capital,
+        fee_per_trade=fee_per_trade,
+    )
+    return labels
 
 
 def _default_output_path(ticker: str | None) -> Path:
-    safe = "all_tickers" if not ticker else ticker.replace("/", "_").replace(".", "_")
-    return derived_data_dir() / f"oracle_labels_train_{safe}.csv"
+    safe_name = (
+        "all_tickers" if not ticker else ticker.replace("/", "_").replace(".", "_")
+    )
+    return derived_data_dir() / f"oracle_labels_train_{safe_name}.csv"
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Oracle DP labels (Sell/Hold/Buy) computed ONLY on train split."
+        description="Generate oracle-DP labels on training rows only."
     )
-    parser.add_argument("--data-dir", type=Path, default=_default_data_dir())
-    parser.add_argument("--ticker", type=str, default="EN.PA")
-    parser.add_argument("--price-col", type=str, default="adj_close")
+    parser.add_argument("--data-dir", type=Path, default=default_market_dataset_path())
+    parser.add_argument("--ticker", default="EN.PA")
+    parser.add_argument("--price-col", default="adj_close")
     parser.add_argument("--train-ratio", type=float, default=0.70)
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--capital", type=float, default=10_000.0)
     parser.add_argument("--fee-per-trade", type=float, default=0.0)
-    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--output", type=Path)
     return parser
 
 
 def main() -> None:
     args = _build_parser().parse_args()
-    data_dir = Path(args.data_dir).expanduser().resolve()
-
-    df = read_parquet_dataset(data_dir)
+    frame = read_parquet_dataset(args.data_dir)
     if args.ticker:
-        if "ticker" not in df.columns:
-            raise ValueError("Le dataset n'a pas de colonne 'ticker' pour filtrer --ticker.")
-        df = df[df["ticker"] == args.ticker].copy()
-    if df.empty:
-        raise ValueError("Aucune ligne apres filtrage ticker.")
-
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    if df["date"].isna().any():
-        raise ValueError("Dates invalides detectees dans le dataset.")
-    df = df.sort_values("date").reset_index(drop=True)
-
-    train_df, val_df, test_df = chronological_train_val_test_split(
-        df, train_ratio=args.train_ratio, val_ratio=args.val_ratio
+        if "ticker" not in frame.columns:
+            raise ValueError("Dataset has no ticker column.")
+        frame = frame[frame["ticker"] == args.ticker].copy()
+    if frame.empty:
+        raise ValueError("No rows remain after ticker filtering.")
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    if frame["date"].isna().any():
+        raise ValueError("Dataset contains invalid dates.")
+    frame = frame.sort_values("date").reset_index(drop=True)
+    train, val, test = chronological_train_val_test_split(
+        frame,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
     )
-
-    oracle_train, report = build_oracle_labels_train_only(
-        train_df=train_df,
+    labels, report = build_oracle_labels_train_only(
+        train,
         price_col=args.price_col,
         initial_capital=args.capital,
         fee_per_trade=args.fee_per_trade,
     )
+    output = args.output or _default_output_path(args.ticker)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    labels.to_csv(output, index=False)
+    print(
+        f"oracle rows={len(labels)} split={len(train)}/{len(val)}/{len(test)} "
+        f"final={report['oracle_final_capital_eval']:.2f} output={output}"
+    )
 
-    output_path = args.output if args.output is not None else _default_output_path(args.ticker)
-    output_path = Path(output_path).expanduser().resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    oracle_train.to_csv(output_path, index=False)
 
-    label_counts = oracle_train["Label"].value_counts().reindex(["Sell", "Hold", "Buy"], fill_value=0)
-
-    train_start = oracle_train["date"].min()
-    train_end = oracle_train["date"].max()
-
-    print("Oracle DP labels (train only)")
-    print(
-        f"| ticker = {args.ticker if args.ticker else 'ALL'}"
-        f" | rows(total) = {len(df)}"
-        f" | rows(train/val/test) = {len(train_df)}/{len(val_df)}/{len(test_df)}"
-    )
-    print(f"| train_range = {train_start} -> {train_end}")
-    print(
-        f"| fee = {args.fee_per_trade:.4f}"
-        f" | capital = {args.capital:.2f}"
-        f" | dp_eval_gap = {report['dp_eval_abs_gap']:.10f}"
-    )
-    print(
-        f"| oracle_final = {report['oracle_final_capital_eval']:.2f}"
-        f" | buy_hold_final = {report['buy_hold_final_capital']:.2f}"
-        f" | outperformance = {report['outperformance_vs_buy_hold']:.2f}"
-        f" | n_trades = {report['n_trades']}"
-    )
-    print(
-        f"| mean_abs_ret(used) = {report['mean_abs_return_used']:.6f}"
-        f" | no_fee_abs_sign_upper = {report['oracle_abs_sign_no_fee_final']:.2f}"
-    )
-    print(
-        f"| labels_train -> Sell={int(label_counts['Sell'])}"
-        f" Hold={int(label_counts['Hold'])}"
-        f" Buy={int(label_counts['Buy'])}"
-    )
-    print(f"| output = {output_path}")
+__all__ = [
+    "apply_oracle_labels_on_all_data",
+    "build_oracle_labels_train_only",
+    "compute_forward_returns",
+    "executed_to_target_positions",
+    "merge_oracle_labels_on_train_only",
+    "solve_oracle_executed_positions_dp",
+    "target_positions_to_labels",
+]
 
 
 if __name__ == "__main__":

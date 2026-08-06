@@ -1,1 +1,1 @@
-"""Training and evaluation pipelines."""
+"""Thin CLI orchestration over reusable experiment modules."""

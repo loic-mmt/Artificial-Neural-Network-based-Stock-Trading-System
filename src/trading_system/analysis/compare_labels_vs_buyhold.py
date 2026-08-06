@@ -1,12 +1,10 @@
 import numpy as np
 import pandas as pd
 
+from trading_system.backtest.engine import evaluate_strategy_vs_buy_hold
+from trading_system.data.io import read_parquet_dataset
+from trading_system.labels.breakout import labelling_all
 from trading_system.paths import default_market_dataset_path
-from trading_system.pipelines.multi_ticker import (
-    evaluate_strategy_vs_buy_hold,
-    labelling_all,
-    read_parquet_dataset,
-)
 
 WINDOW = 20
 CAPITAL = 10_000.0
@@ -53,6 +51,9 @@ def main():
         pred_labels,
         initial_capital=CAPITAL,
         price_col="adj_close",
+        position_mode="long_only",
+        execution_delay=1,
+        group_col="ticker",
     )
     print(results)
 

@@ -1,24 +1,21 @@
 import argparse
-from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
+from trading_system.data.io import read_parquet_dataset
+from trading_system.data.splits import chronological_train_val_test_split
+from trading_system.labels.breakout import enforce_alternating_signals
 from trading_system.paths import default_market_dataset_path
-from trading_system.pipelines.single_ticker import (
-    read_parquet_dataset,
-    chronological_train_val_test_split,
-    evaluate_strategy_vs_buy_hold,
-    enforce_alternating_signals,
-    compute_returns,
-)
 
 DATA_DIR = default_market_dataset_path()
 
 
-def benchmark(df, price_col="adj_close", capital = 10_000):
+def benchmark(df, price_col="adj_close", capital=10_000):
     returns = df[price_col].pct_change().fillna(0.0).to_numpy(np.float64)
-    buy_hold =  float(capital * np.prod(1.0 + returns))
+    buy_hold = float(capital * np.prod(1.0 + returns))
     return buy_hold
+
 
 def backtest_long(returns, labels, fees=0.0, capital=10_000.0):
     """
@@ -39,9 +36,10 @@ def backtest_long(returns, labels, fees=0.0, capital=10_000.0):
     n_trades = 0
 
     for i in range(r.shape[0]):
-        # 1) applique le rendement avec la position courante (signal execute au bar suivant)
+        # 1) applique le rendement avec la position courante
+        # (signal execute au bar suivant)
         if position == 1:
-            portfolio *= (1.0 + r[i])
+            portfolio *= 1.0 + r[i]
         if portfolio <= 0:
             return {
                 "final_capital": 0.0,
@@ -52,11 +50,11 @@ def backtest_long(returns, labels, fees=0.0, capital=10_000.0):
 
         # 2) appliquer le signal (changement de position pour le bar suivant)
         prev_position = position
-        if y[i] == 2:      # Buy
+        if y[i] == 2:  # Buy
             position = 1
-        elif y[i] == 0:    # Sell
+        elif y[i] == 0:  # Sell
             position = 0
-        elif y[i] == 1:    # Hold
+        elif y[i] == 1:  # Hold
             pass
         else:
             raise ValueError(f"Label inconnu: {y[i]}")
@@ -81,6 +79,7 @@ def backtest_long(returns, labels, fees=0.0, capital=10_000.0):
         "stopped_early": False,
     }
 
+
 def backtest_long_short(returns, labels, fees=0.0, capital=10_000.0):
     """
     returns: array-like de rendements simples (ex: pct_change), shape (N,)
@@ -100,11 +99,12 @@ def backtest_long_short(returns, labels, fees=0.0, capital=10_000.0):
     n_trades = 0
 
     for i in range(r.shape[0]):
-        # 1) applique le rendement avec la position courante (signal execute au bar suivant)
+        # 1) applique le rendement avec la position courante
+        # (signal execute au bar suivant)
         if position == 1:
-            portfolio *= (1.0 + r[i])
+            portfolio *= 1.0 + r[i]
         elif position == -1:
-            portfolio *= (1.0 - r[i])
+            portfolio *= 1.0 - r[i]
         if portfolio <= 0:
             return {
                 "final_capital": 0.0,
@@ -115,11 +115,11 @@ def backtest_long_short(returns, labels, fees=0.0, capital=10_000.0):
 
         # 2) appliquer le signal (changement de position pour le bar suivant)
         prev_position = position
-        if y[i] == 2:      # Buy
+        if y[i] == 2:  # Buy
             position = 1
-        elif y[i] == 0:    # Sell
+        elif y[i] == 0:  # Sell
             position = -1
-        elif y[i] == 1:    # Hold
+        elif y[i] == 1:  # Hold
             pass
         else:
             raise ValueError(f"Label inconnu: {y[i]}")
@@ -191,7 +191,11 @@ def label_gridsearch(df, price_col="adj_close", fees=1.0, capital=10_000.0):
                 raw_labels.loc[prev_min.isna() | prev_max.isna()] = "Hold"
 
                 labels = enforce_alternating_signals(raw_labels.tolist())
-                label_ids = pd.Series(labels, index=work.index).map(label_map).to_numpy(np.int64)
+                label_ids = (
+                    pd.Series(labels, index=work.index)
+                    .map(label_map)
+                    .to_numpy(np.int64)
+                )
 
                 rets = work[price_col].pct_change().fillna(0.0).to_numpy(np.float64)
                 metrics = backtest_long(rets, label_ids, fees=fees, capital=capital)
@@ -219,7 +223,9 @@ def label_gridsearch(df, price_col="adj_close", fees=1.0, capital=10_000.0):
                     }
                     best_metrics = metrics
 
-    results_df = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+    results_df = (
+        pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+    )
     return best_params, best_metrics, results_df
 
 
@@ -249,7 +255,6 @@ def label_gridsearch_long_short(df, price_col="adj_close", fees=1.0, capital=10_
 
     buy_hold = benchmark(work, price_col=price_col, capital=capital)
 
-
     for window in windows:
         prev_min = work[price_col].shift(1).rolling(window).min()
         prev_max = work[price_col].shift(1).rolling(window).max()
@@ -270,11 +275,17 @@ def label_gridsearch_long_short(df, price_col="adj_close", fees=1.0, capital=10_
                 raw_labels.loc[prev_min.isna() | prev_max.isna()] = "Hold"
 
                 labels = enforce_alternating_signals(raw_labels.tolist())
-                label_ids = pd.Series(labels, index=work.index).map(label_map).to_numpy(np.int64)
+                label_ids = (
+                    pd.Series(labels, index=work.index)
+                    .map(label_map)
+                    .to_numpy(np.int64)
+                )
 
                 rets = work[price_col].pct_change().fillna(0.0).to_numpy(np.float64)
-                metrics = backtest_long_short(rets, label_ids, fees=fees, capital=capital)
-                
+                metrics = backtest_long_short(
+                    rets, label_ids, fees=fees, capital=capital
+                )
+
                 outperformance = float(metrics["final_capital"]) - buy_hold
                 score = outperformance
 
@@ -298,8 +309,11 @@ def label_gridsearch_long_short(df, price_col="adj_close", fees=1.0, capital=10_
                     }
                     best_metrics = metrics
 
-    results_df = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+    results_df = (
+        pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+    )
     return best_params, best_metrics, results_df
+
 
 def load_default_validation_split(
     ticker: str = "EN.PA",
@@ -308,16 +322,22 @@ def load_default_validation_split(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = read_parquet_dataset(DATA_DIR)
     df = df[df["ticker"] == ticker].copy()
-    return chronological_train_val_test_split(df, train_ratio=train_ratio, val_ratio=val_ratio)
+    return chronological_train_val_test_split(
+        df, train_ratio=train_ratio, val_ratio=val_ratio
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Grid search on breakout labels over validation split.")
+    parser = argparse.ArgumentParser(
+        description="Grid search on breakout labels over validation split."
+    )
     parser.add_argument("--ticker", default="EN.PA")
     parser.add_argument("--fees", type=float, default=2.0)
     parser.add_argument("--capital", type=float, default=10_000.0)
     parser.add_argument("--price-col", default="adj_close")
-    parser.add_argument("--mode", choices=("long_only", "long_short"), default="long_only")
+    parser.add_argument(
+        "--mode", choices=("long_only", "long_short"), default="long_only"
+    )
     args = parser.parse_args()
 
     _, val, _ = load_default_validation_split(ticker=args.ticker)

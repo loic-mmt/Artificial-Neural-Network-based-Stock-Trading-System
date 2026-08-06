@@ -23,7 +23,7 @@ SECTOR_BUCKETS = [
 SECTOR_ONE_HOT_FEATURES = [f"sector_{bucket}" for bucket in SECTOR_BUCKETS]
 
 # Feature list for model import.
-features = [
+MARKET_FEATURE_COLUMNS = [
     # Multi-horizon returns
     "ret_2",
     "ret_3",
@@ -119,7 +119,9 @@ features = [
 ]
 
 
-FEATURE_COLUMNS = features
+FEATURE_COLUMNS = MARKET_FEATURE_COLUMNS
+# Temporary compatibility alias. New code should use MARKET_FEATURE_COLUMNS.
+features = MARKET_FEATURE_COLUMNS
 EPS = 1e-12
 
 EXTERNAL_REQUIRED_COLUMNS = [
