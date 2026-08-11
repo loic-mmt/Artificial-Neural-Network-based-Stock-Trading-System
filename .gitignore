@@ -11,3 +11,6 @@ artifacts/
 notebooks/.ipynb_checkpoints/
 archive/
 tmp/
+.agents/
+.agents/
+artifacts/
