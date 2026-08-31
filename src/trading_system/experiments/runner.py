@@ -416,6 +416,15 @@ def _resolve_sequence_estimator(
     return model
 
 
+def _select_label_rows(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Use a view for an all-valid/prefix mask, copy only genuinely sparse rows."""
+
+    count = int(np.count_nonzero(mask))
+    if mask[:count].all():
+        return values[:count]
+    return values[mask]
+
+
 def run_validation_experiment(
     frame: pd.DataFrame,
     config: ExperimentConfig,
@@ -425,6 +434,7 @@ def run_validation_experiment(
 
     work = _filter_universe(frame, config)
     train, val, test, fill_values, feature_columns = _prepare_splits(work, config)
+    del work
     X_train_raw, y_train, aligned_train = _build_split_windows(
         train, feature_columns, config
     )
@@ -435,7 +445,8 @@ def run_validation_experiment(
     val_mask = aligned_val["_label_known"].to_numpy(dtype=bool)
     if not train_mask.any() or not val_mask.any():
         raise ValueError("Training and validation require observed label targets.")
-    X_train_raw, y_train = X_train_raw[train_mask], y_train[train_mask]
+    X_train_raw = _select_label_rows(X_train_raw, train_mask)
+    y_train = _select_label_rows(y_train, train_mask)
     labels_summary = label_statistics(
         pd.concat([train.loc[train["_label_known"]], val.loc[val["_label_known"]]])
     )
@@ -445,7 +456,7 @@ def run_validation_experiment(
         "val": len(val),
     }
 
-    del train, val, test
+    del train, val, test, aligned_train, train_mask
 
     # Fit statistics only on training windows. Validation and test receive the
     # exact same per-feature normalization, without data-dependent refitting.
@@ -463,15 +474,19 @@ def run_validation_experiment(
         )
 
     print("=======================\n")
+    del X  # The diagnostic loop must not keep the last raw tensor alive.
     scaler = SequenceStandardizer()
     X_train = scaler.fit_transform(X_train_raw)
-    #del X_train_raw
+    del X_train_raw
     X_val = scaler.transform(X_val_raw)
-    #del X_val_raw
+    del X_val_raw
 
     estimator = _resolve_sequence_estimator(model, config)
     fit_result = estimator.fit(
-        X_train, y_train, X_val=X_val[val_mask], y_val=y_val[val_mask]
+        X_train,
+        y_train,
+        X_val=_select_label_rows(X_val, val_mask),
+        y_val=_select_label_rows(y_val, val_mask),
     )
     if not isinstance(fit_result, FitResult):
         raise TypeError("model.fit() must return a FitResult.")
@@ -479,9 +494,11 @@ def run_validation_experiment(
     train_probabilities = align_probability_columns(
         estimator, estimator.predict_proba(X_train)
     )
+    del X_train
     val_probabilities = align_probability_columns(
         estimator, estimator.predict_proba(X_val)
     )
+    del X_val
     decision_policy = DecisionPolicy.calibrate(
         val_probabilities[val_mask],
         y_val[val_mask],
@@ -551,7 +568,10 @@ def evaluate_experiment_test(
     X_test, y_test, aligned_test = _build_split_windows(
         test, columns, config, pd.concat([train, val], ignore_index=True)
     )
+    test_rows = len(test)
+    del train, val, test
     test_probabilities = bundle.predict_proba(X_test)
+    del X_test
     test_predictions = bundle.decision_policy.predict(test_probabilities)
     label_mask = aligned_test["_label_known"].to_numpy(dtype=bool)
     if not label_mask.any():
@@ -570,7 +590,7 @@ def evaluate_experiment_test(
     return ExperimentResult(
         **{
             **validation.__dict__,
-            "split_sizes": {**validation.split_sizes, "test": len(test)},
+            "split_sizes": {**validation.split_sizes, "test": test_rows},
         },
         test_metrics=evaluate_predictions(
             y_test[label_mask], test_predictions[label_mask]

@@ -14,6 +14,19 @@ def _validate_context_len(context_len: int) -> int:
     return int(context_len)
 
 
+def _rolling_windows(
+    values: np.ndarray, context_len: int, first_target: int
+) -> np.ndarray:
+    """Materialize independent C-order windows without a Python list per row."""
+
+    view = np.lib.stride_tricks.sliding_window_view(values, context_len, axis=0)
+    # sliding_window_view appends T after F; restore canonical (N, T, F).
+    view = np.moveaxis(view, -1, 1)[first_target - context_len + 1 :]
+    # Do not expose overlapping read-only strides to callers. A single C-order
+    # copy also lets the ANN adapter flatten (T, F) without another allocation.
+    return view.copy(order="C")
+
+
 def build_sequence_dataset(
     frame: pd.DataFrame,
     feature_columns: Sequence[str],
@@ -84,12 +97,8 @@ def build_sequence_dataset(
     indices = np.arange(first_target, len(frame), dtype=np.int64)
     if len(indices) == 0:
         return (empty_x, empty_y, empty_idx) if return_indices else (empty_x, empty_y)
-    # Each slice ends on its target row and never reads a future row. np.stack
-    # preserves `(time, features)` instead of flattening the two dimensions.
-    windows = np.stack(
-        [values[index - context_len + 1 : index + 1] for index in indices],
-        axis=0,
-    ).astype(np.float32, copy=False)
+    # Every slice ends on its target row; no future row enters its features.
+    windows = _rolling_windows(values, context_len, first_target)
     # The target and positional index both refer to the final row of each window.
     # These indices can later align predictions with `frame.iloc` and prices.
     targets = labels[indices]
@@ -156,10 +165,7 @@ def build_sequence_features(
 
     # Use exactly the same inclusive slicing rule as the labeled builder. Keeping
     # the two axes intact guarantees RNN/LSTM/GRU/Transformer input `(N, T, F)`.
-    windows = np.stack(
-        [values[index - context_len + 1 : index + 1] for index in indices],
-        axis=0,
-    ).astype(np.float32, copy=False)
+    windows = _rolling_windows(values, context_len, first_target)
 
     # Each positional index identifies the final source row of its sequence and
     # can therefore map predictions back to the correct chunk row.
@@ -392,9 +398,8 @@ def build_context_dataset(
     indices = np.arange(first_target, len(frame), dtype=np.int64)
     if len(indices) == 0:
         return (empty_x, empty_y, empty_idx) if return_indices else (empty_x, empty_y)
-    windows = np.asarray(
-        [values[index - context_len + 1 : index + 1].reshape(-1) for index in indices],
-        dtype=np.float32,
+    windows = _rolling_windows(values, context_len, first_target).reshape(
+        len(indices), context_len * feature_dim
     )
     targets = labels[indices]
     return (windows, targets, indices) if return_indices else (windows, targets)
@@ -424,9 +429,8 @@ def build_context_features(
     indices = np.arange(first_target, len(frame), dtype=np.int64)
     if len(indices) == 0:
         return (empty_x, empty_idx) if return_indices else empty_x
-    windows = np.asarray(
-        [values[index - context_len + 1 : index + 1].reshape(-1) for index in indices],
-        dtype=np.float32,
+    windows = _rolling_windows(values, context_len, first_target).reshape(
+        len(indices), context_len * feature_dim
     )
     return (windows, indices) if return_indices else windows
 

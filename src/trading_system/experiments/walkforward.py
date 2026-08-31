@@ -28,7 +28,7 @@ from trading_system.models.manual_ann.manual_nn import (
     ManualANNConfig,
 )
 
-from .runner import TrainedModelBundle, align_probability_columns
+from .runner import TrainedModelBundle, _select_label_rows, align_probability_columns
 
 # TODO(sequence-walkforward-factory): Replace this chunk-id-only callable with the
 # shared registry/factory receiving `ModelBuildContext`, typed parameters and a
@@ -114,6 +114,7 @@ def fit_labeled_history(
     train, val = chronological_train_val_split(
         work, val_ratio=val_ratio, date_col=date_col
     )
+    del work
     for split in (train, val):
         split["_label_known"] = True
         if forward_horizon:
@@ -143,19 +144,26 @@ def fit_labeled_history(
     )
     train_mask = aligned_train["_label_known"].to_numpy(dtype=bool)
     val_mask = aligned_val["_label_known"].to_numpy(dtype=bool)
-    X_train_raw, y_train = X_train_raw[train_mask], y_train[train_mask]
-    X_val_raw, y_val = X_val_raw[val_mask], y_val[val_mask]
+    X_train_raw = _select_label_rows(X_train_raw, train_mask)
+    y_train = _select_label_rows(y_train, train_mask)
+    X_val_raw = _select_label_rows(X_val_raw, val_mask)
+    y_val = _select_label_rows(y_val, val_mask)
+    del aligned_train, aligned_val, train_mask, val_mask
     if not len(X_train_raw) or not len(X_val_raw):
         raise ValueError(
             "Walk-forward context windowing produced an empty train or validation set."
         )
     scaler = Standardizer()
     X_train = scaler.fit_transform(X_train_raw)
+    del X_train_raw
     X_val = scaler.transform(X_val_raw)
+    del X_val_raw
     fit_result = estimator.fit(X_train, y_train, X_val=X_val, y_val=y_val)
+    del X_train
     val_probabilities = align_probability_columns(
         estimator, estimator.predict_proba(X_val)
     )
+    del X_val
     policy = DecisionPolicy.calibrate(
         val_probabilities,
         y_val,

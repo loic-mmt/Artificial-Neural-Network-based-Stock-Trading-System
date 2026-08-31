@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+_STATISTICS_BUFFER_BYTES = 8 * 1024**2
+
 
 @dataclass
 class Standardizer:
@@ -28,7 +30,9 @@ class Standardizer:
             raise ValueError(
                 "Input feature dimension does not match fitted Standardizer."
             )
-        return ((values - self.mean_) / self.scale_).astype(np.float32)
+        transformed = np.subtract(values, self.mean_)
+        np.divide(transformed, self.scale_, out=transformed)
+        return transformed.astype(np.float32, copy=False)
 
     def fit_transform(self, X: np.ndarray) -> np.ndarray:
         return self.fit(X).transform(X)
@@ -89,13 +93,25 @@ class SequenceStandardizer:
             keepdims=True,
         )
 
-        scale_64 = values.std(
-            axis=(0, 1),
-            dtype=np.float64,
-            ddof=0,
-            keepdims=True,
+        # np.std(dtype=float64) allocates a float64 deviation for every window
+        # element. Bound this workspace while retaining the exact window weights,
+        # float64 arithmetic and population-variance definition (ddof=0).
+        rows_per_block = max(
+            1, _STATISTICS_BUFFER_BYTES // (values.shape[1] * values.shape[2] * 8)
         )
-        
+        workspace = np.empty(
+            (min(len(values), rows_per_block), *values.shape[1:]), dtype=np.float64
+        )
+        variance = np.zeros_like(mean_64)
+        for start in range(0, len(values), rows_per_block):
+            block = values[start : start + rows_per_block]
+            deviations = workspace[: len(block)]
+            np.subtract(block, mean_64, out=deviations)
+            np.square(deviations, out=deviations)
+            variance += deviations.sum(axis=(0, 1), keepdims=True)
+        variance /= values.shape[0] * values.shape[1]
+        scale_64 = np.sqrt(variance, out=variance)
+
         if not np.isfinite(mean_64).all() or not np.isfinite(scale_64).all():
             raise ValueError("Sequence statistics must be finite.")
 
@@ -137,7 +153,8 @@ class SequenceStandardizer:
 
         # `(1,1,F)` state broadcasts over samples and timesteps. Calculation
         # creates new array; fitted statistics and caller input remain unchanged.
-        transformed = ((values - mean) / scale).astype(np.float32, copy=False)
+        transformed = np.subtract(values, mean)
+        np.divide(transformed, scale, out=transformed)
         if not np.isfinite(transformed).all():
             raise ValueError("Transformed sequences contain non-finite values.")
         return transformed

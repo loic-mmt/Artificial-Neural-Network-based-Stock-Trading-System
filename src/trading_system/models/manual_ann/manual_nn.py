@@ -20,8 +20,9 @@ def relu_derivative(values: np.ndarray) -> np.ndarray:
 def softmax(logits: np.ndarray) -> np.ndarray:
     values = np.asarray(logits, dtype=np.float32)
     shifted = values - values.max(axis=1, keepdims=True)
-    exponentials = np.exp(shifted)
-    return (exponentials / exponentials.sum(axis=1, keepdims=True)).astype(np.float32)
+    np.exp(shifted, out=shifted)
+    shifted /= shifted.sum(axis=1, keepdims=True)
+    return shifted
 
 
 def one_hot(labels: np.ndarray, num_classes: int = N_CLASSES) -> np.ndarray:
@@ -192,42 +193,49 @@ class ManualANNClassifier:
 
                 batch_X = X[batch_indices]
                 batch_y = y[batch_indices]
-                encoded_y = one_hot(batch_y, self.config.num_classes)
                 W0, b0, W1, b1 = self._state()
                 z1 = batch_X @ W0 + b0
-                hidden = relu(z1)
+                active = z1 > 0.0
+                hidden = z1
+                np.maximum(hidden, 0.0, out=hidden)
                 mask = None
                 if self.config.dropout_probability > 0:
                     mask = dropout_mask(
                         hidden.shape, self.config.dropout_probability, rng
                     )
-                    hidden = hidden * mask
+                    hidden *= mask
                 probabilities = softmax(hidden @ W1 + b1)
                 sample_weights = weights[batch_y]
                 weight_sum = float(sample_weights.sum())
-                output_gradient = (
-                    (probabilities - encoded_y) * sample_weights[:, None]
-                ) / weight_sum
+                # Probabilities are no longer needed once backprop starts. Reuse
+                # their buffer rather than allocating one-hot targets/gradients.
+                output_gradient = probabilities
+                output_gradient[np.arange(len(batch_y)), batch_y] -= 1.0
+                output_gradient *= sample_weights[:, None]
+                output_gradient /= weight_sum
                 dW1 = hidden.T @ output_gradient
                 db1 = output_gradient.sum(axis=0, keepdims=True)
                 hidden_gradient = output_gradient @ W1.T
                 if mask is not None:
                     hidden_gradient *= mask
-                hidden_gradient *= relu_derivative(z1)
+                hidden_gradient *= active
                 dW0 = batch_X.T @ hidden_gradient
                 db0 = hidden_gradient.sum(axis=0, keepdims=True)
-                self.W1_ = W1 - self.config.learning_rate * dW1
-                self.b1_ = b1 - self.config.learning_rate * db1
-                self.W0_ = W0 - self.config.learning_rate * dW0
-                self.b0_ = b0 - self.config.learning_rate * db0
+                # All gradients were computed with the old weights. Updating in
+                # place now preserves SGD math and the copied best checkpoint.
+                for parameter, gradient in (
+                    (W1, dW1), (b1, db1), (W0, dW0), (b0, db0)
+                ):
+                    gradient *= self.config.learning_rate
+                    parameter -= gradient
 
-            train_probabilities = self.predict_proba(X)
-            train_loss = self._weighted_cross_entropy(train_probabilities, y, weights)
+            train_loss = self._weighted_cross_entropy(
+                self._predict_validated(X), y, weights
+            )
             history.train_loss.append(train_loss)
             if validation_X is not None and validation_y is not None:
-                validation_probabilities = self.predict_proba(validation_X)
                 selection_loss = self._weighted_cross_entropy(
-                    validation_probabilities,
+                    self._predict_validated(validation_X),
                     validation_y,
                     weights,
                 )
@@ -257,9 +265,21 @@ class ManualANNClassifier:
         return self.fit_result_
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        W0, b0, W1, b1 = self._state()
+        W0 = self._state()[0]
         values = self._validate_X(X, expected_features=W0.shape[0])
-        return forward_pass(values, W0, b0, W1, b1)[-1]
+        return self._predict_validated(values)
+
+    def _predict_validated(self, values: np.ndarray) -> np.ndarray:
+        """Inference needs one hidden buffer, unlike the public training trace."""
+
+        W0, b0, W1, b1 = self._state()
+        hidden = values @ W0
+        hidden += b0
+        np.maximum(hidden, 0.0, out=hidden)
+        logits = hidden @ W1
+        logits += b1
+        del hidden
+        return softmax(logits)
 
     def state_dict(self) -> dict[str, np.ndarray]:
         W0, b0, W1, b1 = self._state()
