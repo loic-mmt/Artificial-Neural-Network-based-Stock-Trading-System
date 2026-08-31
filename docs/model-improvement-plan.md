@@ -48,7 +48,10 @@ performance.
 
 ### Verified baseline of the codebase
 
-- `53` automated tests pass.
+- `84` core automated tests pass as of 2026-08-31, including `31` new
+  search-integrity tests. The separate untracked local MT5 smoke test is not part
+  of this verification: the test interpreter lacks TA-Lib, while the project
+  `.venv` lacks pytest and stalls while importing pandas.
 - Tests cover chronology, grouped windows, scaling, labels, next-bar execution,
   grouped capital allocation, shared experiment paths, deterministic manual ANN,
   state round-trips, and architecture boundaries.
@@ -56,6 +59,12 @@ performance.
 - Walk-forward retraining uses expanding history and creates a fresh manual ANN
   per chunk.
 - Seed support exists in the walk-forward CLI and manual ANN configuration.
+- Static and walk-forward search now rank on validation only, then evaluate the
+  frozen winner once on final test per search invocation.
+- Static selection exposes a `ValidationResult` without test metrics or prices.
+- Forward-return targets crossing a split boundary are excluded from training,
+  calibration and classification scoring; their feature context is retained.
+- Manual-ANN retrain seeds derive from `(run_seed, chunk_id)` and are recorded.
 
 ### Important incomplete work
 
@@ -70,8 +79,10 @@ still scaffolds:
 - Walk-forward still uses the manual-ANN compatibility path and flattened
   context representation rather than the final model-neutral 3D sequence path.
 - Static and walk-forward paths do not yet use one common model registry.
-- Search currently ranks trials from test metrics or test backtest results.
-  This is test-set selection leakage and blocks promotion of search winners.
+- Search selection leakage is addressed, but immutable run manifests, integrated
+  diagnostics and a current-code repeated-seed baseline still block promotion.
+- Artifact manifest validation, hashing, save/load and compatibility checks are
+  still scaffolds in `artifacts/serialization.py`.
 - Shared backtest output currently exposes capital, PnL, and outperformance.
   Sharpe, drawdown, turnover, execution stress, drift, and overfit diagnostics
   still need one integrated experiment result.
@@ -188,6 +199,53 @@ phase is incomplete.
 
 ### Phase 0: Make evaluation trustworthy
 
+Implementation progress — 2026-08-31:
+
+- [x] Static trial ranking uses only `val_metrics` / `val_backtest`.
+- [x] Walk-forward validation runs stop before final test, before labeling or
+  retraining. Their results have no test-result fields.
+- [x] Final test runs only after all candidates have been scored and the winner
+  is fixed. Static search reuses the exact fitted weights, scaler and policy;
+  walk-forward search evaluates one frozen retraining strategy.
+- [x] Failed validation trials remain visible; ties preserve trial order.
+- [x] Oracle label modes are rejected for search, but remain available as
+  standalone diagnostics.
+- [x] Raw static split boundaries are fixed before feature/label construction.
+  Forward-return boundary targets and unknown trailing targets are excluded from
+  supervised fitting/scoring in static and walk-forward paths.
+- [x] Manual ANN uses deterministic derived chunk seeds, shared across trial
+  configurations and recorded in retrain logs. Reusing an estimator instance
+  across trials/chunks is rejected.
+- [ ] Extend the chunk seed contract to registry-based custom model factories.
+- [ ] Complete immutable manifests and integrate advanced diagnostics.
+- [ ] Rerun and freeze the current-code baseline across at least five seeds.
+- [ ] Add survivor-bias warnings to generated current-universe reports.
+
+Verification: `tests/test_search_integrity.py` covers held-out-price poisoning,
+train/validation target purging, fixed winner evaluation, failure handling,
+stable ties, seed reproduction, grouped static data and CLI JSON output.
+Core suite: `python -m pytest -q --ignore=tests/test_mt5_walkforward_strategies.py`.
+
+Result/API notes:
+
+- `run_validation_experiment` returns train/validation diagnostics without
+  building test windows. `evaluate_experiment_test` evaluates its frozen bundle;
+  `run_experiment` remains the convenience wrapper for both stages.
+- `val_label_mask` / `test_label_mask` identify observed classification targets.
+  Backtests still use every predicted row, so horizons do not shorten their
+  price/benchmark intervals. `label_stats` describes eligible train/validation
+  labels only; it does not expose the held-out label distribution.
+- Walk-forward search retains its DataFrame return type. Rows/CSV contain
+  `val_*` metrics, validation objective scores and a `selected` flag. The separate
+  winner report is in `results.attrs["final_test"]`; frozen trial parameters are
+  in `results.attrs["best_parameters"]`. Per-trial validation retrain logs are in
+  `results.attrs["validation_retrain_logs"]`. The CLI persists all three in JSON.
+- Once-only evaluation is enforced by search orchestration within one run, not
+  by a durable cross-run lock. Repeatedly tuning from the final-test report is
+  still prohibited.
+- Forward-return metrics and seeded ANN results intentionally differ from older
+  runs. Historical numbers are not a new comparable baseline.
+
 Required work:
 
 1. Change `experiments/search.py` so all trial ranking uses validation-only
@@ -265,9 +323,8 @@ Required experiments:
 - probability calibration measured on validation only;
 - joint threshold and `min_action_rate` scans.
 
-Before these experiments, add validation-period backtest output to the shared
-result schema. Never derive a selection objective from `result.test_metrics` or
-`result.backtest`.
+Validation-period backtest output is now available as `val_backtest`. Never
+derive a selection objective from `result.test_metrics` or `result.backtest`.
 
 Promotion condition:
 

@@ -33,6 +33,23 @@ python -m pip install -e ".[dev]"
 pytest
 ```
 
+## Validation and final test
+
+Grid searches select parameters using validation only. After selection, only
+the frozen winner is evaluated on final test. Static search retains the fitted
+model and decision policy; walk-forward search retains the chosen retraining
+configuration and records each deterministic ANN chunk seed.
+
+Walk-forward search CSVs contain `val_*` metrics and a `selected` flag. Its JSON
+report separates the validation ranking (`top`) from the winner's `final_test`.
+Oracle labels are diagnostic-only and are not accepted by grid search.
+
+Forward-return labels crossing split boundaries are excluded from training and
+classification scoring. Their feature rows remain available as context, and
+backtests retain the complete prediction interval. These integrity fixes mean
+older scores are not directly comparable; the new repeated-seed baseline and
+immutable run manifests are still pending.
+
 ## Adding another model
 
 Implement `fit(...)` and `predict_proba(...)` from `ProbabilisticClassifier`, or wrap a scikit-learn-style estimator with `SklearnClassifierAdapter`. Pass model into `run_experiment`; feature preparation, thresholds, metrics, and backtest stay unchanged.
