@@ -48,8 +48,9 @@ performance.
 
 ### Verified baseline of the codebase
 
-- `84` core automated tests pass as of 2026-08-31, including `31` new
-  search-integrity tests. The separate untracked local MT5 smoke test is not part
+- `136` core automated tests pass as of 2026-08-31, including `31`
+  search-integrity tests and `52` memory-optimization tests. The separate
+  untracked local MT5 smoke test is not part
   of this verification: the test interpreter lacks TA-Lib, while the project
   `.venv` lacks pytest and stalls while importing pandas.
 - Tests cover chronology, grouped windows, scaling, labels, next-bar execution,
@@ -65,6 +66,12 @@ performance.
 - Forward-return targets crossing a split boundary are excluded from training,
   calibration and classification scoring; their feature context is retained.
 - Manual-ANN retrain seeds derive from `(run_seed, chunk_id)` and are recorded.
+- Window construction, scaling, manual ANN training/inference and experiment
+  buffer lifetimes now use fewer allocations. Synthetic comparisons against
+  `38a2412` preserve all measured outputs, with lower peak allocations and runtime
+  across single-ticker, multi-ticker and walk-forward paths. See
+  [memory optimization measurements](memory-optimization.md) for methodology,
+  reproduction commands and limitations; these are not a trading baseline.
 
 ### Important incomplete work
 
