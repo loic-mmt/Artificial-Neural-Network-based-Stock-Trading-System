@@ -67,25 +67,36 @@ class TrainedModelBundle:
 
 
 @dataclass
-class ExperimentResult:
+class ValidationResult:
+    """Selection-safe result: no final-test predictions, metrics or prices."""
+
     bundle: TrainedModelBundle
     config: ExperimentConfig
     label_stats: dict[str, int]
     train_metrics: dict[str, float]
     val_metrics: dict[str, float]
-    test_metrics: dict[str, float]
-    backtest: dict[str, float]
+    val_backtest: dict[str, float]
     train_probabilities: np.ndarray
     val_probabilities: np.ndarray
-    test_probabilities: np.ndarray
     train_predictions: np.ndarray
     val_predictions: np.ndarray
-    test_predictions: np.ndarray
     y_train: np.ndarray
     y_val: np.ndarray
-    y_test: np.ndarray
-    aligned_test_frame: pd.DataFrame
+    # Unobserved forward-return targets stay in inference/backtests, not scores.
+    val_label_mask: np.ndarray
+    aligned_val_frame: pd.DataFrame
     split_sizes: dict[str, int]
+
+
+@dataclass
+class ExperimentResult(ValidationResult):
+    test_metrics: dict[str, float]
+    backtest: dict[str, float]
+    test_probabilities: np.ndarray
+    test_predictions: np.ndarray
+    y_test: np.ndarray
+    test_label_mask: np.ndarray
+    aligned_test_frame: pd.DataFrame
 
 
 def align_probability_columns(
@@ -241,15 +252,11 @@ def _apply_labels(frame: pd.DataFrame, config: ExperimentConfig) -> pd.DataFrame
             date_col=config.date_col,
         )
     )
-    train, val, test = chronological_train_val_test_split(
-        breakout,
-        train_ratio=config.train_ratio,
-        val_ratio=config.val_ratio,
-        group_col=config.group_col if config.universe == "multi" else None,
-        date_col=config.date_col,
-    )
+    if "_experiment_split" not in breakout:
+        raise ValueError("Oracle train-only labels require frozen split boundaries.")
+    train_mask = breakout["_experiment_split"] == "train"
     oracle_train = _group_apply(
-        train,
+        breakout.loc[train_mask],
         config,
         lambda group: build_oracle_labels_train_only(
             group,
@@ -258,16 +265,10 @@ def _apply_labels(frame: pd.DataFrame, config: ExperimentConfig) -> pd.DataFrame
             fee_per_trade=config.oracle_fee_per_trade,
         )[0],
     )
-    sort_columns = (
-        [config.group_col, config.date_col]
-        if config.universe == "multi"
-        else [config.date_col]
-    )
-    return (
-        pd.concat([oracle_train, val, test], ignore_index=True)
-        .sort_values(sort_columns)
-        .reset_index(drop=True)
-    )
+    breakout.loc[train_mask, ["Label", "Label_id"]] = oracle_train[
+        ["Label", "Label_id"]
+    ].to_numpy()
+    return breakout
 
 
 def _build_features(
@@ -304,64 +305,70 @@ def _build_features(
 
 
 def _prepare_splits(
-    featured: pd.DataFrame,
-    columns: tuple[str, ...],
+    frame: pd.DataFrame,
     config: ExperimentConfig,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series]:
-    train, val, test = chronological_train_val_test_split(
-        featured,
+    *,
+    include_test: bool = False,
+    fill_values: pd.Series | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, tuple[str, ...]]:
+    """Freeze raw split boundaries before labels/features; withhold test by default."""
+
+    raw_splits = chronological_train_val_test_split(
+        frame,
         train_ratio=config.train_ratio,
         val_ratio=config.val_ratio,
         group_col=config.group_col if config.universe == "multi" else None,
         date_col=config.date_col,
     )
+    parts = []
+    for name, split in zip(("train", "val", "test"), raw_splits):
+        if name == "test" and not include_test:
+            continue
+        split = split.copy()
+        split["_experiment_split"] = name
+        split["_label_known"] = True
+        if config.label_mode == "forward_return":
+            # Exclude targets whose future price belongs to another partition,
+            # but keep their feature rows as chronological context.
+            groups = (
+                split.groupby(config.group_col, sort=False, dropna=False)
+                if config.universe == "multi"
+                else [(None, split)]
+            )
+            for _, group in groups:
+                unknown = group.tail(config.forward_horizon).index
+                split.loc[unknown, "_label_known"] = False
+        parts.append(split)
+    source = pd.concat(parts, ignore_index=True)
+    labeled = _apply_labels(source, config)
+    featured, columns = _build_features(labeled, config)
+    train, val, test = (
+        featured.loc[featured["_experiment_split"] == name].copy()
+        for name in ("train", "val", "test")
+    )
     train = train.dropna(subset=[*columns, "Label_id"]).copy()
     if train.empty:
         raise ValueError("No training rows remain after feature NaN removal.")
-    fill_values = train[list(columns)].median(numeric_only=True).fillna(0.0)
+    if fill_values is None:
+        fill_values = train[list(columns)].median(numeric_only=True).fillna(0.0)
     for split in (val, test):
         split.loc[:, columns] = split[list(columns)].fillna(fill_values).fillna(0.0)
-    if val.empty or test.empty:
-        raise ValueError("Validation and test splits must not be empty.")
-    return train, val, test, fill_values
+    if val.empty or (include_test and test.empty):
+        raise ValueError("Validation and requested test splits must not be empty.")
+    return train, val, test, fill_values, columns
 
 
-def _build_windows(
-    train: pd.DataFrame,
-    val: pd.DataFrame,
-    test: pd.DataFrame,
+def _build_split_windows(
+    target: pd.DataFrame,
     columns: tuple[str, ...],
     config: ExperimentConfig,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    pd.DataFrame,
-]:
-    """Build identical 3D train/validation/test sequence layouts."""
+    history: pd.DataFrame | None = None,
+) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """Build canonical sequences while retaining rows with unobserved targets."""
 
     group_col = config.group_col if config.universe == "multi" else None
-    X_train, y_train = build_sequence_dataset_with_history(
-        train,
-        columns,
-        config.context_len,
-        group_col=group_col,
-        date_col=config.date_col,
-    )
-    X_val, y_val = build_sequence_dataset_with_history(
-        val,
-        columns,
-        config.context_len,
-        history_frame=train,
-        group_col=group_col,
-        date_col=config.date_col,
-    )
-    history = pd.concat([train, val], ignore_index=True)
-    X_test, y_test, aligned_test = build_sequence_dataset_with_history(
-        test,
+    sequences, labels, aligned = build_sequence_dataset_with_history(
+        target,
         columns,
         config.context_len,
         history_frame=history,
@@ -369,33 +376,19 @@ def _build_windows(
         date_col=config.date_col,
         return_aligned_rows=True,
     )
-    if not len(X_train) or not len(X_val) or not len(X_test):
-        raise ValueError(
-            "Context windowing produced an empty train, validation, or test set."
-        )
+    if not len(sequences):
+        raise ValueError("Context windowing produced an empty split.")
 
     # The runner owns the canonical model boundary. Builders retain time and
     # feature axes; no architecture-specific flattening is allowed here.
     expected_tail = (config.context_len, len(columns))
-    split_arrays = (
-        ("train", X_train, y_train),
-        ("validation", X_val, y_val),
-        ("test", X_test, y_test),
-    )
-    for split_name, sequences, labels in split_arrays:
-        if sequences.ndim != 3 or sequences.shape[1:] != expected_tail:
-            raise RuntimeError(
-                f"{split_name} sequences do not match expected dimensions (T, F)."
-            )
-        if labels.ndim != 1 or len(labels) != len(sequences):
-            raise RuntimeError(f"{split_name} sequences and labels are misaligned.")
-        if (labels < 0).any() or (labels >= 3).any():
-            raise ValueError(
-                f"{split_name} labels must use Sell/Hold/Buy IDs 0, 1 and 2."
-            )
-    if len(aligned_test) != len(X_test):
-        raise RuntimeError("Test sequences and aligned backtest rows are misaligned.")
-    return X_train, y_train, X_val, y_val, X_test, y_test, aligned_test
+    if sequences.ndim != 3 or sequences.shape[1:] != expected_tail:
+        raise RuntimeError("Sequences do not match expected dimensions (T, F).")
+    if labels.ndim != 1 or not (len(labels) == len(sequences) == len(aligned)):
+        raise RuntimeError("Sequences, labels and backtest rows are misaligned.")
+    if (labels < 0).any() or (labels >= 3).any():
+        raise ValueError("Labels must use Sell/Hold/Buy IDs 0, 1 and 2.")
+    return sequences, labels, aligned
 
 
 def _resolve_sequence_estimator(
@@ -423,30 +416,63 @@ def _resolve_sequence_estimator(
     return model
 
 
-def run_experiment(
+def run_validation_experiment(
     frame: pd.DataFrame,
     config: ExperimentConfig,
     model: ProbabilisticSequenceClassifier | ManualANNClassifier | None = None,
-) -> ExperimentResult:
-    """Run one leakage-aware static experiment on canonical 3D sequences."""
+) -> ValidationResult:
+    """Fit and calibrate using training/validation only, leaving test untouched."""
 
     work = _filter_universe(frame, config)
-    labeled = _apply_labels(work, config)
-    labels_summary = label_statistics(labeled)
-    featured, feature_columns = _build_features(labeled, config)
-    train, val, test, fill_values = _prepare_splits(featured, feature_columns, config)
-    windows = _build_windows(train, val, test, feature_columns, config)
-    X_train_raw, y_train, X_val_raw, y_val, X_test_raw, y_test, aligned_test = windows
+    train, val, test, fill_values, feature_columns = _prepare_splits(work, config)
+    X_train_raw, y_train, aligned_train = _build_split_windows(
+        train, feature_columns, config
+    )
+    X_val_raw, y_val, aligned_val = _build_split_windows(
+        val, feature_columns, config, train
+    )
+    train_mask = aligned_train["_label_known"].to_numpy(dtype=bool)
+    val_mask = aligned_val["_label_known"].to_numpy(dtype=bool)
+    if not train_mask.any() or not val_mask.any():
+        raise ValueError("Training and validation require observed label targets.")
+    X_train_raw, y_train = X_train_raw[train_mask], y_train[train_mask]
+    labels_summary = label_statistics(
+        pd.concat([train.loc[train["_label_known"]], val.loc[val["_label_known"]]])
+    )
+
+    split_sizes = {
+        "train": len(train),
+        "val": len(val),
+    }
+
+    del train, val, test
 
     # Fit statistics only on training windows. Validation and test receive the
     # exact same per-feature normalization, without data-dependent refitting.
+    print("\n=== SEQUENCE MEMORY ===")
+
+    for name, X in [
+        ("train", X_train_raw),
+        ("val", X_val_raw),
+    ]:
+        print(
+            f"{name:5s}: "
+            f"shape={X.shape}, "
+            f"dtype={X.dtype}, "
+            f"size={X.nbytes / 1024**3:.3f} GiB"
+        )
+
+    print("=======================\n")
     scaler = SequenceStandardizer()
     X_train = scaler.fit_transform(X_train_raw)
+    #del X_train_raw
     X_val = scaler.transform(X_val_raw)
-    X_test = scaler.transform(X_test_raw)
+    #del X_val_raw
 
     estimator = _resolve_sequence_estimator(model, config)
-    fit_result = estimator.fit(X_train, y_train, X_val=X_val, y_val=y_val)
+    fit_result = estimator.fit(
+        X_train, y_train, X_val=X_val[val_mask], y_val=y_val[val_mask]
+    )
     if not isinstance(fit_result, FitResult):
         raise TypeError("model.fit() must return a FitResult.")
 
@@ -456,24 +482,19 @@ def run_experiment(
     val_probabilities = align_probability_columns(
         estimator, estimator.predict_proba(X_val)
     )
-    test_probabilities = align_probability_columns(
-        estimator, estimator.predict_proba(X_test)
-    )
     decision_policy = DecisionPolicy.calibrate(
-        val_probabilities,
-        y_val,
+        val_probabilities[val_mask],
+        y_val[val_mask],
         mode=config.decision_mode,
         min_action_rate=config.min_action_rate,
     )
     train_predictions = decision_policy.predict(train_probabilities)
     val_predictions = decision_policy.predict(val_probabilities)
-    test_predictions = decision_policy.predict(test_probabilities)
     train_metrics = evaluate_predictions(y_train, train_predictions)
-    val_metrics = evaluate_predictions(y_val, val_predictions)
-    test_metrics = evaluate_predictions(y_test, test_predictions)
-    backtest = evaluate_strategy_vs_buy_hold(
-        aligned_test,
-        test_predictions,
+    val_metrics = evaluate_predictions(y_val[val_mask], val_predictions[val_mask])
+    val_backtest = evaluate_strategy_vs_buy_hold(
+        aligned_val,
+        val_predictions,
         initial_capital=config.initial_capital,
         price_col=config.price_col,
         fee_per_trade=config.fee_per_trade,
@@ -491,31 +512,95 @@ def run_experiment(
         feature_fill_values=fill_values.copy(),
         fit_result=fit_result,
     )
-    return ExperimentResult(
+    return ValidationResult(
         bundle=bundle,
         config=config,
         label_stats=labels_summary,
         train_metrics=train_metrics,
         val_metrics=val_metrics,
-        test_metrics=test_metrics,
-        backtest=backtest,
+        val_backtest=val_backtest,
         train_probabilities=train_probabilities,
         val_probabilities=val_probabilities,
-        test_probabilities=test_probabilities,
         train_predictions=train_predictions,
         val_predictions=val_predictions,
-        test_predictions=test_predictions,
         y_train=y_train,
         y_val=y_val,
-        y_test=y_test,
-        aligned_test_frame=aligned_test,
-        split_sizes={"train": len(train), "val": len(val), "test": len(test)},
+        val_label_mask=val_mask,
+        aligned_val_frame=aligned_val,
+        split_sizes=split_sizes,
     )
+
+
+def evaluate_experiment_test(
+    frame: pd.DataFrame,
+    validation: ValidationResult,
+) -> ExperimentResult:
+    """Evaluate a frozen fitted model/policy once, without training or calibration."""
+
+    if isinstance(validation, ExperimentResult):
+        raise ValueError("Final test has already been evaluated for this result.")
+    config, bundle = validation.config, validation.bundle
+    train, val, test, _, columns = _prepare_splits(
+        _filter_universe(frame, config),
+        config,
+        include_test=True,
+        fill_values=bundle.feature_fill_values,
+    )
+    if columns != bundle.feature_columns:
+        raise ValueError("Test feature columns differ from the fitted bundle.")
+    X_test, y_test, aligned_test = _build_split_windows(
+        test, columns, config, pd.concat([train, val], ignore_index=True)
+    )
+    test_probabilities = bundle.predict_proba(X_test)
+    test_predictions = bundle.decision_policy.predict(test_probabilities)
+    label_mask = aligned_test["_label_known"].to_numpy(dtype=bool)
+    if not label_mask.any():
+        raise ValueError("Final test requires observed label targets.")
+    backtest = evaluate_strategy_vs_buy_hold(
+        aligned_test,
+        test_predictions,
+        initial_capital=config.initial_capital,
+        price_col=config.price_col,
+        fee_per_trade=config.fee_per_trade,
+        position_mode=config.position_mode,
+        execution_delay=config.execution_delay,
+        group_col=config.group_col if config.universe == "multi" else None,
+        date_col=config.date_col,
+    )
+    return ExperimentResult(
+        **{
+            **validation.__dict__,
+            "split_sizes": {**validation.split_sizes, "test": len(test)},
+        },
+        test_metrics=evaluate_predictions(
+            y_test[label_mask], test_predictions[label_mask]
+        ),
+        backtest=backtest,
+        test_probabilities=test_probabilities,
+        test_predictions=test_predictions,
+        y_test=y_test,
+        test_label_mask=label_mask,
+        aligned_test_frame=aligned_test,
+    )
+
+
+def run_experiment(
+    frame: pd.DataFrame,
+    config: ExperimentConfig,
+    model: ProbabilisticSequenceClassifier | ManualANNClassifier | None = None,
+) -> ExperimentResult:
+    """Run one static experiment, freezing model/policy before final evaluation."""
+
+    validation = run_validation_experiment(frame, config, model)
+    return evaluate_experiment_test(frame, validation)
 
 
 __all__ = [
     "ExperimentResult",
+    "ValidationResult",
     "TrainedModelBundle",
     "align_probability_columns",
+    "evaluate_experiment_test",
     "run_experiment",
+    "run_validation_experiment",
 ]

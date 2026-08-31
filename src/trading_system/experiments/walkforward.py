@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import replace
+from weakref import ref
 
 import numpy as np
 import pandas as pd
@@ -32,6 +34,19 @@ from .runner import TrainedModelBundle, align_probability_columns
 # shared registry/factory receiving `ModelBuildContext`, typed parameters and a
 # seed derived from `(run_seed, chunk_id)`.
 ModelFactory = Callable[[int], ProbabilisticClassifier]
+
+
+def derive_chunk_seed(run_seed: int, chunk_id: int) -> int:
+    """Stable independent retrain seeds, without touching global RNG state."""
+
+    for name, value in (("run_seed", run_seed), ("chunk_id", chunk_id)):
+        if isinstance(value, (bool, np.bool_)) or not isinstance(
+            value, (int, np.integer)
+        ):
+            raise TypeError(f"{name} must be an integer.")
+        if value < 0:
+            raise ValueError(f"{name} must be non-negative.")
+    return int(np.random.SeedSequence([run_seed, chunk_id]).generate_state(1)[0])
 
 
 def _label_history(
@@ -82,6 +97,7 @@ def fit_labeled_history(
     min_action_rate: float,
     estimator: ProbabilisticClassifier,
     date_col: str = "date",
+    forward_horizon: int = 0,
 ) -> tuple[TrainedModelBundle, pd.DataFrame, dict[str, float]]:
     # TODO(sequence-walkforward-fit-1): Build 3D train/validation sequences and
     # fit one `SequenceStandardizer` on train only.
@@ -98,27 +114,37 @@ def fit_labeled_history(
     train, val = chronological_train_val_split(
         work, val_ratio=val_ratio, date_col=date_col
     )
+    for split in (train, val):
+        split["_label_known"] = True
+        if forward_horizon:
+            split.loc[split.tail(forward_horizon).index, "_label_known"] = False
     train = train.dropna(subset=list(columns)).copy()
     if train.empty:
         raise ValueError("Walk-forward training history has no complete feature rows.")
     fill_values = train[list(columns)].median(numeric_only=True).fillna(0.0)
     val.loc[:, columns] = val[list(columns)].fillna(fill_values).fillna(0.0)
     train.loc[:, columns] = train[list(columns)].fillna(fill_values).fillna(0.0)
-    X_train_raw, y_train = build_context_dataset_with_history(
+    X_train_raw, y_train, aligned_train = build_context_dataset_with_history(
         train,
         columns,
         context_len,
         group_col=None,
         date_col=date_col,
+        return_aligned_rows=True,
     )
-    X_val_raw, y_val = build_context_dataset_with_history(
+    X_val_raw, y_val, aligned_val = build_context_dataset_with_history(
         val,
         columns,
         context_len,
         history_frame=train,
         group_col=None,
         date_col=date_col,
+        return_aligned_rows=True,
     )
+    train_mask = aligned_train["_label_known"].to_numpy(dtype=bool)
+    val_mask = aligned_val["_label_known"].to_numpy(dtype=bool)
+    X_train_raw, y_train = X_train_raw[train_mask], y_train[train_mask]
+    X_val_raw, y_val = X_val_raw[val_mask], y_val[val_mask]
     if not len(X_train_raw) or not len(X_val_raw):
         raise ValueError(
             "Walk-forward context windowing produced an empty train or validation set."
@@ -209,17 +235,20 @@ def walk_forward_classifier(
     context_len: int = 20,
     model_factory: ModelFactory | None = None,
     manual_ann_config: ManualANNConfig | None = None,
+    evaluation_split: str = "test",
 ) -> dict[str, object]:
     # TODO(sequence-walkforward-run-1): Accept model selection/registry instead of
     # ANN-specific fallback config. Construct a fresh model and scaler per chunk.
     #
-    # TODO(sequence-walkforward-run-2): Derive deterministic chunk seeds, forbid
-    # implicit warm-start, and record model name/parameters/duration per retrain.
+    # TODO(sequence-walkforward-run-2): Move custom factories to the registry so
+    # they also receive chunk seeds; record model parameters/duration per retrain.
     #
     # TODO(sequence-walkforward-run-3): Preserve the rule that history ends before
     # each chunk and prediction at `t` executes at `t+1` in the common backtest.
     if walkforward_step <= 0:
         raise ValueError("walkforward_step must be positive.")
+    if evaluation_split not in ("validation", "test"):
+        raise ValueError("evaluation_split must be 'validation' or 'test'.")
     data = full_df.sort_values("date").reset_index(drop=True).copy()
     if len(data) < context_len + 50:
         raise ValueError(
@@ -232,12 +261,16 @@ def walk_forward_classifier(
     ]
     if missing:
         raise ValueError(f"Missing walk-forward columns: {missing}")
-    _, _, initial_test = chronological_train_val_test_split(
+    initial_train, _, initial_test = chronological_train_val_test_split(
         data,
         train_ratio=train_ratio,
         val_ratio=val_ratio,
     )
     test_start = len(data) - len(initial_test)
+    if evaluation_split == "validation":
+        # Truncate before labeling and retraining, not merely before reporting.
+        data = data.iloc[:test_start].copy()
+        test_start = len(initial_train)
     evaluation_labels, evaluation_label_report = _label_history(
         data,
         label_mode=label_mode,
@@ -258,6 +291,7 @@ def walk_forward_classifier(
         batch_size=64,
         early_stopping_patience=30,
     )
+    previous_estimators = []
 
     for chunk_id, start in enumerate(
         range(test_start, len(data), walkforward_step), start=1
@@ -275,18 +309,21 @@ def walk_forward_classifier(
             forward_sell_threshold=forward_sell_threshold,
             breakout_window=breakout_window,
         )
+        chunk_seed = derive_chunk_seed(base_ann_config.seed, chunk_id)
         estimator = (
             model_factory(chunk_id)
             if model_factory is not None
-            else ManualANNClassifier(
-                ManualANNConfig(
-                    **{
-                        **base_ann_config.__dict__,
-                        "seed": base_ann_config.seed + chunk_id - 1,
-                    }
-                )
-            )
+            else ManualANNClassifier(replace(base_ann_config, seed=chunk_seed))
         )
+        if any(estimator is previous() for previous in previous_estimators):
+            raise ValueError(
+                "model_factory must return a fresh estimator for each chunk."
+            )
+        try:
+            previous_estimators.append(ref(estimator))
+        except TypeError:
+            # Preserve the identity guard for slot-only custom classifiers.
+            previous_estimators.append(lambda estimator=estimator: estimator)
         bundle, filled_history, val_metrics = fit_labeled_history(
             labeled_history,
             feature_columns,
@@ -295,6 +332,7 @@ def walk_forward_classifier(
             decision_mode=decision_mode,
             min_action_rate=min_action_rate,
             estimator=estimator,
+            forward_horizon=forward_horizon if label_mode == "forward_return" else 0,
         )
         chunk = data.iloc[start:end].copy().reset_index(drop=True)
         chunk_predictions, local_indices = predict_chunk_with_model(
@@ -307,6 +345,8 @@ def walk_forward_classifier(
         retrain_logs.append(
             {
                 "chunk_id": chunk_id,
+                "run_seed": base_ann_config.seed if model_factory is None else None,
+                "seed": chunk_seed if model_factory is None else None,
                 "start_idx": start,
                 "end_idx": end,
                 "n_hist": len(history),
@@ -322,9 +362,14 @@ def walk_forward_classifier(
     evaluation_mask = test_mask & (predictions >= 0)
     if not evaluation_mask.any():
         raise RuntimeError("Walk-forward evaluation produced no predictions.")
-    y_true = y_true_global[evaluation_mask]
+    label_mask = evaluation_mask.copy()
+    if label_mode == "forward_return":
+        label_mask[-forward_horizon:] = False
+    if not label_mask.any():
+        raise ValueError("Evaluation requires observed label targets.")
+    y_true = y_true_global[label_mask]
     y_pred = predictions[evaluation_mask]
-    test_metrics = evaluate_predictions(y_true, y_pred)
+    test_metrics = evaluate_predictions(y_true, predictions[label_mask])
     aligned_test = data.loc[evaluation_mask].reset_index(drop=True)
     benchmark = evaluate_strategy_vs_buy_hold(
         aligned_test,
@@ -335,18 +380,34 @@ def walk_forward_classifier(
         position_mode=position_mode,
         execution_delay=execution_delay,
     )
-    return {
-        "test_metrics": test_metrics,
-        "benchmark_comparison": benchmark,
+    shared = {
+        "evaluation_split": evaluation_split,
         "n_total_rows": len(data),
-        "test_start_idx": test_start,
-        "n_test_rows": int(test_mask.sum()),
         "n_eval_rows": int(evaluation_mask.sum()),
-        "n_missing_test_preds": int(test_mask.sum() - evaluation_mask.sum()),
+        "n_scored_labels": int(label_mask.sum()),
         "label_eval_report": evaluation_label_report,
         "retrain_logs": retrain_logs,
         "predictions": predictions,
         "evaluation_mask": evaluation_mask,
+        "label_mask": label_mask,
+    }
+    if evaluation_split == "validation":
+        return {
+            **shared,
+            "val_metrics": test_metrics,
+            "val_backtest": benchmark,
+            "val_start_idx": test_start,
+            "n_val_rows": int(test_mask.sum()),
+            "n_missing_val_preds": int(test_mask.sum() - evaluation_mask.sum()),
+            "aligned_val_frame": aligned_test,
+        }
+    return {
+        **shared,
+        "test_metrics": test_metrics,
+        "benchmark_comparison": benchmark,
+        "test_start_idx": test_start,
+        "n_test_rows": int(test_mask.sum()),
+        "n_missing_test_preds": int(test_mask.sum() - evaluation_mask.sum()),
         "aligned_test_frame": aligned_test,
     }
 
@@ -379,6 +440,8 @@ def walk_forward_oracle_ann(
     early_stopping_patience: int = 30,
     early_stopping_min_delta: float = 1e-4,
     seed: int = 1,
+    evaluation_split: str = "test",
+    execution_delay: int = 1,
 ):
     """Compatibility adapter for previous walk-forward ANN API."""
 
@@ -412,10 +475,13 @@ def walk_forward_oracle_ann(
         initial_capital=initial_capital,
         context_len=context_len,
         manual_ann_config=ann_config,
+        evaluation_split=evaluation_split,
+        execution_delay=execution_delay,
     )
 
 
 __all__ = [
+    "derive_chunk_seed",
     "fit_labeled_history",
     "predict_chunk_with_model",
     "walk_forward_classifier",

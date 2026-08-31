@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--label-mode",
-        choices=("oracle_dp", "forward_return", "breakout"),
+        choices=("forward_return", "breakout"),
         default="forward_return",
     )
     parser.add_argument(
@@ -87,8 +87,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    # TODO(sequence-grid-cli-2): Build equal per-model trial matrices, select only
-    # on validation, and write raw runs/failures/summary through artifact helpers.
+    # TODO(sequence-grid-cli-2): Build equal per-model trial matrices and write
+    # raw runs/failures/summary through artifact helpers.
     args = build_parser().parse_args()
     frame = read_parquet_dataset(args.data_dir)
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
@@ -153,14 +153,22 @@ def main() -> None:
             {
                 "ticker": args.ticker,
                 "objective": args.objective,
+                "selection_split": "validation",
                 "trials": len(results),
                 "valid_trials": len(results[results["status"] == "ok"]),
                 "top": valid.to_dict(orient="records"),
+                "best_parameters": results.attrs.get("best_parameters"),
+                "validation_retrain_logs": results.attrs["validation_retrain_logs"],
+                "final_test": results.attrs.get("final_test"),
             },
             indent=2,
         )
     )
+    print("Validation ranking:")
     print(valid.to_string(index=False) if not valid.empty else "No valid trials.")
+    if "final_test" in results.attrs:
+        print("Frozen winner — final test:")
+        print(json.dumps(results.attrs["final_test"], indent=2))
     print(f"csv={output_csv}\njson={output_json}")
 
 
