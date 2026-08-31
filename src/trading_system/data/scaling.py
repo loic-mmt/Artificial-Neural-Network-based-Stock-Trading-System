@@ -83,9 +83,19 @@ class SequenceStandardizer:
         # variance for a constant feature; dividing by it would turn harmless
         # rounding noise into normalized values near one. Persisted state remains
         # float32, matching model inputs.
-        statistics = values.astype(np.float64)
-        mean_64 = statistics.mean(axis=(0, 1), keepdims=True)
-        scale_64 = statistics.std(axis=(0, 1), ddof=0, keepdims=True)
+        mean_64 = values.mean(
+            axis=(0, 1),
+            dtype=np.float64,
+            keepdims=True,
+        )
+
+        scale_64 = values.std(
+            axis=(0, 1),
+            dtype=np.float64,
+            ddof=0,
+            keepdims=True,
+        )
+        
         if not np.isfinite(mean_64).all() or not np.isfinite(scale_64).all():
             raise ValueError("Sequence statistics must be finite.")
 

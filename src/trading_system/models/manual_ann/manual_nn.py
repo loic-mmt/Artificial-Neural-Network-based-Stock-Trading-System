@@ -185,11 +185,13 @@ class ManualANNClassifier:
 
         for epoch in range(self.config.epochs):
             permutation = rng.permutation(len(X))
-            shuffled_X = X[permutation]
-            shuffled_y = y[permutation]
+
             for start in range(0, len(X), self.config.batch_size):
-                batch_X = shuffled_X[start : start + self.config.batch_size]
-                batch_y = shuffled_y[start : start + self.config.batch_size]
+                end = start + self.config.batch_size
+                batch_indices = permutation[start:end]
+
+                batch_X = X[batch_indices]
+                batch_y = y[batch_indices]
                 encoded_y = one_hot(batch_y, self.config.num_classes)
                 W0, b0, W1, b1 = self._state()
                 z1 = batch_X @ W0 + b0
