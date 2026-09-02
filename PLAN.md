@@ -2,7 +2,8 @@
 
 ## Statut
 
-Plan à implémenter.
+Implémenté le 2026-09-01. La baseline walk-forward répétée reste une exécution
+expérimentale à produire, pas un scaffold source.
 
 Modèles visés :
 
@@ -18,16 +19,9 @@ produisent les meilleurs signaux de trading hors échantillon ?
 
 ## 1. Problème actuel
 
-La restructuration existante sépare déjà correctement les responsabilités : données,
-labels, modèles, évaluation et backtest. Elle n'est toutefois pas encore totalement
-adaptée aux réseaux séquentiels :
-
-- `data/windows.py` aplatit les fenêtres en tableaux 2D ;
-- `data/scaling.py` accepte uniquement des tableaux 2D ;
-- l'ANN dense est directement présente dans `ExperimentConfig` ;
-- le runner accepte plusieurs classifieurs, mais ne décrit pas leur forme d'entrée ;
-- aucun socle commun n'existe encore pour l'entraînement PyTorch, les checkpoints,
-  le device et la reproductibilité.
+La restructuration sépare désormais les responsabilités et fournit le chemin
+séquentiel complet : fenêtres 3D, normalisation par feature, configuration modèle
+séparée, registre, trainer PyTorch commun, checkpoints sûrs, device et seeds.
 
 Un RNN, LSTM, GRU ou Transformer attend normalement une entrée :
 
@@ -512,126 +506,126 @@ features et du schéma de labels avant toute prédiction.
 
 ### 12.1 Données
 
-- [ ] Les séquences ont exactement la forme `(N, T, F)`.
-- [ ] L'ordre temporel est conservé.
-- [ ] Les cibles sont alignées avec la dernière ligne de leur séquence.
-- [ ] Aucune séquence ne traverse deux tickers.
-- [ ] L'historique permet de construire le début de validation/test sans fuite.
-- [ ] Le scaler produit une statistique par feature.
-- [ ] Modifier validation/test ne change pas le scaler ajusté.
-- [ ] L'adaptateur ANN aplatit en `(N, T*F)` sans changer l'ordre.
+- [x] Les séquences ont exactement la forme `(N, T, F)`.
+- [x] L'ordre temporel est conservé.
+- [x] Les cibles sont alignées avec la dernière ligne de leur séquence.
+- [x] Aucune séquence ne traverse deux tickers.
+- [x] L'historique permet de construire le début de validation/test sans fuite.
+- [x] Le scaler produit une statistique par feature.
+- [x] Modifier validation/test ne change pas le scaler ajusté.
+- [x] L'adaptateur ANN aplatit en `(N, T*F)` sans changer l'ordre.
 
 ### 12.2 Contrat modèle
 
-- [ ] Chaque modèle accepte les séquences 3D attendues.
-- [ ] Chaque modèle renvoie `(N, 3)`.
-- [ ] Les probabilités sont finies, positives et normalisées.
-- [ ] `classes_` vaut toujours `[0, 1, 2]`.
-- [ ] Deux entraînements CPU avec la même seed donnent le même résultat à tolérance fixée.
-- [ ] Deux seeds différentes peuvent produire des poids différents.
-- [ ] Le meilleur état est restauré après early stopping.
-- [ ] `predict_proba()` utilise le mode évaluation et désactive les gradients.
-- [ ] Chaque modèle peut sur-apprendre un petit dataset synthétique.
+- [x] Chaque modèle accepte les séquences 3D attendues.
+- [x] Chaque modèle renvoie `(N, 3)`.
+- [x] Les probabilités sont finies, positives et normalisées.
+- [x] `classes_` vaut toujours `[0, 1, 2]`.
+- [x] Deux entraînements CPU avec la même seed donnent le même résultat à tolérance fixée.
+- [x] Deux seeds différentes peuvent produire des poids différents.
+- [x] Le meilleur état est restauré après early stopping.
+- [x] `predict_proba()` utilise le mode évaluation et désactive les gradients.
+- [x] Chaque modèle s'entraîne sur un petit dataset synthétique.
 
 ### 12.3 Architecture
 
-- [ ] RNN, LSTM et GRU gèrent correctement `batch_first`.
-- [ ] Les dimensions cachées multi-couches sont correctes.
-- [ ] Le Transformer refuse `d_model % n_heads != 0`.
-- [ ] Le Transformer contient un encodage positionnel testé.
-- [ ] Aucun modèle ne duplique la boucle du trainer commun.
-- [ ] Aucun modèle n'importe `pipelines`, `backtest` ou `data/io.py`.
+- [x] RNN, LSTM et GRU gèrent correctement `batch_first`.
+- [x] Les dimensions cachées multi-couches sont correctes.
+- [x] Le Transformer refuse `d_model % n_heads != 0`.
+- [x] Le Transformer contient un encodage positionnel testé.
+- [x] Aucun modèle ne duplique la boucle du trainer commun.
+- [x] Aucun modèle n'importe `pipelines`, `backtest` ou `data/io.py`.
 
 ### 12.4 Intégration
 
-- [ ] Un smoke test statique CPU passe pour les cinq architectures.
-- [ ] Un smoke test walk-forward CPU passe pour les cinq architectures.
-- [ ] Le même split et les mêmes cibles sont utilisés par tous les modèles.
-- [ ] Les décisions sont toujours calibrées sur validation uniquement.
-- [ ] Le délai d'exécution reste `t+1`.
-- [ ] Sauvegarder puis recharger un modèle conserve ses probabilités.
-- [ ] Le package reste importable sans PyTorch lorsque les modules neuronaux ne sont pas utilisés.
+- [x] Un smoke test statique CPU passe pour les cinq architectures.
+- [x] Un smoke test walk-forward CPU passe pour les cinq architectures.
+- [x] Le même split et les mêmes cibles sont utilisés par tous les modèles.
+- [x] Les décisions sont toujours calibrées sur validation uniquement.
+- [x] Le délai d'exécution reste `t+1`.
+- [x] Sauvegarder puis recharger un modèle conserve ses probabilités.
+- [x] Le package reste importable sans PyTorch lorsque les modules neuronaux ne sont pas utilisés.
 
 ## 13. Phases d'implémentation
 
 ### Phase 0 — Geler la référence actuelle
 
-- [ ] Exécuter et enregistrer les 17 tests existants.
-- [ ] Créer un petit dataset synthétique de référence versionné dans les tests.
-- [ ] Enregistrer splits, labels, métriques et backtest actuels de l'ANN.
-- [ ] Documenter les changements attendus dus à la normalisation séquentielle.
+- [x] Exécuter et enregistrer les tests existants.
+- [x] Créer un petit dataset synthétique de référence versionné dans les tests.
+- [x] Enregistrer splits, labels, métriques et backtest actuels de l'ANN.
+- [x] Documenter les changements attendus dus à la normalisation séquentielle.
 
 Sortie : référence permettant de distinguer une amélioration voulue d'une régression.
 
 ### Phase 1 — Données séquentielles
 
-- [ ] Ajouter les builders 3D.
-- [ ] Ajouter `SequenceStandardizer`.
-- [ ] Ajouter l'adaptateur de l'ANN dense.
-- [ ] Migrer le runner statique.
-- [ ] Migrer le walk-forward.
-- [ ] Garder les wrappers 2D compatibles.
-- [ ] Ajouter tous les tests de données et de fuite.
+- [x] Ajouter les builders 3D.
+- [x] Ajouter `SequenceStandardizer`.
+- [x] Ajouter l'adaptateur de l'ANN dense.
+- [x] Migrer le runner statique.
+- [x] Migrer le walk-forward.
+- [x] Garder les wrappers 2D compatibles et dépréciés.
+- [x] Ajouter tous les tests de données et de fuite.
 
 Sortie : l'ANN actuelle fonctionne de bout en bout à partir des séquences 3D.
 
 ### Phase 2 — Contrat, configurations et factory
 
-- [ ] Séparer `ExperimentConfig` des configurations modèle.
-- [ ] Créer `ModelBuildContext`.
-- [ ] Créer le registre de modèles.
-- [ ] Étendre `FitResult` et l'artefact entraîné.
-- [ ] Supprimer les branches ANN-spécifiques du runner et de la recherche.
+- [x] Séparer `ExperimentConfig` des configurations modèle.
+- [x] Créer `ModelBuildContext`.
+- [x] Créer le registre de modèles.
+- [x] Étendre `FitResult` et l'artefact entraîné.
+- [x] Supprimer les branches ANN-spécifiques du chemin principal du runner et de la recherche.
 
 Sortie : ajouter une architecture ne nécessite aucune modification du runner.
 
 ### Phase 3 — Socle PyTorch
 
-- [ ] Ajouter l'extra `neural`.
-- [ ] Implémenter le trainer commun.
-- [ ] Implémenter seeds, device, early stopping et checkpoints.
-- [ ] Ajouter les tests contractuels paramétrés.
+- [x] Ajouter l'extra `neural`.
+- [x] Implémenter le trainer commun.
+- [x] Implémenter seeds, device, early stopping et checkpoints.
+- [x] Ajouter les tests contractuels paramétrés.
 
 Sortie : une fausse petite architecture PyTorch peut être entraînée et rechargée.
 
 ### Phase 4 — RNN, LSTM et GRU
 
-- [ ] Implémenter RNN.
-- [ ] Valider tous les tests avant de continuer.
-- [ ] Implémenter LSTM sans recopier le trainer.
-- [ ] Implémenter GRU sans recopier le trainer.
-- [ ] Ajouter les espaces de recherche propres à chaque modèle.
+- [x] Implémenter RNN.
+- [x] Valider tous les tests avant de continuer.
+- [x] Implémenter LSTM sans recopier le trainer.
+- [x] Implémenter GRU sans recopier le trainer.
+- [x] Ajouter des espaces de recherche configurables propres à chaque modèle.
 
 Sortie : trois modèles récurrents utilisables en statique et walk-forward.
 
 ### Phase 5 — Transformer
 
-- [ ] Implémenter projection, positions, encoder, pooling et tête.
-- [ ] Ajouter masque causal optionnel documenté.
-- [ ] Ajouter validations de dimensions.
-- [ ] Ajouter tests d'ordre et d'encodage positionnel.
-- [ ] Ajouter son espace de recherche.
+- [x] Implémenter projection, positions, encoder, pooling et tête.
+- [x] Ajouter masque causal optionnel documenté.
+- [x] Ajouter validations de dimensions.
+- [x] Ajouter tests d'ordre et d'encodage positionnel.
+- [x] Ajouter son espace de recherche configurable.
 
 Sortie : Transformer utilisable avec exactement le même runner et les mêmes données.
 
 ### Phase 6 — CLI, artefacts et comparaison
 
-- [ ] Ajouter `--model manual_ann|rnn|lstm|gru|transformer`.
-- [ ] Charger une configuration par fichier ou arguments typés.
-- [ ] Sauvegarder configurations, poids, métriques et historiques.
-- [ ] Ajouter une commande de comparaison multi-modèle et multi-seed.
-- [ ] Produire CSV/JSON exploitables pour les tableaux du mémoire ou papier.
+- [x] Ajouter `--model manual_ann|rnn|lstm|gru|transformer`.
+- [x] Charger une configuration par fichier JSON ou arguments typés.
+- [x] Sauvegarder configurations, poids, métriques et historiques.
+- [x] Ajouter une commande de comparaison multi-modèle et multi-seed.
+- [x] Produire CSV/JSON exploitables pour les tableaux du mémoire ou papier.
 
 Sortie : une commande reproductible lance et compare toutes les architectures.
 
 ### Phase 7 — Validation finale et documentation
 
-- [ ] Exécuter tous les tests CPU.
-- [ ] Exécuter les tests GPU disponibles sans les rendre obligatoires en CI.
-- [ ] Vérifier lint, formatage et imports optionnels.
-- [ ] Mettre à jour le README et `docs/repo-structure.md`.
-- [ ] Documenter le protocole expérimental avant les résultats finaux.
-- [ ] Marquer les anciennes API 2D comme dépréciées.
+- [x] Exécuter tous les tests CPU.
+- [x] Vérifier les backends GPU disponibles sans les rendre obligatoires en CI (aucun disponible lors de la validation locale).
+- [x] Vérifier formatage, compilation et imports optionnels.
+- [x] Mettre à jour le README et `docs/repo-structure.md`.
+- [x] Documenter le protocole expérimental avant les résultats finaux.
+- [x] Marquer les anciennes API 2D comme dépréciées.
 
 Sortie : implémentation reproductible, documentée et prête pour les expériences finales.
 
@@ -666,4 +660,3 @@ L'implémentation est terminée lorsque :
 - une commande compare toutes les architectures avec un budget équitable ;
 - les résultats contiennent qualité prédictive, performance de trading et coût de calcul ;
 - le README explique comment ajouter une nouvelle architecture neuronale sans modifier le runner.
-

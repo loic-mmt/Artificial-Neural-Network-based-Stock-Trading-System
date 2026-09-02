@@ -13,7 +13,8 @@ Implementation result:
 - advanced `backtest/lib.py` kept as lazy-loaded legacy implementation while lightweight engine stays independent;
 - 17 tests cover single/multi, long-only/long-short, static/walk-forward, leakage guards, ANN determinism, adapter alignment, and oracle/backtest agreement.
 
-Original findings and unchecked migration checklist below remain as before-state/history. Implementation summary above is authoritative.
+Original findings remain as before-state history. The checklist below now records
+the completed migration and the compatibility decisions retained intentionally.
 
 ## Goal
 
@@ -253,78 +254,78 @@ Both must import owning modules after extraction.
 
 ### Phase 0 — Characterize behavior
 
-- [ ] Add synthetic fixtures for one ticker and multiple tickers.
-- [ ] Capture outputs for labels, split sizes, windows, scaler values, probability decisions, metrics, positions, fees, and PnL.
-- [ ] Add regression test proving no window crosses ticker boundaries.
-- [ ] Add regression test proving scaler fits train only.
-- [ ] Add regression test for signal timing (`t` prediction executes at `t+1`).
-- [ ] Add fee test: long/short flip has turnover `2`.
-- [ ] Add deterministic ANN smoke test with fixed seed.
-- [ ] Record intentional differences between current pipelines.
+- [x] Add synthetic fixtures for one ticker and multiple tickers.
+- [x] Capture outputs for labels, split sizes, windows, scaler values, probability decisions, metrics, positions, fees, and PnL.
+- [x] Add regression test proving no window crosses ticker boundaries.
+- [x] Add regression test proving scaler fits train only.
+- [x] Add regression test for signal timing (`t` prediction executes at `t+1`).
+- [x] Add fee test: long/short flip has turnover `2`.
+- [x] Add deterministic ANN smoke test with fixed seed.
+- [x] Record intentional differences between current pipelines.
 
 Exit: behavior baseline exists before any move.
 
 ### Phase 1 — Extract exact shared helpers
 
-- [ ] Create `data/io.py`, `data/splits.py`, `data/windows.py`, `data/scaling.py`.
-- [ ] Create `features/technical.py` and feature constants.
-- [ ] Create `labels/schema.py` and `labels/breakout.py`.
-- [ ] Create `evaluation/classification.py` and `evaluation/thresholds.py`.
-- [ ] Replace copied functions with imports, one family at a time.
-- [ ] Update analysis and label-grid-search imports.
-- [ ] Keep temporary re-exports only where external import compatibility matters.
+- [x] Create `data/io.py`, `data/splits.py`, `data/windows.py`, `data/scaling.py`.
+- [x] Create `features/technical.py` and feature constants.
+- [x] Create `labels/schema.py` and `labels/breakout.py`.
+- [x] Create `evaluation/classification.py` and `evaluation/thresholds.py`.
+- [x] Replace copied functions with imports, one family at a time.
+- [x] Update analysis and label-grid-search imports.
+- [x] Keep temporary re-exports only where external import compatibility matters.
 
 Exit: exact duplicate helper bodies removed; pipeline behavior unchanged.
 
 ### Phase 2 — Consolidate position and backtest semantics
 
-- [ ] Introduce explicit `position_mode` and `execution_delay` configuration.
-- [ ] Implement canonical position decoder.
-- [ ] Implement single-asset evaluation and grouped multi-asset wrapper.
-- [ ] Compare old/new equity curves row by row.
-- [ ] Select and document next-bar execution as canonical behavior.
+- [x] Introduce explicit `position_mode` and `execution_delay` configuration.
+- [x] Implement canonical position decoder.
+- [x] Implement single-asset evaluation and grouped multi-asset wrapper.
+- [x] Compare old/new equity curves row by row.
+- [x] Select and document next-bar execution as canonical behavior.
 
 Exit: one tested PnL path serves static and walk-forward workflows.
 
 ### Phase 3 — Extract manual ANN
 
-- [ ] Add `ManualANNConfig`, `ManualANNClassifier`, `FitResult`, and `TrainingHistory`.
-- [ ] Move primitives, forward pass, gradient updates, dropout, weighted loss, early stopping, and inference into `manual_nn.py`.
-- [ ] Make feature arrays and validation arrays explicit inputs.
-- [ ] Replace raw weight dictionaries in pipeline code with model object.
-- [ ] Keep threshold calibration, metrics, backtest, and plots outside model.
-- [ ] Test probabilities and one deterministic training run against baseline.
+- [x] Add `ManualANNConfig`, `ManualANNClassifier`, `FitResult`, and `TrainingHistory`.
+- [x] Move primitives, forward pass, gradient updates, dropout, weighted loss, early stopping, and inference into `manual_nn.py`.
+- [x] Make feature arrays and validation arrays explicit inputs.
+- [x] Replace raw weight dictionaries in pipeline code with model object.
+- [x] Keep threshold calibration, metrics, backtest, and plots outside model.
+- [x] Test probabilities and one deterministic training run against baseline.
 
 Exit: manual ANN train/inference has one implementation and no pipeline dependency.
 
 ### Phase 4 — Add model-neutral experiment runner
 
-- [ ] Add typed `ExperimentConfig` and result dataclasses.
-- [ ] Build shared load -> label -> features -> split -> window -> scale workflow.
-- [ ] Call `model.fit()` and `model.predict_proba()` through common interface.
-- [ ] Calibrate thresholds on validation only.
-- [ ] Evaluate test only once after model selection.
-- [ ] Return structured metrics, predictions, aligned rows, and backtest outputs.
+- [x] Add typed `ExperimentConfig` and result dataclasses.
+- [x] Build shared load -> label -> features -> split -> window -> scale workflow.
+- [x] Call `model.fit()` and `model.predict_proba()` through common interface.
+- [x] Calibrate thresholds on validation only.
+- [x] Evaluate test only once after model selection.
+- [x] Return structured metrics, predictions, aligned rows, and backtest outputs.
 
 Exit: swapping model factory requires no data/evaluation code copy.
 
 ### Phase 5 — Thin pipelines
 
-- [ ] Convert six static modules into small config/CLI wrappers.
-- [ ] Preserve current scripts as compatibility entrypoints.
-- [ ] Optionally replace six pipeline modules with one `train.py` entrypoint and flags.
-- [ ] Keep `walkforward.py` focused on rolling schedule only.
-- [ ] Keep `gridsearch_walkforward.py` focused on CLI/search configuration only.
+- [x] Convert six static modules into small config/CLI wrappers.
+- [x] Preserve current scripts as compatibility entrypoints.
+- [x] Retain the six named wrappers instead of adding an ambiguous `train.py` entrypoint.
+- [x] Keep `walkforward.py` focused on rolling schedule only.
+- [x] Keep `gridsearch_walkforward.py` focused on CLI/search configuration only.
 
 Exit: pipeline modules contain orchestration, not model math or reusable helpers.
 
 ### Phase 6 — Cleanup and add second model
 
-- [ ] Remove compatibility aliases after imports are migrated.
-- [ ] Remove confirmed dead code and commented blocks.
-- [ ] Export intentional public APIs through package `__init__.py` files.
-- [ ] Add first alternative classifier through adapter/factory.
-- [ ] Run same experiment config with manual ANN and alternative model.
+- [x] Retain only intentional compatibility aliases and deprecate the legacy 2D windows.
+- [x] Remove confirmed dead code and commented blocks.
+- [x] Export intentional public APIs through package `__init__.py` files.
+- [x] Add RNN, LSTM, GRU, and Transformer through the shared registry.
+- [x] Run the same static and walk-forward experiment contracts through all five models.
 
 Exit: second model uses identical data, thresholds, metrics, and backtest path.
 

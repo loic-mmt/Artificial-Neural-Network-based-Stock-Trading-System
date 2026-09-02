@@ -42,14 +42,21 @@ performance.
   return to pipeline modules.
 - Manual ANN has one canonical implementation under
   `src/trading_system/models/manual_ann/`.
+- Manual ANN, RNN, LSTM, GRU, and Transformer consume the same normalized 3D
+  sequences through a common registry and build context.
+- PyTorch training, devices, deterministic seeds, minibatches, weighted loss,
+  gradient clipping, early stopping, and best-state restoration have one owner.
+- Safe JSON/NPZ artifacts include checksums, dataset/config hashes, split
+  boundaries, ordered features, scaler/model state, decision policy, metrics,
+  training history, code revision, and dependency versions.
 - Core execution uses next-bar timing through
   `evaluate_strategy_vs_buy_hold`.
 - Static single-ticker and multi-ticker experiments share `run_experiment`.
 
 ### Verified baseline of the codebase
 
-- `136` core automated tests pass as of 2026-08-31, including `31`
-  search-integrity tests and `52` memory-optimization tests. The separate
+- `170` core automated tests pass as of 2026-09-01, including model-contract,
+  registry, serialization, comparison, search-integrity, and memory tests. The separate
   untracked local MT5 smoke test is not part
   of this verification: the test interpreter lacks TA-Lib, while the project
   `.venv` lacks pytest and stalls while importing pandas.
@@ -57,9 +64,11 @@ performance.
   grouped capital allocation, shared experiment paths, deterministic manual ANN,
   state round-trips, and architecture boundaries.
 - `DecisionPolicy` supports `argmax` and validation-calibrated `thresholds`.
-- Walk-forward retraining uses expanding history and creates a fresh manual ANN
-  per chunk.
-- Seed support exists in the walk-forward CLI and manual ANN configuration.
+- Walk-forward retraining uses expanding history and creates a fresh selected
+  registry model per chunk.
+- Every registry-based chunk receives a deterministic seed derived from
+  `(run_seed, chunk_id)` and records model, parameters, parameter count, seed,
+  validation metrics, epoch, and duration.
 - Static and walk-forward search now rank on validation only, then evaluate the
   frozen winner once on final test per search invocation.
 - Static selection exposes a `ValidationResult` without test metrics or prices.
@@ -73,26 +82,19 @@ performance.
   [memory optimization measurements](memory-optimization.md) for methodology,
   reproduction commands and limitations; these are not a trading baseline.
 
-### Important incomplete work
+### Remaining experimental work
 
-The refactor created interfaces for the target architecture, but several are
-still scaffolds:
+Implementation scaffolds are complete. Remaining work requires experiment data
+or a deliberate research decision rather than another model-code patch:
 
-- `ModelBuildContext` and `ModelSelection` are not implemented.
-- `ModelRegistry` and `create_default_model_registry` are not implemented.
-- RNN, LSTM, GRU, Transformer, and shared PyTorch trainer modules contain
-  `NotImplementedError` placeholders.
-- Multi-model comparison orchestration is not implemented.
-- Walk-forward still uses the manual-ANN compatibility path and flattened
-  context representation rather than the final model-neutral 3D sequence path.
-- Static and walk-forward paths do not yet use one common model registry.
-- Search selection leakage is addressed, but immutable run manifests, integrated
-  diagnostics and a current-code repeated-seed baseline still block promotion.
-- Artifact manifest validation, hashing, save/load and compatibility checks are
-  still scaffolds in `artifacts/serialization.py`.
-- Shared backtest output currently exposes capital, PnL, and outperformance.
-  Sharpe, drawdown, turnover, execution stress, drift, and overfit diagnostics
-  still need one integrated experiment result.
+- rerun and freeze the current-code walk-forward baseline over at least five
+  seeds in an environment with a healthy parquet stack;
+- acquire historical index-membership snapshots before treating CAC40 results
+  as free of survivorship bias;
+- choose which advanced stress, drift, anomaly, and overfit diagnostics should
+  become promotion gates. The artifact API already accepts and persists these
+  diagnostics, while the core result now includes Sharpe, Sortino, drawdown,
+  turnover, transactions, fees, return, and exposure.
 
 ### Historical baseline
 
@@ -206,7 +208,7 @@ phase is incomplete.
 
 ### Phase 0: Make evaluation trustworthy
 
-Implementation progress — 2026-08-31:
+Implementation progress — 2026-09-01:
 
 - [x] Static trial ranking uses only `val_metrics` / `val_backtest`.
 - [x] Walk-forward validation runs stop before final test, before labeling or
@@ -223,10 +225,12 @@ Implementation progress — 2026-08-31:
 - [x] Manual ANN uses deterministic derived chunk seeds, shared across trial
   configurations and recorded in retrain logs. Reusing an estimator instance
   across trials/chunks is rejected.
-- [ ] Extend the chunk seed contract to registry-based custom model factories.
-- [ ] Complete immutable manifests and integrate advanced diagnostics.
+- [x] Extend the chunk seed contract to registry-based model factories.
+- [x] Complete immutable manifests and provide integrated advanced-diagnostic
+  persistence.
 - [ ] Rerun and freeze the current-code baseline across at least five seeds.
-- [ ] Add survivor-bias warnings to generated current-universe reports.
+- [x] Add survivor-bias warnings to generated current-universe reports and
+  manifests.
 
 Verification: `tests/test_search_integrity.py` covers held-out-price poisoning,
 train/validation target purging, fixed winner evaluation, failure handling,
@@ -253,16 +257,16 @@ Result/API notes:
 - Forward-return metrics and seeded ANN results intentionally differ from older
   runs. Historical numbers are not a new comparable baseline.
 
-Required work:
+Implemented work:
 
-1. Change `experiments/search.py` so all trial ranking uses validation-only
+1. `experiments/search.py` ranks all trials with validation-only
    objectives.
-2. Prevent walk-forward grid search from reading final-test metrics during
+2. Walk-forward grid search cannot read final-test metrics during
    selection.
-3. Evaluate final test once, only for the frozen winner.
-4. Complete deterministic seed derivation from `run_seed` and `chunk_id` and
-   record each retrain seed.
-5. Add a run manifest containing:
+3. Final test is evaluated once, only for the frozen winner.
+4. Deterministic seed derivation from `run_seed` and `chunk_id` is complete and
+   records each retrain seed.
+5. Run manifests contain:
    - dataset path and hash;
    - ticker set and date range;
    - feature and label configuration;
@@ -270,9 +274,13 @@ Required work:
    - seed and model configuration;
    - fees, execution delay, capital, and position mode;
    - code commit and dependency versions.
-6. Integrate core and advanced reports into one persisted experiment artifact.
-7. Rerun a current-code baseline across at least five seeds.
-8. Mark all current-universe CAC40 results as survivor-biased.
+6. Core and optional advanced reports persist in one experiment artifact.
+7. The comparison CLI provides equal-budget, multi-seed CSV/JSON results and
+   one reloadable artifact per successful run.
+8. Current-universe CAC40 results are marked survivor-biased.
+
+Open execution item: rerun and freeze the current-code walk-forward baseline
+across at least five seeds.
 
 Primary touchpoints:
 
@@ -294,20 +302,23 @@ Exit criteria:
 
 ### Phase 1: Complete model-neutral execution
 
-Required work:
+Implementation complete:
 
-1. Implement and validate `ModelBuildContext` and `ModelSelection`.
-2. Implement `ModelRegistry` with lazy model factories.
-3. Move ANN-specific configuration out of `ExperimentConfig`.
-4. Make static and walk-forward runners consume 3D `(N, T, F)` sequences through
+1. `ModelBuildContext` and `ModelSelection` are validated immutable specs.
+2. `ModelRegistry` provides lazy factories for all five models.
+3. Model configuration is separated from shared `ExperimentConfig`; the old
+   `manual_ann` field is input-only compatibility.
+4. Static and walk-forward runners consume 3D `(N, T, F)` sequences through
    the same classifier contract.
-5. Replace compatibility factory hooks with registry-based model construction.
-6. Implement structured comparison runs with equal model/seed budgets.
-7. Persist model name, parameter count, duration, seed, and failures.
+5. Registry construction is the primary path; legacy factory hooks remain only
+   for compatible callers and are isolated.
+6. Structured comparison runs enforce equal model/seed budgets.
+7. Reports persist model name, parameters, parameter count, duration, seed,
+   metrics, artifacts, and failures.
 
-Manual ANN remains the only production candidate until this phase passes. RNN,
-LSTM, GRU, and Transformer scaffolds must not be presented as implemented
-models.
+Manual ANN remains the reference model, but RNN, LSTM, GRU, and Transformer are
+implemented experiment candidates. No architecture is promoted from smoke tests
+or a single run.
 
 Exit criteria:
 
@@ -343,6 +354,9 @@ Promotion condition:
 
 Primary learnable family remains `forward_return`.
 
+Detailed implementation, CLI, diagnostics, and test plan:
+[`docs/labeling-implementation-plan.md`](labeling-implementation-plan.md).
+
 Experiment backlog:
 
 - horizons `1`, `3`, `5`, and `10`;
@@ -374,7 +388,7 @@ Model order:
 2. logistic regression;
 3. shallow tree-based baseline;
 4. manual ANN;
-5. RNN, LSTM, GRU, and Transformer only after Phase 1 implementation.
+5. RNN, LSTM, GRU, and Transformer.
 
 ANN/neural search may include hidden size, dropout, learning rate, context length,
 depth, and architecture-specific parameters. Every model receives equal search
@@ -457,7 +471,8 @@ Required tests before performance promotion:
 - Primary label: `forward_return`.
 - Primary evaluation: expanding walk-forward.
 - Primary objective: robust median OOS outperformance, not in-sample fit.
-- Current production model: manual ANN only.
+- Current reference model: manual ANN; no architecture is promoted until the
+  repeated-seed baseline and promotion gates pass.
 - Oracle policy: diagnostic upper bound only.
 - Current CAC40 history: survivor-biased until historical membership is added.
 - `tmp/model-improvement-tracker/`: local historical evidence, not source of

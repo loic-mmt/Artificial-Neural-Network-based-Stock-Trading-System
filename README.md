@@ -5,7 +5,8 @@
 - `src/trading_system/data/`: loading, chronological splits, context windows, scaling
 - `src/trading_system/features/`: technical and full-market feature builders
 - `src/trading_system/labels/`: shared label schema, breakout, forward-return, and oracle labels
-- `src/trading_system/models/`: common classifier contract, manual ANN, estimator adapters
+- `src/trading_system/models/`: 3D model contract, registry, NumPy ANN, RNN, LSTM, GRU, Transformer
+- `src/trading_system/artifacts/`: safe checksummed model and run serialization
 - `src/trading_system/experiments/`: model-neutral static, walk-forward, and search runners
 - `src/trading_system/pipelines/`: thin CLI/configuration wrappers
 - `src/trading_system/backtest/`: positions, timing, fees, benchmarks, and advanced backtests
@@ -24,6 +25,7 @@ python scripts/download_market_data.py
 python scripts/run_single_ticker.py
 python scripts/run_walkforward.py
 python scripts/run_gridsearch_walkforward.py
+python scripts/run_model_comparison.py --device cpu
 ```
 
 Run tests with development dependencies:
@@ -47,12 +49,35 @@ Oracle labels are diagnostic-only and are not accepted by grid search.
 Forward-return labels crossing split boundaries are excluded from training and
 classification scoring. Their feature rows remain available as context, and
 backtests retain the complete prediction interval. These integrity fixes mean
-older scores are not directly comparable; the new repeated-seed baseline and
-immutable run manifests are still pending.
+older scores are not directly comparable. Static and comparison runs can now
+persist reloadable, checksummed artifacts and immutable manifests.
+
+Current/frozen CAC40 and market-universe datasets are survivorship-biased for
+historical evaluation. Their CLIs and manifests display this limitation.
 
 ## Adding another model
 
-Implement `fit(...)` and `predict_proba(...)` from `ProbabilisticClassifier`, or wrap a scikit-learn-style estimator with `SklearnClassifierAdapter`. Pass model into `run_experiment`; feature preparation, thresholds, metrics, and backtest stay unchanged.
+Register a factory returning `ProbabilisticSequenceClassifier`. It receives a
+`ModelBuildContext`, consumes `(samples, context, features)` arrays, and returns
+probabilities in `[Sell, Hold, Buy]` order. No runner branch is needed; feature
+preparation, train-only scaling, thresholds, metrics, and backtest stay shared.
+
+PyTorch architectures are optional:
+
+```bash
+python -m pip install -e ".[neural]"
+python scripts/run_walkforward.py --model gru --device cpu \
+  --model-config '{"hidden_size":64,"epochs":100}'
+```
+
+Fair multi-model, multi-seed comparison (five seeds by default):
+
+```bash
+python scripts/run_model_comparison.py \
+  --data data/processed/cac40_daily.parquet \
+  --models manual_ann,rnn,lstm,gru,transformer \
+  --device cpu
+```
 
 See [restructuring plan](docs/restructuring-plan.md) for ownership rules and migration record.
 
