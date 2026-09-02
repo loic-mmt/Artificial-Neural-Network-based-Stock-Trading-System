@@ -35,6 +35,10 @@ def gridsearch_dir() -> Path:
     return artifacts_root() / "gridsearch"
 
 
+def comparisons_dir() -> Path:
+    return artifacts_root() / "comparisons"
+
+
 def default_market_dataset_path(filename: str = "cac40_daily.parquet") -> Path:
     return processed_data_dir() / filename
 

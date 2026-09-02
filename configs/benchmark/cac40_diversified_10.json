@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "name": "cac40_diversified_10",
+  "dataset": {
+    "path": "data/processed/cac40_daily.parquet",
+    "sha256": "65e46f7dcb4d527e506e9505ab43540af32ed9455d0845fd00762c0582070acd",
+    "date_start": "2000-01-03",
+    "date_end": "2026-04-28",
+    "available_tickers": 40
+  },
+  "selection": {
+    "selected_on": "2026-09-02",
+    "uses_performance_metrics": false,
+    "rules": [
+      "Use one ticker per eligible sector bucket.",
+      "Require complete OHLCV and fundamental coverage.",
+      "Prefer the longest common history, from 2000-01-03 through 2026-04-28.",
+      "Among equally complete candidates, prefer the highest median historical traded value."
+    ],
+    "excluded_sector_buckets": {
+      "financial_services": "No candidate covers the full common history.",
+      "real_estate": "The sole candidate contains only 775 observations.",
+      "unknown": "Sector classification is not reliable enough for stratification."
+    }
+  },
+  "tickers": [
+    {
+      "ticker": "BNP.PA",
+      "sector": "banks",
+      "observations": 6762,
+      "median_traded_value": 111351780
+    },
+    {
+      "ticker": "MC.PA",
+      "sector": "consumer_cyclical",
+      "observations": 6762,
+      "median_traded_value": 90680528
+    },
+    {
+      "ticker": "OR.PA",
+      "sector": "consumer_defensive",
+      "observations": 6762,
+      "median_traded_value": 75523857
+    },
+    {
+      "ticker": "TTE.PA",
+      "sector": "energy",
+      "observations": 6762,
+      "median_traded_value": 140466340
+    },
+    {
+      "ticker": "SAN.PA",
+      "sector": "healthcare",
+      "observations": 6762,
+      "median_traded_value": 114094933
+    },
+    {
+      "ticker": "SU.PA",
+      "sector": "industrials",
+      "observations": 6762,
+      "median_traded_value": 67418927
+    },
+    {
+      "ticker": "CS.PA",
+      "sector": "insurance",
+      "observations": 6762,
+      "median_traded_value": 73491690
+    },
+    {
+      "ticker": "AI.PA",
+      "sector": "materials",
+      "observations": 6762,
+      "median_traded_value": 60178606
+    },
+    {
+      "ticker": "CAP.PA",
+      "sector": "technology",
+      "observations": 6762,
+      "median_traded_value": 38660557
+    },
+    {
+      "ticker": "ORA.PA",
+      "sector": "telecom",
+      "observations": 6762,
+      "median_traded_value": 51744495
+    }
+  ]
+}
