@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import fields
 from typing import Any
 
 from trading_system.models.specs import ModelBuildContext
@@ -15,34 +16,65 @@ def build_gru_module(
     torch_module: Any,
     nn_module: Any,
 ) -> Any:
-    # TODO(gru-module-1): Build `nn.GRU(batch_first=True)` and a linear class head
-    # using the configured hidden size, layers, dropout and directions.
-    #
-    # TODO(gru-module-2): In `forward`, select the final layer's hidden state,
-    # concatenate directions only when enabled, and return unnormalized logits.
-    raise NotImplementedError
+    class GRUModule(nn_module.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.directions = 2 if config.bidirectional else 1
+            self.recurrent = nn_module.GRU(
+                context.input_size,
+                config.hidden_size,
+                num_layers=config.num_layers,
+                batch_first=True,
+                dropout=config.dropout,
+                bidirectional=config.bidirectional,
+            )
+            self.head = nn_module.Linear(
+                config.hidden_size * self.directions, context.num_classes
+            )
+
+        def forward(self, sequences: Any) -> Any:
+            _, hidden = self.recurrent(sequences)
+            hidden = hidden.reshape(
+                config.num_layers,
+                self.directions,
+                len(sequences),
+                config.hidden_size,
+            )[-1]
+            features = hidden.transpose(0, 1).reshape(len(sequences), -1)
+            return self.head(features)
+
+    return GRUModule()
 
 
 class GRUClassifier(TorchSequenceClassifier):
     model_name = "gru"
 
     def __init__(self, context: ModelBuildContext, config: GRUConfig):
-        # TODO(gru-classifier-init): Store typed config and delegate all common
-        # setup/training behavior to `TorchSequenceClassifier`.
-        raise NotImplementedError
+        if not isinstance(config, GRUConfig):
+            raise TypeError("config must be GRUConfig.")
+        self.gru_config = config
+        super().__init__(context, config)
 
     def _build_module(self, torch_module: Any, nn_module: Any) -> Any:
-        # TODO(gru-classifier-build): Delegate to `build_gru_module` only.
-        raise NotImplementedError
+        return build_gru_module(
+            self.context, self.gru_config, torch_module, nn_module
+        )
 
 
 def create_gru_classifier(
     context: ModelBuildContext,
     parameters: Mapping[str, Any],
 ) -> GRUClassifier:
-    # TODO(gru-factory): Validate parameter keys, build `GRUConfig`, reconcile
-    # seed/device with context, and return the classifier.
-    raise NotImplementedError
+    allowed = {item.name for item in fields(GRUConfig)}
+    unknown = sorted(set(parameters) - allowed)
+    if unknown:
+        raise ValueError(f"Unknown gru parameters: {unknown}")
+    values = dict(parameters)
+    for name, required in (("seed", context.seed), ("device", context.device)):
+        if name in values and values[name] != required:
+            raise ValueError(f"{name} is controlled by ModelBuildContext.")
+        values[name] = required
+    return GRUClassifier(context, GRUConfig(**values))
 
 
 __all__ = ["GRUClassifier", "build_gru_module", "create_gru_classifier"]

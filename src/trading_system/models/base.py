@@ -17,6 +17,10 @@ class FitResult:
     best_epoch: int
     stop_reason: str
     history: TrainingHistory
+    training_duration_seconds: float | None = field(default=None, compare=False)
+    parameter_count: int | None = field(default=None, compare=False)
+    seed: int | None = field(default=None, compare=False)
+    device: str | None = field(default=None, compare=False)
 
 
 @runtime_checkable
@@ -50,19 +54,19 @@ class ProbabilisticSequenceClassifier(Protocol):
         X_val: np.ndarray | None = None,
         y_val: np.ndarray | None = None,
     ) -> FitResult:
-        # TODO(sequence-contract-fit): Implementations must validate
+        # Implementations validate
         # `(N, T, F)` inputs, preserve the fixed Sell/Hold/Buy schema, train only
         # from train/validation, and return the framework-neutral `FitResult`.
         ...
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        # TODO(sequence-contract-predict): Implementations must accept 3D input
+        # Implementations accept 3D input
         # and return finite normalized probabilities shaped `(N, 3)` in fixed
         # class order. Inference must not update weights or preprocessing state.
         ...
 
     def state_dict(self) -> dict[str, object]:
-        # TODO(sequence-contract-state): Return framework-independent metadata
+        # Implementations return framework-independent metadata
         # plus copy-safe model state suitable for the artifact serializer.
         ...
 

@@ -11,15 +11,18 @@ import pandas as pd
 
 from trading_system.data.io import read_parquet_dataset
 from trading_system.experiments.search import (
+    make_model_walkforward_trial_grid,
     make_walkforward_trial_grid,
     pick_trials,
     run_walkforward_grid_search,
 )
+from trading_system.models.factory import create_default_model_registry
 from trading_system.features.market import (
     MARKET_FEATURE_COLUMNS,
     compute_market_features,
 )
 from trading_system.paths import default_market_dataset_path, gridsearch_dir
+from trading_system.reporting.warnings import current_universe_warning
 
 
 def parse_int_list(raw: str) -> list[int]:
@@ -35,9 +38,6 @@ def parse_str_list(raw: str) -> list[str]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    # TODO(sequence-grid-cli-1): Add model list/config-space inputs and obtain
-    # model names from the registry. Remove ANN-specific hidden/alpha flags after
-    # the compatibility period.
     parser = argparse.ArgumentParser(
         description="Grid search over expanding-window experiments."
     )
@@ -75,6 +75,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs-grid", default="300")
     parser.add_argument("--alphas", default="0.001")
     parser.add_argument("--batch-sizes", default="64")
+    parser.add_argument(
+        "--models",
+        default="manual_ann",
+        help="Comma-separated registry model names.",
+    )
+    parser.add_argument(
+        "--model-parameter-spaces",
+        help=(
+            "JSON mapping model names to equally sized lists of parameter objects."
+        ),
+    )
     parser.add_argument("--decision-modes", default="argmax")
     parser.add_argument("--min-action-rates", default="0.02")
     parser.add_argument("--max-trials", type=int, default=40)
@@ -87,9 +98,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    # TODO(sequence-grid-cli-2): Build equal per-model trial matrices and write
-    # raw runs/failures/summary through artifact helpers.
     args = build_parser().parse_args()
+    warning = current_universe_warning(args.data_dir)
+    if warning:
+        print(warning)
     frame = read_parquet_dataset(args.data_dir)
     frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
     frame = frame.dropna(subset=["date"]).copy()
@@ -100,20 +112,75 @@ def main() -> None:
     if frame.empty:
         raise ValueError("No rows remain after ticker filtering.")
     featured = compute_market_features(frame.sort_values("date").reset_index(drop=True))
-    trials = make_walkforward_trial_grid(
-        forward_horizons=parse_int_list(args.forward_horizons),
-        forward_buy_thresholds=parse_float_list(args.forward_buy_thresholds),
-        forward_sell_thresholds=parse_float_list(args.forward_sell_thresholds),
-        context_lengths=parse_int_list(args.context_lengths),
-        walkforward_steps=parse_int_list(args.walkforward_steps),
-        hidden_sizes=parse_int_list(args.hiddens),
-        epochs=parse_int_list(args.epochs_grid),
-        learning_rates=parse_float_list(args.alphas),
-        batch_sizes=parse_int_list(args.batch_sizes),
-        decision_modes=parse_str_list(args.decision_modes),
-        min_action_rates=parse_float_list(args.min_action_rates),
-    )
-    selected = pick_trials(trials, args.max_trials, args.seed)
+    model_names = parse_str_list(args.models)
+    available = set(create_default_model_registry().names())
+    unknown = sorted(set(model_names) - available)
+    if not model_names or unknown:
+        raise ValueError(f"Invalid model list; unknown={unknown}, available={sorted(available)}")
+    neutral = args.model_parameter_spaces is not None or model_names != ["manual_ann"]
+    if neutral:
+        if args.model_parameter_spaces:
+            try:
+                spaces = json.loads(args.model_parameter_spaces)
+            except json.JSONDecodeError as error:
+                raise ValueError("--model-parameter-spaces must be valid JSON.") from error
+            if not isinstance(spaces, dict):
+                raise ValueError("--model-parameter-spaces must encode an object.")
+        else:
+            spaces = {name: [{}] for name in model_names}
+        if set(spaces) != set(model_names):
+            raise ValueError("Model parameter spaces must exactly match --models.")
+        trials = make_model_walkforward_trial_grid(
+            model_parameter_spaces=spaces,
+            forward_horizons=parse_int_list(args.forward_horizons),
+            forward_buy_thresholds=parse_float_list(args.forward_buy_thresholds),
+            forward_sell_thresholds=parse_float_list(args.forward_sell_thresholds),
+            context_lengths=parse_int_list(args.context_lengths),
+            walkforward_steps=parse_int_list(args.walkforward_steps),
+            decision_modes=parse_str_list(args.decision_modes),
+            min_action_rates=parse_float_list(args.min_action_rates),
+        )
+        selected = list(trials)
+        if args.max_trials is not None and args.max_trials < len(trials):
+            if args.max_trials % len(model_names):
+                raise ValueError("--max-trials must be divisible by model count.")
+            per_model = args.max_trials // len(model_names)
+            selected = []
+            for name in sorted(model_names):
+                model_trials = [trial for trial in trials if trial.model.name == name]
+                selected.extend(pick_trials(model_trials, per_model, args.seed))
+    else:
+        trials = make_walkforward_trial_grid(
+            forward_horizons=parse_int_list(args.forward_horizons),
+            forward_buy_thresholds=parse_float_list(args.forward_buy_thresholds),
+            forward_sell_thresholds=parse_float_list(args.forward_sell_thresholds),
+            context_lengths=parse_int_list(args.context_lengths),
+            walkforward_steps=parse_int_list(args.walkforward_steps),
+            hidden_sizes=parse_int_list(args.hiddens),
+            epochs=parse_int_list(args.epochs_grid),
+            learning_rates=parse_float_list(args.alphas),
+            batch_sizes=parse_int_list(args.batch_sizes),
+            decision_modes=parse_str_list(args.decision_modes),
+            min_action_rates=parse_float_list(args.min_action_rates),
+        )
+        selected = pick_trials(trials, args.max_trials, args.seed)
+    common_parameters = {
+        "price_col": args.price_col,
+        "train_ratio": args.train_ratio,
+        "val_ratio": args.val_ratio,
+        "oracle_fee_per_trade": args.oracle_fee_per_trade,
+        "label_mode": args.label_mode,
+        "position_mode": args.position_mode,
+        "strategy_fee_per_trade": args.strategy_fee_per_trade,
+        "initial_capital": args.capital,
+    }
+    if not neutral:
+        common_parameters.update(
+            do_dropout=args.do_dropout,
+            dropout_percent=args.dropout_percent,
+            early_stopping_patience=args.early_stopping_patience,
+            early_stopping_min_delta=args.early_stopping_min_delta,
+        )
     results = run_walkforward_grid_search(
         featured,
         MARKET_FEATURE_COLUMNS,
@@ -121,20 +188,7 @@ def main() -> None:
         objective=args.objective,
         seed=args.seed,
         suppress_inner_logs=not args.show_inner_logs,
-        common_parameters={
-            "price_col": args.price_col,
-            "train_ratio": args.train_ratio,
-            "val_ratio": args.val_ratio,
-            "oracle_fee_per_trade": args.oracle_fee_per_trade,
-            "label_mode": args.label_mode,
-            "position_mode": args.position_mode,
-            "strategy_fee_per_trade": args.strategy_fee_per_trade,
-            "initial_capital": args.capital,
-            "do_dropout": args.do_dropout,
-            "dropout_percent": args.dropout_percent,
-            "early_stopping_patience": args.early_stopping_patience,
-            "early_stopping_min_delta": args.early_stopping_min_delta,
-        },
+        common_parameters=common_parameters,
     )
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_csv = (
@@ -156,7 +210,11 @@ def main() -> None:
                 "selection_split": "validation",
                 "trials": len(results),
                 "valid_trials": len(results[results["status"] == "ok"]),
+                "models": model_names,
                 "top": valid.to_dict(orient="records"),
+                "failures": results[results["status"] == "error"].to_dict(
+                    orient="records"
+                ),
                 "best_parameters": results.attrs.get("best_parameters"),
                 "validation_retrain_logs": results.attrs["validation_retrain_logs"],
                 "final_test": results.attrs.get("final_test"),

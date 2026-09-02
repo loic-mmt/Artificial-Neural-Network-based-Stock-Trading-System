@@ -9,8 +9,11 @@ from trading_system.data.io import read_parquet_dataset
 from trading_system.experiments.config import ExperimentConfig
 from trading_system.experiments.runner import ExperimentResult, run_experiment
 from trading_system.models.base import ProbabilisticClassifier
+from trading_system.models.manual_ann.manual_nn import ManualANNConfig
+from trading_system.models.specs import ModelSelection
 from trading_system.paths import default_market_dataset_path
 from trading_system.reporting.plots import format_experiment_summary
+from trading_system.reporting.warnings import current_universe_warning
 
 
 def train_model(
@@ -32,11 +35,9 @@ def train_model(
 ) -> ExperimentResult:
     """Compatibility adapter from old pipeline kwargs to shared experiment config."""
 
-    # TODO(sequence-static-compatibility): Keep this ANN-specific adapter only for
-    # old callers. New neural CLIs must use `ModelSelection` and the shared registry
-    # instead of adding RNN/LSTM/GRU/Transformer kwargs to this signature.
-
-    ann = config.manual_ann
+    if config.model.name != "manual_ann":
+        raise ValueError("Legacy ANN keyword adapter requires model='manual_ann'.")
+    ann = ManualANNConfig(**{**config.model.parameters, "seed": config.seed})
     if do_dropout is None:
         dropout_probability = ann.dropout_probability
     elif do_dropout:
@@ -63,7 +64,18 @@ def train_model(
     )
     configured = replace(
         config,
-        manual_ann=ann,
+        model=ModelSelection(
+            "manual_ann",
+            {
+                "hidden_size": ann.hidden_size,
+                "learning_rate": ann.learning_rate,
+                "epochs": ann.epochs,
+                "batch_size": ann.batch_size,
+                "dropout_probability": ann.dropout_probability,
+                "early_stopping_patience": ann.early_stopping_patience,
+                "early_stopping_min_delta": ann.early_stopping_min_delta,
+            },
+        ),
         train_ratio=train_ratio if train_ratio is not None else config.train_ratio,
         val_ratio=val_ratio if val_ratio is not None else config.val_ratio,
         context_len=context_len if context_len is not None else config.context_len,
@@ -74,12 +86,24 @@ def train_model(
 def run_configured_pipeline(
     config: ExperimentConfig,
     data_path: str | Path | None = None,
+    *,
+    artifact_path: str | Path | None = None,
 ) -> ExperimentResult:
-    # TODO(sequence-static-cli): Accept model selection/config and pass it to the
-    # sequence-aware runner once migration is complete. Preserve this function as
-    # a thin I/O/reporting wrapper.
-    frame = read_parquet_dataset(data_path or default_market_dataset_path())
+    resolved_path = data_path or default_market_dataset_path()
+    warning = current_universe_warning(resolved_path)
+    if warning:
+        print(warning)
+    frame = read_parquet_dataset(resolved_path)
     result = run_experiment(frame, config)
+    if artifact_path is not None:
+        from trading_system.artifacts.experiment import save_experiment_artifact
+
+        save_experiment_artifact(
+            artifact_path,
+            frame,
+            result,
+            dataset_path=resolved_path,
+        )
     print(f"labels={result.label_stats} split={result.split_sizes}")
     print(format_experiment_summary(result.test_metrics, result.backtest))
     return result

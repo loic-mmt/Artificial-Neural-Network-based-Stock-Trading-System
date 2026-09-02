@@ -1,4 +1,6 @@
-# V3 notebook library extracted and consolidated from research/backtests.ipynb\n\nfrom __future__ import annotations
+# V3 notebook library extracted and consolidated from research/backtests.ipynb
+
+from __future__ import annotations
 import hashlib
 import importlib.metadata
 import itertools
@@ -13,7 +15,16 @@ from statistics import NormalDist
 from typing import Any
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    from plotly.subplots import make_subplots
+except ImportError:
+    go = None
+    px = None
+
+    def make_subplots(*args, **kwargs):
+        raise ImportError("Plotly is required to build backtest visualizations.")
 from trading_system.paths import runs_dir
 try:
     import ccxt
@@ -505,7 +516,10 @@ def run_backtest_from_labels(train_df: pd.DataFrame, labels_df: pd.DataFrame, co
     - Fees and slippage are applied per transaction.
     """
     if config.allow_multiple_positions:
-        raise NotImplementedError('V1 supports a single position only')
+        raise ValueError(
+            "allow_multiple_positions is incompatible with scalar target_position "
+            "labels; use the portfolio backtest for concurrent asset positions."
+        )
     required = {'open', 'high', 'low', 'close'}
     missing = required - set(train_df.columns)
     if missing:
@@ -1068,8 +1082,6 @@ def assert_acceptance_passed(report: pd.DataFrame) -> None:
         raise AssertionError(f'Acceptance checks failed:\n{failed}')
 from dataclasses import field
 import warnings
-import plotly.express as px
-from plotly.subplots import make_subplots
 try:
     from scipy.stats import mannwhitneyu, ks_2samp
 except Exception:

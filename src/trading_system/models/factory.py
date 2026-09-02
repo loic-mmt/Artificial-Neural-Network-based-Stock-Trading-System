@@ -4,7 +4,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from .base import ProbabilisticSequenceClassifier
-from .specs import ModelBuildContext
+from .specs import ModelBuildContext, normalize_model_name
 
 ModelFactory = Callable[
     [ModelBuildContext, Mapping[str, Any]], ProbabilisticSequenceClassifier
@@ -15,10 +15,7 @@ class ModelRegistry:
     """Registry that keeps architecture selection out of experiment runners."""
 
     def __init__(self) -> None:
-        # TODO(model-registry-init): Create a private mapping from normalized
-        # model names to factories. Do not register defaults implicitly here;
-        # tests need to construct an empty isolated registry.
-        raise NotImplementedError
+        self._factories: dict[str, ModelFactory] = {}
 
     def register(
         self,
@@ -27,13 +24,12 @@ class ModelRegistry:
         *,
         replace: bool = False,
     ) -> None:
-        # TODO(model-registry-register-1): Normalize and validate `name`, ensure
-        # `factory` is callable, and reject duplicate names unless `replace` is
-        # explicitly true.
-        #
-        # TODO(model-registry-register-2): Store only the factory. Do not create
-        # a model during registration because input dimensions are not known yet.
-        raise NotImplementedError
+        normalized = normalize_model_name(name)
+        if not callable(factory):
+            raise TypeError("factory must be callable.")
+        if normalized in self._factories and not replace:
+            raise ValueError(f"Model already registered: {normalized}")
+        self._factories[normalized] = factory
 
     def build(
         self,
@@ -41,29 +37,54 @@ class ModelRegistry:
         context: ModelBuildContext,
         parameters: Mapping[str, Any] | None = None,
     ) -> ProbabilisticSequenceClassifier:
-        # TODO(model-registry-build-1): Resolve a registered factory and report
-        # an unknown name together with the sorted available names.
-        #
-        # TODO(model-registry-build-2): Pass a defensive parameter dictionary and
-        # the complete build context to the factory. Validate the returned object
-        # against `ProbabilisticSequenceClassifier` before returning it.
-        raise NotImplementedError
+        normalized = normalize_model_name(name)
+        if not isinstance(context, ModelBuildContext):
+            raise TypeError("context must be a ModelBuildContext.")
+        if normalized not in self._factories:
+            available = ", ".join(self.names()) or "<none>"
+            raise KeyError(f"Unknown model {normalized!r}; available: {available}")
+        copied = dict(parameters or {})
+        model = self._factories[normalized](context, copied)
+        if not isinstance(model, ProbabilisticSequenceClassifier):
+            raise TypeError(
+                f"Factory {normalized!r} did not return a sequence classifier."
+            )
+        return model
 
     def names(self) -> tuple[str, ...]:
-        # TODO(model-registry-names): Return registered names in deterministic
-        # sorted order so CLI choices and artifacts remain stable.
-        raise NotImplementedError
+        return tuple(sorted(self._factories))
+
+
+def _lazy_factory(module_name: str, factory_name: str) -> ModelFactory:
+    def build(
+        context: ModelBuildContext, parameters: Mapping[str, Any]
+    ) -> ProbabilisticSequenceClassifier:
+        from importlib import import_module
+
+        factory = getattr(import_module(module_name), factory_name)
+        return factory(context, dict(parameters))
+
+    return build
 
 
 def create_default_model_registry() -> ModelRegistry:
-    # TODO(default-registry-1): Create a fresh registry and register
-    # `manual_ann`, `rnn`, `lstm`, `gru`, and `transformer` with lazy imports.
-    # Lazy imports are required so importing the project does not require torch.
-    #
-    # TODO(default-registry-2): Each factory must parse only its typed config,
-    # reject unknown parameter keys, and receive dimensions from
-    # `ModelBuildContext` rather than inferring them from global state.
-    raise NotImplementedError
+    registry = ModelRegistry()
+    factories = {
+        "manual_ann": (
+            "trading_system.models.manual_ann.sequence_adapter",
+            "create_manual_ann_sequence_classifier",
+        ),
+        "rnn": ("trading_system.models.neural.rnn", "create_rnn_classifier"),
+        "lstm": ("trading_system.models.neural.lstm", "create_lstm_classifier"),
+        "gru": ("trading_system.models.neural.gru", "create_gru_classifier"),
+        "transformer": (
+            "trading_system.models.neural.transformer",
+            "create_transformer_classifier",
+        ),
+    }
+    for name, (module_name, factory_name) in factories.items():
+        registry.register(name, _lazy_factory(module_name, factory_name))
+    return registry
 
 
 __all__ = ["ModelFactory", "ModelRegistry", "create_default_model_registry"]

@@ -33,6 +33,8 @@ from trading_system.models.base import (
 )
 from trading_system.models.manual_ann.manual_nn import ManualANNClassifier
 from trading_system.models.manual_ann.sequence_adapter import ManualANNSequenceAdapter
+from trading_system.models.factory import ModelRegistry, create_default_model_registry
+from trading_system.models.specs import ModelBuildContext, ModelSelection
 
 from .config import ExperimentConfig
 
@@ -48,6 +50,7 @@ class TrainedModelBundle:
     decision_policy: DecisionPolicy
     feature_fill_values: pd.Series
     fit_result: FitResult
+    model_selection: ModelSelection
 
     def predict_proba(self, raw_windows: np.ndarray) -> np.ndarray:
         values = np.asarray(raw_windows, dtype=np.float32)
@@ -64,6 +67,15 @@ class TrainedModelBundle:
 
     def predict(self, raw_windows: np.ndarray) -> np.ndarray:
         return self.decision_policy.predict(self.predict_proba(raw_windows))
+
+    def parameter_count(self) -> int:
+        counter = getattr(self.estimator, "parameter_count", None)
+        if callable(counter):
+            return int(counter())
+        state = self.estimator.state_dict()
+        return int(
+            sum(value.size for value in state.values() if isinstance(value, np.ndarray))
+        )
 
 
 @dataclass
@@ -394,11 +406,29 @@ def _build_split_windows(
 def _resolve_sequence_estimator(
     model: ProbabilisticSequenceClassifier | ManualANNClassifier | None,
     config: ExperimentConfig,
-) -> ProbabilisticSequenceClassifier:
+    feature_count: int,
+    *,
+    model_selection: ModelSelection | None = None,
+    registry: ModelRegistry | None = None,
+) -> tuple[ProbabilisticSequenceClassifier, ModelSelection]:
     """Return a classifier accepting canonical ``(N, T, F)`` inputs."""
 
     if model is None:
-        return ManualANNSequenceAdapter(config.manual_ann)
+        selection = model_selection or config.model
+        context = ModelBuildContext(
+            input_size=feature_count,
+            context_len=config.context_len,
+            num_classes=3,
+            seed=config.seed,
+            device=config.device,
+        )
+        estimator = (registry or create_default_model_registry()).build(
+            selection.name, context, selection.parameters
+        )
+        return estimator, selection
+
+    if model_selection is not None or registry is not None:
+        raise ValueError("Explicit model cannot be combined with selection/registry.")
 
     # Preserve the old public injection point while keeping flattening inside the
     # one dedicated adapter. This branch can disappear with the legacy 2D API.
@@ -406,14 +436,14 @@ def _resolve_sequence_estimator(
         adapter = ManualANNSequenceAdapter(model.config)
         adapter.estimator = model
         adapter.classes_ = model.classes_.copy()
-        return adapter
+        return adapter, ModelSelection("manual_ann", {"legacy_injected": True})
 
     if not isinstance(model, ProbabilisticSequenceClassifier):
         raise TypeError(
             "model must implement ProbabilisticSequenceClassifier and accept "
             "3D arrays shaped (N, T, F)."
         )
-    return model
+    return model, ModelSelection(getattr(model, "model_name", type(model).__name__))
 
 
 def _select_label_rows(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -429,6 +459,9 @@ def run_validation_experiment(
     frame: pd.DataFrame,
     config: ExperimentConfig,
     model: ProbabilisticSequenceClassifier | ManualANNClassifier | None = None,
+    *,
+    model_selection: ModelSelection | None = None,
+    registry: ModelRegistry | None = None,
 ) -> ValidationResult:
     """Fit and calibrate using training/validation only, leaving test untouched."""
 
@@ -481,7 +514,13 @@ def run_validation_experiment(
     X_val = scaler.transform(X_val_raw)
     del X_val_raw
 
-    estimator = _resolve_sequence_estimator(model, config)
+    estimator, resolved_selection = _resolve_sequence_estimator(
+        model,
+        config,
+        len(feature_columns),
+        model_selection=model_selection,
+        registry=registry,
+    )
     fit_result = estimator.fit(
         X_train,
         y_train,
@@ -528,6 +567,7 @@ def run_validation_experiment(
         decision_policy=decision_policy,
         feature_fill_values=fill_values.copy(),
         fit_result=fit_result,
+        model_selection=resolved_selection,
     )
     return ValidationResult(
         bundle=bundle,
@@ -608,10 +648,19 @@ def run_experiment(
     frame: pd.DataFrame,
     config: ExperimentConfig,
     model: ProbabilisticSequenceClassifier | ManualANNClassifier | None = None,
+    *,
+    model_selection: ModelSelection | None = None,
+    registry: ModelRegistry | None = None,
 ) -> ExperimentResult:
     """Run one static experiment, freezing model/policy before final evaluation."""
 
-    validation = run_validation_experiment(frame, config, model)
+    validation = run_validation_experiment(
+        frame,
+        config,
+        model,
+        model_selection=model_selection,
+        registry=registry,
+    )
     return evaluate_experiment_test(frame, validation)
 
 

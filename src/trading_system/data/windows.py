@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from collections.abc import Sequence
 
 import numpy as np
@@ -376,7 +377,13 @@ def build_context_dataset(
     *,
     label_col: str = "Label_id",
 ):
-    """Flatten rolling feature windows and align each window with its target."""
+    """Flatten rolling windows; deprecated in favor of 3D sequence builders."""
+
+    warnings.warn(
+        "build_context_dataset is deprecated; use build_sequence_dataset.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
 
     context_len = _validate_context_len(context_len)
     columns = list(feature_columns)
@@ -412,7 +419,13 @@ def build_context_features(
     target_start: int = 0,
     return_indices: bool = False,
 ):
-    """Build inference windows without requiring a label column."""
+    """Build flat inference windows; use build_sequence_features for new code."""
+
+    warnings.warn(
+        "build_context_features is deprecated; use build_sequence_features.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
 
     context_len = _validate_context_len(context_len)
     columns = list(feature_columns)
@@ -446,7 +459,14 @@ def build_context_dataset_with_history(
     label_col: str = "Label_id",
     return_aligned_rows: bool = False,
 ):
-    """Build target windows using preceding split history without group leakage."""
+    """Build flat split-history windows; use the 3D sequence equivalent."""
+
+    warnings.warn(
+        "build_context_dataset_with_history is deprecated; "
+        "use build_sequence_dataset_with_history.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
 
     context_len = _validate_context_len(context_len)
     target = target_frame.copy()

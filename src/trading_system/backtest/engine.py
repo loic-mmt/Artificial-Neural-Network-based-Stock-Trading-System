@@ -38,12 +38,13 @@ def run_label_backtest(
     targets = labels_to_positions(labels, position_mode=position_mode)
     executed = apply_execution_delay(targets, execution_delay)
     turnover = position_turnover(executed)
+    fees_paid = float(fee_per_trade) * turnover
     strategy_returns = executed * returns
     model_curve = np.empty(len(values), dtype=np.float64)
     capital = float(initial_capital)
     for index, strategy_return in enumerate(strategy_returns):
         capital *= 1.0 + float(strategy_return)
-        capital -= float(fee_per_trade) * float(turnover[index])
+        capital -= float(fees_paid[index])
         capital = max(capital, 0.0)
         model_curve[index] = capital
     benchmark_curve = buy_and_hold_curve(values, initial_capital)
@@ -54,24 +55,60 @@ def run_label_backtest(
         "target_positions": targets,
         "executed_positions": executed,
         "turnover": turnover,
+        "fees_paid": fees_paid,
         "strategy_returns": strategy_returns,
     }
 
 
 def _summarize_backtest(
-    result: dict[str, object], initial_capital: float
+    result: dict[str, object],
+    initial_capital: float,
+    annualization_factor: int = 252,
 ) -> dict[str, float]:
     model_curve = np.asarray(result["model_curve"], dtype=np.float64)
     benchmark_curve = np.asarray(result["buy_hold_curve"], dtype=np.float64)
     model_final = float(model_curve[-1])
     benchmark_final = float(benchmark_curve[-1])
+    strategy_returns = np.asarray(result["strategy_returns"], dtype=np.float64)
+    turnover = np.asarray(result["turnover"], dtype=np.float64)
+    positions = np.asarray(result["executed_positions"], dtype=np.float64)
+    fees_paid = np.asarray(result["fees_paid"], dtype=np.float64)
+    return_std = float(strategy_returns.std(ddof=0))
+    sharpe = (
+        float(np.sqrt(annualization_factor) * strategy_returns.mean() / return_std)
+        if return_std > 0
+        else np.nan
+    )
+    downside = strategy_returns[strategy_returns < 0]
+    downside_std = float(downside.std(ddof=0)) if len(downside) else 0.0
+    sortino = (
+        float(np.sqrt(annualization_factor) * strategy_returns.mean() / downside_std)
+        if downside_std > 0
+        else np.nan
+    )
+    peaks = np.maximum.accumulate(model_curve)
+    drawdowns = np.divide(
+        model_curve,
+        peaks,
+        out=np.ones_like(model_curve),
+        where=peaks > 0,
+    ) - 1.0
     return {
         "initial_capital": float(initial_capital),
         "model_final_capital": model_final,
         "buy_hold_final_capital": benchmark_final,
         "model_pnl": model_final - float(initial_capital),
+        "model_return": model_final / float(initial_capital) - 1.0,
         "buy_hold_pnl": benchmark_final - float(initial_capital),
         "outperformance": model_final - benchmark_final,
+        "sharpe_ratio": sharpe,
+        "sortino_ratio": sortino,
+        "max_drawdown": float(drawdowns.min()),
+        "turnover": float(turnover.sum()),
+        "transaction_count": float(turnover.sum()),
+        "trade_count": float(np.count_nonzero(turnover)),
+        "total_fees": float(fees_paid.sum()),
+        "exposure": float(np.mean(np.abs(positions) > 0)),
     }
 
 
@@ -86,6 +123,7 @@ def evaluate_strategy_vs_buy_hold(
     *,
     group_col: str | None = None,
     date_col: str = "date",
+    annualization_factor: int = 252,
 ) -> dict[str, float]:
     """Evaluate one series or an equal-capital grouped portfolio."""
 
@@ -101,7 +139,7 @@ def evaluate_strategy_vs_buy_hold(
             position_mode=position_mode,
             execution_delay=execution_delay,
         )
-        return _summarize_backtest(result, initial_capital)
+        return _summarize_backtest(result, initial_capital, annualization_factor)
 
     work = test_frame.reset_index(drop=True).copy()
     work["_prediction_index"] = np.arange(len(work), dtype=np.int64)
@@ -115,6 +153,7 @@ def evaluate_strategy_vs_buy_hold(
     capital_per_group = float(initial_capital) / len(groups)
     model_total = 0.0
     benchmark_total = 0.0
+    group_summaries = []
     for group in groups:
         group = group.sort_values(date_col)
         group_labels = labels[group["_prediction_index"].to_numpy(dtype=np.int64)]
@@ -128,13 +167,42 @@ def evaluate_strategy_vs_buy_hold(
         )
         model_total += float(np.asarray(result["model_curve"])[-1])
         benchmark_total += float(np.asarray(result["buy_hold_curve"])[-1])
+        group_summaries.append(
+            _summarize_backtest(result, capital_per_group, annualization_factor)
+        )
+    group_sharpes = [
+        row["sharpe_ratio"]
+        for row in group_summaries
+        if np.isfinite(row["sharpe_ratio"])
+    ]
+    group_sortinos = [
+        row["sortino_ratio"]
+        for row in group_summaries
+        if np.isfinite(row["sortino_ratio"])
+    ]
     return {
         "initial_capital": float(initial_capital),
         "model_final_capital": model_total,
         "buy_hold_final_capital": benchmark_total,
         "model_pnl": model_total - float(initial_capital),
+        "model_return": model_total / float(initial_capital) - 1.0,
         "buy_hold_pnl": benchmark_total - float(initial_capital),
         "outperformance": model_total - benchmark_total,
+        "sharpe_ratio": float(np.mean(group_sharpes)) if group_sharpes else np.nan,
+        "sortino_ratio": float(np.mean(group_sortinos)) if group_sortinos else np.nan,
+        "max_drawdown": float(min(row["max_drawdown"] for row in group_summaries)),
+        "turnover": float(sum(row["turnover"] for row in group_summaries)),
+        "transaction_count": float(
+            sum(row["transaction_count"] for row in group_summaries)
+        ),
+        "trade_count": float(sum(row["trade_count"] for row in group_summaries)),
+        "total_fees": float(sum(row["total_fees"] for row in group_summaries)),
+        "exposure": float(
+            np.average(
+                [row["exposure"] for row in group_summaries],
+                weights=[len(group) for group in groups],
+            )
+        ),
     }
 
 

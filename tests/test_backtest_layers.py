@@ -48,3 +48,47 @@ def test_grouped_backtest_allocates_total_capital_once():
         group_col="ticker",
     )
     assert result["initial_capital"] == 100.0
+
+
+def test_backtest_reports_risk_turnover_and_exposure():
+    frame = pd.DataFrame(
+        {"adj_close": [100.0, 105.0, 103.0, 110.0]},
+        index=pd.date_range("2024-01-01", periods=4),
+    )
+    result = evaluate_strategy_vs_buy_hold(
+        frame,
+        np.asarray([2, 1, 0, 1]),
+        initial_capital=100.0,
+        execution_delay=1,
+    )
+    assert set(result) >= {
+        "sharpe_ratio",
+        "sortino_ratio",
+        "max_drawdown",
+        "turnover",
+        "transaction_count",
+        "trade_count",
+        "model_return",
+        "total_fees",
+        "exposure",
+    }
+    assert result["turnover"] == 3.0
+    assert result["total_fees"] == 0.0
+    assert 0 <= result["exposure"] <= 1
+
+
+def test_scalar_label_backtest_rejects_ambiguous_multiple_positions():
+    from trading_system.backtest.lib import BacktestConfig, run_backtest_from_labels
+
+    index = pd.date_range("2024-01-01", periods=2, tz="UTC")
+    market = pd.DataFrame(
+        {"open": [100, 101], "high": [101, 102], "low": [99, 100], "close": [100, 101]},
+        index=index,
+    )
+    labels = pd.DataFrame(
+        {"target_position": [1, 1], "action": ["buy", "hold"]}, index=index
+    )
+    with np.testing.assert_raises_regex(ValueError, "scalar target_position"):
+        run_backtest_from_labels(
+            market, labels, BacktestConfig(allow_multiple_positions=True)
+        )

@@ -6,6 +6,7 @@ from dataclasses import asdict, fields
 import numpy as np
 
 from trading_system.models.base import FitResult
+from trading_system.models.specs import ModelBuildContext
 
 from .manual_nn import ManualANNClassifier, ManualANNConfig
 
@@ -158,6 +159,9 @@ class ManualANNSequenceAdapter:
             "weights": self.estimator.state_dict(),
         }
 
+    def parameter_count(self) -> int:
+        return int(sum(weight.size for weight in self.estimator._state()))
+
     def load_state_dict(self, state: Mapping[str, object]) -> None:
         if not isinstance(state, Mapping):
             raise TypeError("state must be a mapping.")
@@ -274,4 +278,25 @@ class ManualANNSequenceAdapter:
         self.fit_result_ = None
 
 
-__all__ = ["ManualANNSequenceAdapter"]
+def create_manual_ann_sequence_classifier(
+    context: ModelBuildContext,
+    parameters: Mapping[str, object],
+) -> ManualANNSequenceAdapter:
+    if not isinstance(context, ModelBuildContext):
+        raise TypeError("context must be a ModelBuildContext.")
+    allowed = {item.name for item in fields(ManualANNConfig)}
+    unknown = sorted(set(parameters) - allowed)
+    if unknown:
+        raise ValueError(f"Unknown manual_ann parameters: {unknown}")
+    values = dict(parameters)
+    for name, required in (("seed", context.seed), ("num_classes", context.num_classes)):
+        if name in values and values[name] != required:
+            raise ValueError(f"{name} is controlled by ModelBuildContext.")
+        values[name] = required
+    return ManualANNSequenceAdapter(ManualANNConfig(**values))
+
+
+__all__ = [
+    "ManualANNSequenceAdapter",
+    "create_manual_ann_sequence_classifier",
+]

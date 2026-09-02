@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Literal
 
 from trading_system.models.manual_ann.manual_nn import ManualANNConfig
+from trading_system.models.specs import ModelSelection
 
 UniverseMode = Literal["single", "multi"]
 FeatureSet = Literal["technical", "market"]
@@ -35,12 +36,32 @@ class ExperimentConfig:
     forward_buy_threshold: float = 0.002
     forward_sell_threshold: float = 0.002
     oracle_fee_per_trade: float = 0.0
-    # TODO(model-neutral-experiment-config): Move this ANN-specific field into a
-    # separate `ModelSelection`/model config after the 3D runner is ready. Keep it
-    # temporarily so current pipelines remain compatible during migration.
-    manual_ann: ManualANNConfig = field(default_factory=ManualANNConfig)
+    model: ModelSelection = field(
+        default_factory=lambda: ModelSelection("manual_ann")
+    )
+    seed: int = 1
+    device: Literal["auto", "cpu", "cuda", "mps"] = "auto"
+    # Input-only compatibility field. __post_init__ migrates it into `model`.
+    manual_ann: ManualANNConfig | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self.manual_ann is not None:
+            if not isinstance(self.manual_ann, ManualANNConfig):
+                raise TypeError("manual_ann must be ManualANNConfig or None.")
+            if self.model.name != "manual_ann":
+                raise ValueError("manual_ann compatibility config requires manual_ann model.")
+            parameters = asdict(self.manual_ann)
+            seed = int(parameters.pop("seed"))
+            parameters.pop("num_classes")
+            object.__setattr__(self, "model", ModelSelection("manual_ann", parameters))
+            object.__setattr__(self, "seed", seed)
+            object.__setattr__(self, "manual_ann", None)
+        if not isinstance(self.model, ModelSelection):
+            raise TypeError("model must be a ModelSelection.")
+        if isinstance(self.seed, bool) or not isinstance(self.seed, int) or self.seed < 0:
+            raise ValueError("seed must be a non-negative integer.")
+        if self.device not in ("auto", "cpu", "cuda", "mps"):
+            raise ValueError("device must be 'auto', 'cpu', 'cuda', or 'mps'.")
         if self.universe not in ("single", "multi"):
             raise ValueError(f"Unknown universe: {self.universe}")
         if self.feature_set not in ("technical", "market"):

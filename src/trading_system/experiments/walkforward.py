@@ -1,39 +1,41 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import replace
+from dataclasses import asdict
+from time import perf_counter
 from weakref import ref
 
 import numpy as np
 import pandas as pd
 
 from trading_system.backtest.engine import evaluate_strategy_vs_buy_hold
-from trading_system.data.scaling import Standardizer
+from trading_system.data.scaling import SequenceStandardizer
 from trading_system.data.splits import (
     chronological_train_val_split,
     chronological_train_val_test_split,
 )
 from trading_system.data.windows import (
-    build_context_dataset_with_history,
-    build_context_features,
+    build_sequence_dataset_with_history,
+    build_sequence_features,
 )
 from trading_system.evaluation.classification import evaluate_predictions
 from trading_system.evaluation.thresholds import DecisionPolicy
 from trading_system.labels.breakout import generate_breakout_labels
 from trading_system.labels.forward_return import build_forward_return_labels
 from trading_system.labels.oracle_dp import build_oracle_labels_train_only
-from trading_system.models.base import ProbabilisticClassifier
+from trading_system.models.base import ProbabilisticSequenceClassifier
+from trading_system.models.factory import ModelRegistry, create_default_model_registry
 from trading_system.models.manual_ann.manual_nn import (
     ManualANNClassifier,
     ManualANNConfig,
 )
+from trading_system.models.manual_ann.sequence_adapter import ManualANNSequenceAdapter
+from trading_system.models.specs import ModelBuildContext, ModelSelection
 
 from .runner import TrainedModelBundle, _select_label_rows, align_probability_columns
 
-# TODO(sequence-walkforward-factory): Replace this chunk-id-only callable with the
-# shared registry/factory receiving `ModelBuildContext`, typed parameters and a
-# seed derived from `(run_seed, chunk_id)`.
-ModelFactory = Callable[[int], ProbabilisticClassifier]
+# Compatibility hook. New code should pass ModelSelection plus ModelRegistry.
+ModelFactory = Callable[[int], ProbabilisticSequenceClassifier]
 
 
 def derive_chunk_seed(run_seed: int, chunk_id: int) -> int:
@@ -95,16 +97,11 @@ def fit_labeled_history(
     context_len: int,
     decision_mode: str,
     min_action_rate: float,
-    estimator: ProbabilisticClassifier,
+    estimator: ProbabilisticSequenceClassifier | ManualANNClassifier,
+    model_selection: ModelSelection | None = None,
     date_col: str = "date",
     forward_horizon: int = 0,
 ) -> tuple[TrainedModelBundle, pd.DataFrame, dict[str, float]]:
-    # TODO(sequence-walkforward-fit-1): Build 3D train/validation sequences and
-    # fit one `SequenceStandardizer` on train only.
-    #
-    # TODO(sequence-walkforward-fit-2): Train any registry-created sequence model,
-    # calibrate the policy on validation only, and persist the same bundle schema
-    # as the static runner.
     columns = tuple(feature_columns)
     work = labeled_history.sort_values(date_col).reset_index(drop=True).copy()
     work["Label_id"] = pd.to_numeric(work["Label_id"], errors="coerce")
@@ -125,7 +122,7 @@ def fit_labeled_history(
     fill_values = train[list(columns)].median(numeric_only=True).fillna(0.0)
     val.loc[:, columns] = val[list(columns)].fillna(fill_values).fillna(0.0)
     train.loc[:, columns] = train[list(columns)].fillna(fill_values).fillna(0.0)
-    X_train_raw, y_train, aligned_train = build_context_dataset_with_history(
+    X_train_raw, y_train, aligned_train = build_sequence_dataset_with_history(
         train,
         columns,
         context_len,
@@ -133,7 +130,7 @@ def fit_labeled_history(
         date_col=date_col,
         return_aligned_rows=True,
     )
-    X_val_raw, y_val, aligned_val = build_context_dataset_with_history(
+    X_val_raw, y_val, aligned_val = build_sequence_dataset_with_history(
         val,
         columns,
         context_len,
@@ -153,11 +150,18 @@ def fit_labeled_history(
         raise ValueError(
             "Walk-forward context windowing produced an empty train or validation set."
         )
-    scaler = Standardizer()
+    scaler = SequenceStandardizer()
     X_train = scaler.fit_transform(X_train_raw)
     del X_train_raw
     X_val = scaler.transform(X_val_raw)
     del X_val_raw
+    if isinstance(estimator, ManualANNClassifier):
+        adapter = ManualANNSequenceAdapter(estimator.config)
+        adapter.estimator = estimator
+        adapter.classes_ = estimator.classes_.copy()
+        estimator = adapter
+    if not isinstance(estimator, ProbabilisticSequenceClassifier):
+        raise TypeError("estimator must implement ProbabilisticSequenceClassifier.")
     fit_result = estimator.fit(X_train, y_train, X_val=X_val, y_val=y_val)
     del X_train
     val_probabilities = align_probability_columns(
@@ -185,6 +189,8 @@ def fit_labeled_history(
         decision_policy=policy,
         feature_fill_values=fill_values,
         fit_result=fit_result,
+        model_selection=model_selection
+        or ModelSelection(getattr(estimator, "model_name", type(estimator).__name__)),
     )
     return bundle, filled_history, metrics
 
@@ -194,11 +200,6 @@ def predict_chunk_with_model(
     history: pd.DataFrame,
     chunk: pd.DataFrame,
 ) -> tuple[np.ndarray, np.ndarray]:
-    # TODO(sequence-walkforward-predict-1): Replace flat inference windows with
-    # `build_sequence_features`, using at most `context_len - 1` earlier rows.
-    #
-    # TODO(sequence-walkforward-predict-2): Keep source/local index conversion and
-    # verify that every prediction maps to a row in the current chunk only.
     columns = list(bundle.feature_columns)
     work = chunk.copy().reset_index(drop=True)
     work["_chunk_local_index"] = np.arange(len(work), dtype=np.int64)
@@ -206,7 +207,7 @@ def predict_chunk_with_model(
     work.loc[:, columns] = work[columns].fillna(bundle.feature_fill_values).fillna(0.0)
     prefix = history.tail(bundle.context_len - 1)[columns].copy()
     source = pd.concat([prefix, work[columns]], ignore_index=True)
-    windows, source_indices = build_context_features(
+    windows, source_indices = build_sequence_features(
         source,
         columns,
         bundle.context_len,
@@ -243,16 +244,14 @@ def walk_forward_classifier(
     context_len: int = 20,
     model_factory: ModelFactory | None = None,
     manual_ann_config: ManualANNConfig | None = None,
+    model_selection: ModelSelection | None = None,
+    registry: ModelRegistry | None = None,
+    seed: int = 1,
+    device: str = "auto",
     evaluation_split: str = "test",
 ) -> dict[str, object]:
-    # TODO(sequence-walkforward-run-1): Accept model selection/registry instead of
-    # ANN-specific fallback config. Construct a fresh model and scaler per chunk.
-    #
-    # TODO(sequence-walkforward-run-2): Move custom factories to the registry so
-    # they also receive chunk seeds; record model parameters/duration per retrain.
-    #
-    # TODO(sequence-walkforward-run-3): Preserve the rule that history ends before
-    # each chunk and prediction at `t` executes at `t+1` in the common backtest.
+    if model_factory is not None and (model_selection is not None or registry is not None):
+        raise ValueError("Legacy model_factory cannot be combined with registry selection.")
     if walkforward_step <= 0:
         raise ValueError("walkforward_step must be positive.")
     if evaluation_split not in ("validation", "test"):
@@ -293,12 +292,23 @@ def walk_forward_classifier(
     y_true_global = evaluation_labels["Label_id"].to_numpy(dtype=np.int64)
     predictions = np.full(len(data), -1, dtype=np.int64)
     retrain_logs: list[dict[str, object]] = []
-    base_ann_config = manual_ann_config or ManualANNConfig(
-        hidden_size=64,
-        epochs=150,
-        batch_size=64,
-        early_stopping_patience=30,
+    if manual_ann_config is not None:
+        if model_selection is not None:
+            raise ValueError("manual_ann_config cannot be combined with model_selection.")
+        parameters = asdict(manual_ann_config)
+        seed = int(parameters.pop("seed"))
+        parameters.pop("num_classes")
+        model_selection = ModelSelection("manual_ann", parameters)
+    selection = model_selection or ModelSelection(
+        "manual_ann",
+        {
+            "hidden_size": 64,
+            "epochs": 150,
+            "batch_size": 64,
+            "early_stopping_patience": 30,
+        },
     )
+    model_registry = registry or create_default_model_registry()
     previous_estimators = []
 
     for chunk_id, start in enumerate(
@@ -317,11 +327,22 @@ def walk_forward_classifier(
             forward_sell_threshold=forward_sell_threshold,
             breakout_window=breakout_window,
         )
-        chunk_seed = derive_chunk_seed(base_ann_config.seed, chunk_id)
+        started = perf_counter()
+        chunk_seed = derive_chunk_seed(seed, chunk_id)
         estimator = (
             model_factory(chunk_id)
             if model_factory is not None
-            else ManualANNClassifier(replace(base_ann_config, seed=chunk_seed))
+            else model_registry.build(
+                selection.name,
+                ModelBuildContext(
+                    input_size=len(feature_columns),
+                    context_len=context_len,
+                    num_classes=3,
+                    seed=chunk_seed,
+                    device=device,
+                ),
+                selection.parameters,
+            )
         )
         if any(estimator is previous() for previous in previous_estimators):
             raise ValueError(
@@ -340,6 +361,7 @@ def walk_forward_classifier(
             decision_mode=decision_mode,
             min_action_rate=min_action_rate,
             estimator=estimator,
+            model_selection=selection,
             forward_horizon=forward_horizon if label_mode == "forward_return" else 0,
         )
         chunk = data.iloc[start:end].copy().reset_index(drop=True)
@@ -353,8 +375,13 @@ def walk_forward_classifier(
         retrain_logs.append(
             {
                 "chunk_id": chunk_id,
-                "run_seed": base_ann_config.seed if model_factory is None else None,
-                "seed": chunk_seed if model_factory is None else None,
+                "run_seed": seed,
+                "seed": chunk_seed,
+                "seed_applied_by_registry": model_factory is None,
+                "model_name": bundle.model_selection.name,
+                "model_parameters": dict(bundle.model_selection.parameters),
+                "parameter_count": bundle.parameter_count(),
+                "duration_seconds": perf_counter() - started,
                 "start_idx": start,
                 "end_idx": end,
                 "n_hist": len(history),

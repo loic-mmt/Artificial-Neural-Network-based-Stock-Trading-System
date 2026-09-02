@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import perf_counter
 
 import numpy as np
 
@@ -84,6 +85,8 @@ class ManualANNConfig:
             raise ValueError("Invalid early-stopping configuration.")
         if self.num_classes <= 1:
             raise ValueError("num_classes must exceed one.")
+        if self.seed < 0:
+            raise ValueError("seed must be non-negative.")
 
 
 class ManualANNClassifier:
@@ -145,6 +148,7 @@ class ManualANNClassifier:
         y_val: np.ndarray | None = None,
         class_weights: np.ndarray | None = None,
     ) -> FitResult:
+        started = perf_counter()
         X = self._validate_X(X_train)
         y = self._validate_y(y_train, len(X))
         if (X_val is None) != (y_val is None):
@@ -261,6 +265,10 @@ class ManualANNClassifier:
             best_epoch=best_epoch,
             stop_reason=stop_reason,
             history=history,
+            training_duration_seconds=perf_counter() - started,
+            parameter_count=int(sum(weight.size for weight in best_state)),
+            seed=self.config.seed,
+            device="cpu",
         )
         return self.fit_result_
 

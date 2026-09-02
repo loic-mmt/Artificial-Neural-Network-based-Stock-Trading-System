@@ -259,7 +259,13 @@ def test_walkforward_validation_is_isolated_and_seeds_reproduce():
         assert log["seed"] == walkforward.derive_chunk_seed(19, log["chunk_id"])
         seeds.append(log["seed"])
     assert len(set(seeds)) == 3
-    assert first["retrain_logs"] == second["retrain_logs"]
+    without_duration = lambda logs: [
+        {key: value for key, value in log.items() if key != "duration_seconds"}
+        for log in logs
+    ]
+    assert without_duration(first["retrain_logs"]) == without_duration(
+        second["retrain_logs"]
+    )
 
 
 def test_walkforward_forward_purge_retains_feature_context():
@@ -275,7 +281,9 @@ def test_walkforward_forward_purge_retains_feature_context():
     assert len(X_train) == 80 - 2 - 5
     assert len(X_val) == 20 - 5
     assert len(history) == 100
-    expected_first_val = bundle.scaler.transform(np.array([[78, 79, 80]], dtype=np.float32))
+    expected_first_val = bundle.scaler.transform(
+        np.array([[[78], [79], [80]]], dtype=np.float32)
+    )
     np.testing.assert_array_equal(X_val[:1], expected_first_val)
 
 

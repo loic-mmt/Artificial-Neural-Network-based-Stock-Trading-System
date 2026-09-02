@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -14,21 +15,23 @@ from trading_system.experiments.walkforward import (
     walk_forward_classifier,
     walk_forward_oracle_ann,
 )
+from trading_system.artifacts.serialization import stable_config_hash
 from trading_system.features.market import (
     MARKET_FEATURE_COLUMNS,
     compute_market_features,
 )
 from trading_system.paths import default_market_dataset_path
+from trading_system.models.factory import create_default_model_registry
+from trading_system.models.specs import ModelSelection
 from trading_system.reporting.plots import format_experiment_summary
+from trading_system.reporting.warnings import current_universe_warning
 
 # Compatibility alias used by old grid-search code.
 features = MARKET_FEATURE_COLUMNS
 
 
 def build_parser() -> argparse.ArgumentParser:
-    # TODO(sequence-walkforward-cli-1): Add `--model` choices from the default
-    # registry and a model-config input. Stop exposing ANN-only flags globally;
-    # validate parameters against the selected typed model config.
+    model_names = create_default_model_registry().names()
     parser = argparse.ArgumentParser(
         description="Expanding-window probabilistic classifier evaluation."
     )
@@ -67,13 +70,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--early-stopping-patience", type=int, default=30)
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--model", choices=model_names, default="manual_ann")
+    parser.add_argument(
+        "--model-config",
+        help="JSON object containing parameters for the selected model.",
+    )
+    parser.add_argument(
+        "--device", choices=("auto", "cpu", "cuda", "mps"), default="auto"
+    )
     return parser
 
 
 def main() -> None:
-    # TODO(sequence-walkforward-cli-2): Build `ModelSelection`, call the neutral
-    # walk-forward runner, and include model/config hash in console output.
     args = build_parser().parse_args()
+    warning = current_universe_warning(args.data_dir)
+    if warning:
+        print(warning)
     frame = read_parquet_dataset(args.data_dir)
     if "date" not in frame.columns:
         raise ValueError("Dataset requires date column.")
@@ -86,9 +98,29 @@ def main() -> None:
     if frame.empty:
         raise ValueError("No rows remain after ticker filtering.")
     featured = compute_market_features(frame.sort_values("date").reset_index(drop=True))
-    result = walk_forward_oracle_ann(
+    if args.model_config:
+        try:
+            model_parameters = json.loads(args.model_config)
+        except json.JSONDecodeError as error:
+            raise ValueError("--model-config must be valid JSON.") from error
+        if not isinstance(model_parameters, dict):
+            raise ValueError("--model-config must encode a JSON object.")
+    elif args.model == "manual_ann":
+        model_parameters = {
+            "hidden_size": args.hidden,
+            "learning_rate": args.alpha,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "dropout_probability": args.dropout_percent if args.do_dropout else 0.0,
+            "early_stopping_patience": args.early_stopping_patience,
+            "early_stopping_min_delta": args.early_stopping_min_delta,
+        }
+    else:
+        model_parameters = {}
+    selection = ModelSelection(args.model, model_parameters)
+    result = walk_forward_classifier(
         full_df=featured,
-        feature_cols=MARKET_FEATURE_COLUMNS,
+        feature_columns=MARKET_FEATURE_COLUMNS,
         price_col=args.price_col,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
@@ -105,17 +137,15 @@ def main() -> None:
         strategy_fee_per_trade=args.strategy_fee_per_trade,
         initial_capital=args.capital,
         context_len=args.context_len,
-        epochs=args.epochs,
-        alpha=args.alpha,
-        hidden=args.hidden,
-        batch_size=args.batch_size,
-        do_dropout=args.do_dropout,
-        dropout_percent=args.dropout_percent,
-        early_stopping_patience=args.early_stopping_patience,
-        early_stopping_min_delta=args.early_stopping_min_delta,
+        model_selection=selection,
         seed=args.seed,
+        device=args.device,
+    )
+    config_hash = stable_config_hash(
+        {"model": selection, "seed": args.seed, "context_len": args.context_len}
     )
     print(
+        f"model={selection.name} config_hash={config_hash} "
         f"coverage={result['n_eval_rows']}/{result['n_test_rows']} "
         f"retrains={len(result['retrain_logs'])}"
     )
