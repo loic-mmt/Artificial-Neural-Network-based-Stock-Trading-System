@@ -7,13 +7,15 @@ ANN/__pycache__/
 ANN/datasets/
 data/processed/
 data/derived/
-artifacts/
+/artifacts/
 notebooks/.ipynb_checkpoints/
 archive/
 tmp/
 .agents/
 .agents/
-artifacts/
+/artifacts/
 MT5/
 .gitkeep
 .aider*
+
+src/*.egg-info/
