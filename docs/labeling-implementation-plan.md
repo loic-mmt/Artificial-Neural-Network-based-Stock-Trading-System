@@ -153,6 +153,10 @@ rester dans `experiments/runner.py` ou `experiments/walkforward.py`.
 
 ### M0 — `breakout`
 
+Statut : **implémenté**. La configuration standardisée, le registry, les paramètres
+CLI, le support statique/walk-forward et le grid search utilisant le backtest
+canonique sont couverts par des tests de non-régression.
+
 Conserver la méthode actuelle comme baseline contrôlée.
 
 - sémantique : `action` ;
@@ -161,7 +165,24 @@ Conserver la méthode actuelle comme baseline contrôlée.
 - migration : supprimer les backtests dupliqués de `breakout_gridsearch.py` et
   utiliser le moteur canonique.
 
+Exemple M0 :
+
+```bash
+python3 scripts/run_model_comparison.py \
+  --data data/processed/cac40_daily.parquet \
+  --preset multi_ticker_long_short \
+  --label-method breakout \
+  --label-window 20 \
+  --label-buy-buffer 0.001 \
+  --label-sell-buffer 0.001 \
+  --label-alternating
+```
+
 ### M1 — `forward_return`
+
+Statut : **implémenté**. M1 utilise le registry commun, expose les seuils
+asymétriques et l'horizon dans la CLI, produit `label_score`, et marque inconnue
+la fin de chaque ticker et de chaque split afin d'interdire toute fuite future.
 
 Conserver le rendement futur à horizon fixe comme baseline simple.
 
@@ -175,7 +196,26 @@ r(t,h) = P(t+h) / P(t) - 1
 - targets qui franchissent une frontière de split : inconnues et exclues du fit ;
 - sémantique actuelle : `action` pour compatibilité.
 
+Exemple M1 :
+
+```bash
+python3 scripts/run_model_comparison.py \
+  --data data/processed/cac40_daily.parquet \
+  --preset multi_ticker_long_short \
+  --label-method forward-return \
+  --label-horizon 5 \
+  --label-buy-threshold 0.005 \
+  --label-sell-threshold 0.0075
+```
+
 ### M2 — `volatility_position` — candidat principal
+
+Statut : **implémenté**. M2 produit des états persistants `Short`/`Flat`/`Long`,
+avec hystérésis, durée minimale, cooldown, coûts et volatilité historique. Les
+états sont réinitialisés à chaque ticker et frontière temporelle ; les warm-ups
+et horizons non observables sont exclus du fit et des métriques. Le backtest
+interprète explicitement `Flat` comme une fermeture, et non comme l'action
+`Hold`.
 
 Construire des états persistants Short/Flat/Long :
 
@@ -210,6 +250,12 @@ est stable, car `long_flat` correspond mieux à l'objectif `excess_buy_hold`.
 
 ### M3 — `triple_barrier`
 
+Statut : **implémenté**. Les barrières horizontales sont ajustées à la volatilité
+historique et aux coûts ; la première barrière touchée prévaut, sinon la barrière
+verticale produit la classe centrale. Les événements peuvent couvrir toutes les
+lignes éligibles ou provenir d'un CUSUM symétrique causal. La politique entre
+événements est obligatoire et explicite : `hold`, `flat` ou `carry`.
+
 Pour chaque événement :
 
 - barrière de profit ajustée à la volatilité ;
@@ -220,6 +266,18 @@ Pour chaque événement :
 
 Paramètres pilotes : horizon maximal `5/10/20`, profit `1.0/1.5 vol`, stop
 `0.75/1.0 vol`, seuil CUSUM `0.5/1.0 vol`.
+
+Extension implémentée : `--label-volatility-estimator rolling_std|atr|bollinger`
+(comparaison, walk-forward, grid search). Défaut `rolling_std` inchangé ; ATR =
+moyenne mobile simple du true range ajusté / prix courant ; Bollinger =
+`2 * std(prix, ddof=0) / moyenne(prix)` sur `--label-vol-window`.
+ATR exige `high`, `low`, `close`, ajustés au prix de labélisation via `prix / close`.
+Les trois échelles sont causales, figées au début de chaque événement et partagent
+le même warmup. CUSUM garde sa volatilité de rendements : changer l'échelle des
+barrières ne change pas l'échantillonnage événementiel. Détection des touches
+sur clôtures uniquement, pas sur extrêmes intraday ni bandes mobiles.
+Estimateur persisté dans configuration/métadonnées/hash et relu par le notebook ;
+anciens runs sans ce champ → `rolling_std`. Comparaison empirique encore à faire.
 
 La méthode doit fournir une politique explicite entre événements. Elle ne peut pas
 laisser des trous implicitement interprétés comme Hold ou Flat.
@@ -318,6 +376,7 @@ Arguments spécialisés :
 --label-max-holding
 --label-event-filter {all,cusum}
 --label-cusum-threshold
+--label-between-events {hold,flat,carry}
 --label-primary-side
 --label-top-quantile
 --label-bottom-quantile
