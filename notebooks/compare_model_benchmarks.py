@@ -21,7 +21,8 @@ pd.set_option("display.width", 220)
 plt.style.use("seaborn-v0_8-whitegrid")
 
 # Set a specific result directory here. Leave as None to use the latest one.
-RESULT_DIR: Path | None = None
+RESULT_DIR =  Path("../artifacts/comparisons/20260903T100057Z-m3-triple-barrier")
+#RESULT_DIR: Path | None = None
 
 
 # %%
@@ -99,6 +100,36 @@ manifest = json.loads(
 experiment_config = manifest["experiment_parameters"]["config"]
 dataset_metadata = manifest["experiment_parameters"]["dataset"]
 
+feature_sources = manifest["experiment_parameters"].get("feature_sources")
+if feature_sources:
+    print(f"Historical sources mode: {feature_sources['mode']}")
+    display(pd.DataFrame({
+        name: feature_sources[name] for name in ("fundamentals", "sentiment")
+    }).T)
+
+feature_selection = manifest["experiment_parameters"].get("feature_selection")
+if feature_selection:
+    display(pd.DataFrame({
+        "train_coverage": feature_selection["coverage"],
+        "excluded_reason": feature_selection["dropped"],
+    }).sort_values("train_coverage"))
+    print(f"Selected features: {len(feature_selection['selected'])}")
+
+sample_weight_state = manifest["experiment_parameters"].get("sample_weight_state")
+if sample_weight_state:
+    display(pd.Series(sample_weight_state, name="sample_weighting").to_frame())
+
+# Train-only FracDiff choices and diagnostics (absent in older artifacts).
+fracdiff_state = manifest["experiment_parameters"].get("fracdiff_state")
+if fracdiff_state:
+    display(pd.DataFrame([
+        {"ticker": ticker, "selected_order": state["order"],
+         "selected_terms": len(state["weights"]), "train_end": state["train_end"],
+         **diagnostic}
+        for ticker, state in fracdiff_state["groups"].items()
+        for diagnostic in state["diagnostics"]
+    ]))
+
 src_path = str(PROJECT_ROOT / "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
@@ -109,7 +140,8 @@ from trading_system.labels.breakout import (
     generate_breakout_labels,
     generate_breakout_labels_by_ticker,
 )
-from trading_system.labels.forward_return import build_forward_return_labels
+from trading_system.labels.config import LabelConfig
+from trading_system.labels.registry import LabelContext, create_default_label_registry
 
 
 def build_test_labels(frame: pd.DataFrame, config: dict) -> pd.DataFrame:
@@ -135,6 +167,9 @@ def build_test_labels(frame: pd.DataFrame, config: dict) -> pd.DataFrame:
                 config["label_window"],
                 price_col=config["price_col"],
                 date_col=config["date_col"],
+                buy_buffer=config.get("breakout_buy_buffer", 0.0),
+                sell_buffer=config.get("breakout_sell_buffer", 0.0),
+                alternating=config.get("breakout_alternating", True),
             )
         else:
             labeled = generate_breakout_labels_by_ticker(
@@ -143,27 +178,78 @@ def build_test_labels(frame: pd.DataFrame, config: dict) -> pd.DataFrame:
                 price_col=config["price_col"],
                 group_col=group_col,
                 date_col=config["date_col"],
+                buy_buffer=config.get("breakout_buy_buffer", 0.0),
+                sell_buffer=config.get("breakout_sell_buffer", 0.0),
+                alternating=config.get("breakout_alternating", True),
             )
     elif config["label_mode"] == "forward_return":
-        groups = (
-            source.groupby(group_col, sort=False, dropna=False)
-            if group_col is not None
-            else [(None, source)]
-        )
-        labeled = pd.concat(
-            [
-                build_forward_return_labels(
-                    group,
-                    price_col=config["price_col"],
-                    horizon=config["forward_horizon"],
-                    buy_threshold=config["forward_buy_threshold"],
-                    sell_threshold=config["forward_sell_threshold"],
-                    date_col=config["date_col"],
-                )[0]
-                for _, group in groups
-            ],
-            ignore_index=True,
-        )
+        labeled = create_default_label_registry().generate(
+            source,
+            LabelConfig.forward_return(
+                horizon=config["forward_horizon"],
+                buy_threshold=config["forward_buy_threshold"],
+                sell_threshold=config["forward_sell_threshold"],
+            ),
+            LabelContext(
+                price_col=config["price_col"],
+                date_col=config["date_col"],
+                group_col=group_col,
+            ),
+        ).frame
+    elif config["label_mode"] == "volatility_position":
+        labeled = create_default_label_registry().generate(
+            source,
+            LabelConfig.volatility_position(
+                horizon=config.get("volatility_horizon", 10),
+                volatility_window=config.get("volatility_window", 20),
+                long_threshold=config.get("volatility_long_threshold", 1.0),
+                short_threshold=config.get("volatility_short_threshold", 1.5),
+                exit_threshold=config.get("volatility_exit_threshold", 0.25),
+                min_holding_period=config.get(
+                    "volatility_min_holding_period", 5
+                ),
+                cooldown=config.get("volatility_cooldown", 0),
+                cost_bps=config.get("volatility_cost_bps", 5.0),
+                position_mode=config.get(
+                    "volatility_position_mode", "long_flat"
+                ),
+            ),
+            LabelContext(
+                price_col=config["price_col"],
+                date_col=config["date_col"],
+                group_col=group_col,
+            ),
+        ).frame
+    elif config["label_mode"] == "triple_barrier":
+        labeled = create_default_label_registry().generate(
+            source,
+            LabelConfig.triple_barrier(
+                max_holding=config.get("triple_barrier_max_holding", 10),
+                volatility_window=config.get(
+                    "triple_barrier_volatility_window", 20
+                ),
+                volatility_estimator=config.get(
+                    "triple_barrier_volatility_estimator", "rolling_std"
+                ),
+                profit_barrier=config.get(
+                    "triple_barrier_profit_barrier", 1.0
+                ),
+                stop_barrier=config.get("triple_barrier_stop_barrier", 1.0),
+                event_filter=config.get("triple_barrier_event_filter", "all"),
+                cusum_threshold=config.get(
+                    "triple_barrier_cusum_threshold", 0.5
+                ),
+                cost_bps=config.get("triple_barrier_cost_bps", 5.0),
+                between_event_policy=config.get(
+                    "triple_barrier_between_event_policy", "hold"
+                ),
+            ),
+            LabelContext(
+                price_col=config["price_col"],
+                date_col=config["date_col"],
+                group_col=group_col,
+            ),
+        ).frame
     else:
         raise ValueError(
             f"Perfect-label diagnostic does not support {config['label_mode']!r}."
@@ -190,14 +276,29 @@ if selected_tickers and experiment_config["group_col"] in market:
     ].copy()
 
 perfect_test = build_test_labels(market, experiment_config)
+is_position_target = experiment_config["label_mode"] == "volatility_position" or (
+    experiment_config["label_mode"] == "triple_barrier"
+    and experiment_config.get("triple_barrier_between_event_policy", "hold")
+    != "hold"
+)
+label_position_mode = experiment_config.get(
+    "volatility_position_mode", "long_flat"
+)
+is_long_flat_target = (
+    experiment_config["label_mode"] == "volatility_position"
+    and label_position_mode == "long_flat"
+)
 perfect_label_metrics = evaluate_strategy_vs_buy_hold(
     perfect_test,
     perfect_test["Label_id"].to_numpy(dtype=np.int64),
     initial_capital=experiment_config["initial_capital"],
     price_col=experiment_config["price_col"],
     fee_per_trade=experiment_config["fee_per_trade"],
-    position_mode=experiment_config["position_mode"],
+    position_mode=(
+        "long_only" if is_long_flat_target else experiment_config["position_mode"]
+    ),
     execution_delay=experiment_config["execution_delay"],
+    label_semantics="target_position" if is_position_target else "action",
     group_col=(
         experiment_config["group_col"]
         if experiment_config["universe"] == "multi"
@@ -226,7 +327,16 @@ label_reference = pd.DataFrame(
 ).set_index("strategy")
 
 print(f"Label mode: {experiment_config['label_mode']}")
-display(perfect_test["Label"].value_counts().rename("test_labels").to_frame())
+known_test = perfect_test.get(
+    "_label_known", pd.Series(True, index=perfect_test.index)
+).astype(bool)
+display(
+    perfect_test.loc[known_test, "Label"]
+    .value_counts()
+    .rename("known_test_labels")
+    .to_frame()
+)
+print(f"Known labels: {int(known_test.sum())}/{len(known_test)}")
 display(label_reference.round(2))
 
 
@@ -362,3 +472,5 @@ elif leader_stability < 0.60:
     print("Conclusion: apparent winner, but unstable across seeds.")
 else:
     print("Conclusion: promising winner; confirm with walk-forward and untouched data.")
+
+# %%
