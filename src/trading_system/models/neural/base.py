@@ -91,6 +91,8 @@ class TorchSequenceClassifier(ABC):
         *,
         X_val: np.ndarray | None = None,
         y_val: np.ndarray | None = None,
+        sample_weight: np.ndarray | None = None,
+        sample_weight_val: np.ndarray | None = None,
     ) -> FitResult:
         if (X_val is None) != (y_val is None):
             raise ValueError("X_val and y_val must be supplied together.")
@@ -109,6 +111,8 @@ class TorchSequenceClassifier(ABC):
             validation_labels,
             num_classes=self.context.num_classes,
             config=self.config,
+            sample_weight=sample_weight,
+            sample_weight_val=sample_weight_val,
         )
         self.fit_result_ = result
         self.fitted_ = True

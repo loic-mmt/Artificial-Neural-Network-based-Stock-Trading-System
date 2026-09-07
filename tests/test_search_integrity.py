@@ -409,8 +409,9 @@ def test_cli_persists_separate_final_test_report(monkeypatch, tmp_path):
     from trading_system.pipelines import gridsearch_walkforward as cli
 
     monkeypatch.setattr(cli, "read_parquet_dataset", lambda _: market_frame())
-    monkeypatch.setattr(cli, "compute_market_features", lambda frame: frame)
-    monkeypatch.setattr(cli, "MARKET_FEATURE_COLUMNS", ["signal"])
+    monkeypatch.setattr(cli, "build_cli_features", lambda frame, args: (
+        frame, ("signal",), ExperimentConfig(feature_set="market")
+    ))
     output = tmp_path / "search.json"
     monkeypatch.setattr(sys, "argv", [
         "gridsearch", "--ticker", "AAA", "--train-ratio", "0.6", "--val-ratio", "0.2",

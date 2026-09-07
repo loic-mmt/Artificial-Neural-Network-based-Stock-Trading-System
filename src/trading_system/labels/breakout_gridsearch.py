@@ -1,336 +1,201 @@
-import argparse
+from __future__ import annotations
 
-import numpy as np
+import argparse
+from collections.abc import Sequence
+from pathlib import Path
+
 import pandas as pd
 
+from trading_system.backtest.engine import evaluate_strategy_vs_buy_hold
 from trading_system.data.io import read_parquet_dataset
 from trading_system.data.splits import chronological_train_val_test_split
-from trading_system.labels.breakout import enforce_alternating_signals
+from trading_system.labels.config import LabelConfig
+from trading_system.labels.registry import LabelContext, create_default_label_registry
 from trading_system.paths import default_market_dataset_path
 
 DATA_DIR = default_market_dataset_path()
+DEFAULT_BUFFERS = (0.0, 0.001, 0.002, 0.005)
 
 
-def benchmark(df, price_col="adj_close", capital=10_000):
-    returns = df[price_col].pct_change().fillna(0.0).to_numpy(np.float64)
-    buy_hold = float(capital * np.prod(1.0 + returns))
-    return buy_hold
+def _grid_values(value: str, *, cast, name: str) -> tuple:
+    try:
+        values = tuple(cast(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"Invalid {name} list: {value!r}.") from error
+    if not values:
+        raise argparse.ArgumentTypeError(f"{name} requires at least one value.")
+    return values
 
 
-def backtest_long(returns, labels, fees=0.0, capital=10_000.0):
-    """
-    returns: array-like de rendements simples (ex: pct_change), shape (N,)
-    labels:  array-like d'entiers {0:Sell, 1:Hold, 2:Buy}, shape (N,)
-    fees: coût fixe par changement de position (en valeur absolue de capital)
-    """
-    r = np.asarray(returns, dtype=np.float64)
-    y = np.asarray(labels, dtype=np.int64)
-
-    if r.shape[0] != y.shape[0]:
-        raise ValueError("returns et labels doivent avoir la même longueur.")
-    if r.shape[0] == 0:
-        raise ValueError("Séries vides.")
-
-    portfolio = float(capital)
-    position = 0  # 0 = flat, 1 = long
-    n_trades = 0
-
-    for i in range(r.shape[0]):
-        # 1) applique le rendement avec la position courante
-        # (signal execute au bar suivant)
-        if position == 1:
-            portfolio *= 1.0 + r[i]
-        if portfolio <= 0:
-            return {
-                "final_capital": 0.0,
-                "pnl": -float(capital),
-                "n_trades": n_trades,
-                "stopped_early": True,
-            }
-
-        # 2) appliquer le signal (changement de position pour le bar suivant)
-        prev_position = position
-        if y[i] == 2:  # Buy
-            position = 1
-        elif y[i] == 0:  # Sell
-            position = 0
-        elif y[i] == 1:  # Hold
-            pass
-        else:
-            raise ValueError(f"Label inconnu: {y[i]}")
-
-        # 3) si changement de position => frais
-        trade_actions = abs(position - prev_position)  # 0 ou 1 en long-only
-        if trade_actions > 0:
-            portfolio -= float(fees) * trade_actions
-            n_trades += int(trade_actions)
-            if portfolio <= 0:
-                return {
-                    "final_capital": 0.0,
-                    "pnl": -float(capital),
-                    "n_trades": n_trades,
-                    "stopped_early": True,
-                }
+def _compatibility_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    """Keep historical result keys while exposing all canonical metrics."""
 
     return {
-        "final_capital": float(portfolio),
-        "pnl": float(portfolio - float(capital)),
-        "n_trades": int(n_trades),
-        "stopped_early": False,
+        **metrics,
+        "final_capital": metrics["model_final_capital"],
+        "pnl": metrics["model_pnl"],
+        "n_trades": metrics["transaction_count"],
     }
 
 
-def backtest_long_short(returns, labels, fees=0.0, capital=10_000.0):
-    """
-    returns: array-like de rendements simples (ex: pct_change), shape (N,)
-    labels:  array-like d'entiers {0:Sell, 1:Hold, 2:Buy}, shape (N,)
-    fees: coût fixe par changement de position (en valeur absolue de capital)
-    """
-    r = np.asarray(returns, dtype=np.float64)
-    y = np.asarray(labels, dtype=np.int64)
+def _label_gridsearch(
+    frame: pd.DataFrame,
+    *,
+    price_col: str,
+    fees: float,
+    capital: float,
+    position_mode: str,
+    windows: Sequence[int],
+    buy_buffers: Sequence[float],
+    sell_buffers: Sequence[float],
+    alternating: bool,
+    execution_delay: int,
+) -> tuple[dict[str, object], dict[str, float], pd.DataFrame]:
+    if frame is None or frame.empty:
+        raise ValueError("frame must not be empty.")
+    missing = [column for column in ("date", price_col) if column not in frame.columns]
+    if missing:
+        raise ValueError(f"Missing grid-search columns: {missing}")
+    if position_mode not in ("long_only", "long_short"):
+        raise ValueError("position_mode must be 'long_only' or 'long_short'.")
+    if not windows or not buy_buffers or not sell_buffers:
+        raise ValueError("Grid-search parameter collections must not be empty.")
 
-    if r.shape[0] != y.shape[0]:
-        raise ValueError("returns et labels doivent avoir la même longueur.")
-    if r.shape[0] == 0:
-        raise ValueError("Séries vides.")
-
-    portfolio = float(capital)
-    position = 0  # -1 = short, 0 = flat, 1 = long
-    n_trades = 0
-
-    for i in range(r.shape[0]):
-        # 1) applique le rendement avec la position courante
-        # (signal execute au bar suivant)
-        if position == 1:
-            portfolio *= 1.0 + r[i]
-        elif position == -1:
-            portfolio *= 1.0 - r[i]
-        if portfolio <= 0:
-            return {
-                "final_capital": 0.0,
-                "pnl": -float(capital),
-                "n_trades": n_trades,
-                "stopped_early": True,
-            }
-
-        # 2) appliquer le signal (changement de position pour le bar suivant)
-        prev_position = position
-        if y[i] == 2:  # Buy
-            position = 1
-        elif y[i] == 0:  # Sell
-            position = -1
-        elif y[i] == 1:  # Hold
-            pass
-        else:
-            raise ValueError(f"Label inconnu: {y[i]}")
-
-        # 3) frais: un flip +1 <-> -1 vaut 2 transactions (close + open)
-        trade_actions = abs(position - prev_position)  # 0, 1 ou 2
-        if trade_actions > 0:
-            portfolio -= float(fees) * trade_actions
-            n_trades += int(trade_actions)
-            if portfolio <= 0:
-                return {
-                    "final_capital": 0.0,
-                    "pnl": -float(capital),
-                    "n_trades": n_trades,
-                    "stopped_early": True,
-                }
-
-    return {
-        "final_capital": float(portfolio),
-        "pnl": float(portfolio - float(capital)),
-        "n_trades": int(n_trades),
-        "stopped_early": False,
-    }
-
-
-def label_gridsearch(df, price_col="adj_close", fees=1.0, capital=10_000.0):
-    """
-    Grid search simple sur (window, buy_buffer, sell_buffer).
-    Retourne best_params, best_metrics, all_results_df
-    """
-    if df is None or df.empty:
-        raise ValueError("df vide")
-    if price_col not in df.columns:
-        raise ValueError(f"{price_col} manquant")
-    if "date" not in df.columns:
-        raise ValueError("date manquant")
-
-    work = df.sort_values("date").copy()
-
-    windows = list(range(5, 61))
-    buy_buffers = [0.0, 0.001, 0.002, 0.005]
-    sell_buffers = [0.0, 0.001, 0.002, 0.005]
-
-    label_map = {"Sell": 0, "Hold": 1, "Buy": 2}
-    best_score = -np.inf
-    best_params = None
-    best_metrics = None
-    rows = []
-
-    buy_hold = benchmark(work, price_col=price_col, capital=capital)
+    work = frame.sort_values("date").reset_index(drop=True).copy()
+    registry = create_default_label_registry()
+    context = LabelContext(price_col=price_col, date_col="date")
+    rows: list[dict[str, object]] = []
+    best_params: dict[str, object] | None = None
+    best_metrics: dict[str, float] | None = None
+    best_score = float("-inf")
 
     for window in windows:
-        prev_min = work[price_col].shift(1).rolling(window).min()
-        prev_max = work[price_col].shift(1).rolling(window).max()
-
         for buy_buffer in buy_buffers:
             for sell_buffer in sell_buffers:
-                raw_labels = np.where(
-                    work[price_col] <= prev_min * (1.0 - buy_buffer),
-                    "Buy",
-                    np.where(
-                        work[price_col] >= prev_max * (1.0 + sell_buffer),
-                        "Sell",
-                        "Hold",
-                    ),
+                config = LabelConfig.breakout(
+                    window=window,
+                    buy_buffer=buy_buffer,
+                    sell_buffer=sell_buffer,
+                    alternating=alternating,
                 )
-
-                raw_labels = pd.Series(raw_labels, index=work.index, dtype="object")
-                raw_labels.loc[prev_min.isna() | prev_max.isna()] = "Hold"
-
-                labels = enforce_alternating_signals(raw_labels.tolist())
-                label_ids = (
-                    pd.Series(labels, index=work.index)
-                    .map(label_map)
-                    .to_numpy(np.int64)
+                labels = registry.generate(work, config, context)
+                metrics = evaluate_strategy_vs_buy_hold(
+                    labels.frame,
+                    labels.frame["Label_id"].to_numpy(),
+                    initial_capital=capital,
+                    price_col=price_col,
+                    fee_per_trade=fees,
+                    position_mode=position_mode,
+                    execution_delay=execution_delay,
                 )
-
-                rets = work[price_col].pct_change().fillna(0.0).to_numpy(np.float64)
-                metrics = backtest_long(rets, label_ids, fees=fees, capital=capital)
-
-                outperformance = float(metrics["final_capital"]) - buy_hold
-                score = outperformance
-
-                row = {
-                    "window": window,
-                    "buy_buffer": buy_buffer,
-                    "sell_buffer": sell_buffer,
-                    "score": score,
-                    "final_capital": metrics["final_capital"],
-                    "pnl": metrics["pnl"],
-                    "n_trades": metrics["n_trades"],
-                }
-                rows.append(row)
-
+                score = float(metrics["outperformance"])
+                parameters = dict(config.parameters)
+                rows.append(
+                    {
+                        **parameters,
+                        "score": score,
+                        "final_capital": metrics["model_final_capital"],
+                        "pnl": metrics["model_pnl"],
+                        "buy_hold_final_capital": metrics["buy_hold_final_capital"],
+                        "outperformance": metrics["outperformance"],
+                        "n_trades": metrics["transaction_count"],
+                        "trade_count": metrics["trade_count"],
+                        "total_fees": metrics["total_fees"],
+                        "action_rate": labels.metadata["action_rate"],
+                    }
+                )
                 if score > best_score:
                     best_score = score
-                    best_params = {
-                        "window": window,
-                        "buy_buffer": buy_buffer,
-                        "sell_buffer": sell_buffer,
-                    }
-                    best_metrics = metrics
+                    best_params = parameters
+                    best_metrics = _compatibility_metrics(metrics)
 
-    results_df = (
+    if best_params is None or best_metrics is None:
+        raise RuntimeError("Grid search produced no result.")
+    results = (
         pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
     )
-    return best_params, best_metrics, results_df
+    return best_params, best_metrics, results
 
 
-def label_gridsearch_long_short(df, price_col="adj_close", fees=1.0, capital=10_000.0):
-    """
-    Grid search simple sur (window, buy_buffer, sell_buffer).
-    Retourne best_params, best_metrics, all_results_df
-    """
-    if df is None or df.empty:
-        raise ValueError("df vide")
-    if price_col not in df.columns:
-        raise ValueError(f"{price_col} manquant")
-    if "date" not in df.columns:
-        raise ValueError("date manquant")
+def label_gridsearch(
+    df: pd.DataFrame,
+    price_col: str = "adj_close",
+    fees: float = 1.0,
+    capital: float = 10_000.0,
+    *,
+    windows: Sequence[int] = tuple(range(5, 61)),
+    buy_buffers: Sequence[float] = DEFAULT_BUFFERS,
+    sell_buffers: Sequence[float] = DEFAULT_BUFFERS,
+    alternating: bool = True,
+    execution_delay: int = 1,
+):
+    """Select breakout parameters on one validation frame using long/flat."""
 
-    work = df.sort_values("date").copy()
-
-    windows = list(range(2, 61))
-    buy_buffers = [0.0, 0.001, 0.002, 0.005]
-    sell_buffers = [0.0, 0.001, 0.002, 0.005]
-
-    label_map = {"Sell": 0, "Hold": 1, "Buy": 2}
-    best_score = -np.inf
-    best_params = None
-    best_metrics = None
-    rows = []
-
-    buy_hold = benchmark(work, price_col=price_col, capital=capital)
-
-    for window in windows:
-        prev_min = work[price_col].shift(1).rolling(window).min()
-        prev_max = work[price_col].shift(1).rolling(window).max()
-
-        for buy_buffer in buy_buffers:
-            for sell_buffer in sell_buffers:
-                raw_labels = np.where(
-                    work[price_col] <= prev_min * (1.0 - buy_buffer),
-                    "Buy",
-                    np.where(
-                        work[price_col] >= prev_max * (1.0 + sell_buffer),
-                        "Sell",
-                        "Hold",
-                    ),
-                )
-
-                raw_labels = pd.Series(raw_labels, index=work.index, dtype="object")
-                raw_labels.loc[prev_min.isna() | prev_max.isna()] = "Hold"
-
-                labels = enforce_alternating_signals(raw_labels.tolist())
-                label_ids = (
-                    pd.Series(labels, index=work.index)
-                    .map(label_map)
-                    .to_numpy(np.int64)
-                )
-
-                rets = work[price_col].pct_change().fillna(0.0).to_numpy(np.float64)
-                metrics = backtest_long_short(
-                    rets, label_ids, fees=fees, capital=capital
-                )
-
-                outperformance = float(metrics["final_capital"]) - buy_hold
-                score = outperformance
-
-                row = {
-                    "window": window,
-                    "buy_buffer": buy_buffer,
-                    "sell_buffer": sell_buffer,
-                    "score": score,
-                    "final_capital": metrics["final_capital"],
-                    "pnl": metrics["pnl"],
-                    "n_trades": metrics["n_trades"],
-                }
-                rows.append(row)
-
-                if score > best_score:
-                    best_score = score
-                    best_params = {
-                        "window": window,
-                        "buy_buffer": buy_buffer,
-                        "sell_buffer": sell_buffer,
-                    }
-                    best_metrics = metrics
-
-    results_df = (
-        pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+    return _label_gridsearch(
+        df,
+        price_col=price_col,
+        fees=fees,
+        capital=capital,
+        position_mode="long_only",
+        windows=windows,
+        buy_buffers=buy_buffers,
+        sell_buffers=sell_buffers,
+        alternating=alternating,
+        execution_delay=execution_delay,
     )
-    return best_params, best_metrics, results_df
+
+
+def label_gridsearch_long_short(
+    df: pd.DataFrame,
+    price_col: str = "adj_close",
+    fees: float = 1.0,
+    capital: float = 10_000.0,
+    *,
+    windows: Sequence[int] = tuple(range(2, 61)),
+    buy_buffers: Sequence[float] = DEFAULT_BUFFERS,
+    sell_buffers: Sequence[float] = DEFAULT_BUFFERS,
+    alternating: bool = True,
+    execution_delay: int = 1,
+):
+    """Select breakout parameters on one validation frame using long/short."""
+
+    return _label_gridsearch(
+        df,
+        price_col=price_col,
+        fees=fees,
+        capital=capital,
+        position_mode="long_short",
+        windows=windows,
+        buy_buffers=buy_buffers,
+        sell_buffers=sell_buffers,
+        alternating=alternating,
+        execution_delay=execution_delay,
+    )
 
 
 def load_default_validation_split(
     ticker: str = "EN.PA",
     train_ratio: float = 0.7,
     val_ratio: float = 0.15,
+    *,
+    data_path: Path = DATA_DIR,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    df = read_parquet_dataset(DATA_DIR)
-    df = df[df["ticker"] == ticker].copy()
+    frame = read_parquet_dataset(data_path)
+    frame = frame[frame["ticker"] == ticker].copy()
+    if frame.empty:
+        raise ValueError(f"Ticker {ticker!r} is absent from {data_path}.")
     return chronological_train_val_test_split(
-        df, train_ratio=train_ratio, val_ratio=val_ratio
+        frame,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
     )
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Grid search on breakout labels over validation split."
+        description="Grid search on breakout labels over the validation split."
     )
+    parser.add_argument("--data", type=Path, default=DATA_DIR)
     parser.add_argument("--ticker", default="EN.PA")
     parser.add_argument("--fees", type=float, default=2.0)
     parser.add_argument("--capital", type=float, default=10_000.0)
@@ -338,27 +203,67 @@ def main() -> None:
     parser.add_argument(
         "--mode", choices=("long_only", "long_short"), default="long_only"
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--label-method",
+        "--label-mode",
+        choices=("breakout",),
+        default="breakout",
+    )
+    parser.add_argument(
+        "--label-windows",
+        "--label-window",
+        dest="label_windows",
+        type=lambda value: _grid_values(value, cast=int, name="windows"),
+    )
+    parser.add_argument(
+        "--label-buy-buffers",
+        "--label-buy-buffer",
+        dest="label_buy_buffers",
+        type=lambda value: _grid_values(value, cast=float, name="buy buffers"),
+        default=DEFAULT_BUFFERS,
+    )
+    parser.add_argument(
+        "--label-sell-buffers",
+        "--label-sell-buffer",
+        dest="label_sell_buffers",
+        type=lambda value: _grid_values(value, cast=float, name="sell buffers"),
+        default=DEFAULT_BUFFERS,
+    )
+    parser.add_argument(
+        "--label-alternating",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--execution-delay", type=int, default=1)
+    return parser
 
-    _, val, _ = load_default_validation_split(ticker=args.ticker)
-    if args.mode == "long_short":
-        best_params, best_metrics, results_df = label_gridsearch_long_short(
-            val,
-            price_col=args.price_col,
-            fees=args.fees,
-            capital=args.capital,
-        )
-    else:
-        best_params, best_metrics, results_df = label_gridsearch(
-            val,
-            price_col=args.price_col,
-            fees=args.fees,
-            capital=args.capital,
-        )
 
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    _, validation, _ = load_default_validation_split(
+        ticker=args.ticker,
+        data_path=args.data,
+    )
+    windows = args.label_windows
+    if windows is None:
+        windows = tuple(range(2 if args.mode == "long_short" else 5, 61))
+    function = (
+        label_gridsearch_long_short if args.mode == "long_short" else label_gridsearch
+    )
+    best_params, best_metrics, results = function(
+        validation,
+        price_col=args.price_col,
+        fees=args.fees,
+        capital=args.capital,
+        windows=windows,
+        buy_buffers=args.label_buy_buffers,
+        sell_buffers=args.label_sell_buffers,
+        alternating=args.label_alternating,
+        execution_delay=args.execution_delay,
+    )
     print(best_params)
     print(best_metrics)
-    print(results_df.head(20))
+    print(results.head(20))
 
 
 if __name__ == "__main__":

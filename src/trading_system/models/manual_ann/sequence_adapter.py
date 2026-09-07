@@ -75,6 +75,8 @@ class ManualANNSequenceAdapter:
         *,
         X_val: np.ndarray | None = None,
         y_val: np.ndarray | None = None,
+        sample_weight: np.ndarray | None = None,
+        sample_weight_val: np.ndarray | None = None,
     ) -> FitResult:
         # Validation features and labels form one optional pair. Supplying only
         # one would make validation loss meaningless or misaligned.
@@ -107,6 +109,8 @@ class ManualANNSequenceAdapter:
             y_train=y_train,
             X_val=flattened_val,
             y_val=y_val,
+            sample_weight=sample_weight,
+            sample_weight_val=sample_weight_val,
         )
 
         # Commit adapter state only after successful training. Failed fit leaves

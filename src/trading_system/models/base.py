@@ -34,6 +34,8 @@ class ProbabilisticClassifier(Protocol):
         *,
         X_val: np.ndarray | None = None,
         y_val: np.ndarray | None = None,
+        sample_weight: np.ndarray | None = None,
+        sample_weight_val: np.ndarray | None = None,
     ) -> FitResult: ...
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray: ...
@@ -53,6 +55,8 @@ class ProbabilisticSequenceClassifier(Protocol):
         *,
         X_val: np.ndarray | None = None,
         y_val: np.ndarray | None = None,
+        sample_weight: np.ndarray | None = None,
+        sample_weight_val: np.ndarray | None = None,
     ) -> FitResult:
         # Implementations validate
         # `(N, T, F)` inputs, preserve the fixed Sell/Hold/Buy schema, train only

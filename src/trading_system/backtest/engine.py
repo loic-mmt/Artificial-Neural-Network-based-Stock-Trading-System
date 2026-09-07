@@ -5,6 +5,7 @@ import pandas as pd
 
 from .benchmarks import buy_and_hold_curve, forward_returns
 from .positions import (
+    LabelSemantics,
     PositionMode,
     apply_execution_delay,
     labels_to_positions,
@@ -20,6 +21,7 @@ def run_label_backtest(
     fee_per_trade: float = 0.0,
     position_mode: PositionMode = "long_short",
     execution_delay: int = 1,
+    label_semantics: LabelSemantics = "action",
 ) -> dict[str, object]:
     """Backtest labels with explicit timing and turnover semantics."""
 
@@ -35,7 +37,11 @@ def run_label_backtest(
         raise ValueError("At least two prices are required for a backtest.")
 
     returns = forward_returns(values)
-    targets = labels_to_positions(labels, position_mode=position_mode)
+    targets = labels_to_positions(
+        labels,
+        position_mode=position_mode,
+        label_semantics=label_semantics,
+    )
     executed = apply_execution_delay(targets, execution_delay)
     turnover = position_turnover(executed)
     fees_paid = float(fee_per_trade) * turnover
@@ -121,6 +127,7 @@ def evaluate_strategy_vs_buy_hold(
     position_mode: PositionMode = "long_short",
     execution_delay: int = 1,
     *,
+    label_semantics: LabelSemantics = "action",
     group_col: str | None = None,
     date_col: str = "date",
     annualization_factor: int = 252,
@@ -138,6 +145,7 @@ def evaluate_strategy_vs_buy_hold(
             fee_per_trade=fee_per_trade,
             position_mode=position_mode,
             execution_delay=execution_delay,
+            label_semantics=label_semantics,
         )
         return _summarize_backtest(result, initial_capital, annualization_factor)
 
@@ -164,6 +172,7 @@ def evaluate_strategy_vs_buy_hold(
             fee_per_trade=fee_per_trade,
             position_mode=position_mode,
             execution_delay=execution_delay,
+            label_semantics=label_semantics,
         )
         model_total += float(np.asarray(result["model_curve"])[-1])
         benchmark_total += float(np.asarray(result["buy_hold_curve"])[-1])

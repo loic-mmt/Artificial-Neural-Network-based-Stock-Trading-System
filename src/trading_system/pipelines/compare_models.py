@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import datetime, timezone
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
+from trading_system.artifacts.serialization import stable_config_hash
 from trading_system.data.io import read_parquet_dataset
 from trading_system.experiments.comparison import (
     build_comparison_runs,
@@ -16,6 +17,18 @@ from trading_system.experiments.comparison import (
 from trading_system.models.factory import create_default_model_registry
 from trading_system.paths import comparisons_dir, default_market_dataset_path
 from trading_system.reporting.warnings import current_universe_warning
+
+from .label_arguments import (
+    add_label_arguments,
+    apply_label_arguments,
+    resolved_label_config,
+)
+from .feature_arguments import add_feature_arguments, apply_feature_arguments, apply_feature_sources
+from .training_arguments import add_weight_arguments, apply_weight_arguments
+from .overfitting_arguments import (
+    add_overfitting_arguments,
+    overfitting_config_from_args,
+)
 
 from .multi_ticker import DEFAULT_CONFIG as MULTI_TICKER
 from .multi_ticker_long_short import DEFAULT_CONFIG as MULTI_TICKER_LONG_SHORT
@@ -113,6 +126,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="JSON selection file. Supported only by multi-ticker presets.",
     )
+    add_label_arguments(parser)
+    add_feature_arguments(parser)
+    add_weight_arguments(parser)
+    add_overfitting_arguments(parser)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="cpu")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--fail-fast", action="store_true")
@@ -156,7 +173,13 @@ def main(argv: list[str] | None = None):
     if warning:
         print(warning)
     frame = read_parquet_dataset(args.data)
-    config = replace(PRESETS[args.preset], device=args.device)
+    config = apply_label_arguments(
+        replace(PRESETS[args.preset], device=args.device),
+        args,
+    )
+    config = apply_feature_arguments(config, args)
+    config = apply_weight_arguments(config, args)
+    config = replace(config, overfitting_control=overfitting_config_from_args(args))
     selected_tickers = None
     if args.ticker_selection is not None:
         if config.universe != "multi":
@@ -169,8 +192,20 @@ def main(argv: list[str] | None = None):
         if missing:
             raise ValueError(f"Selected tickers missing from dataset: {missing}")
         frame = frame[frame[config.group_col].astype(str).isin(selected_tickers)].copy()
+    frame, feature_sources = apply_feature_sources(frame, args, config)
     parameter_sets = _parameter_sets(args.models, args.model_parameter_sets)
     runs = build_comparison_runs(parameter_sets, args.seeds)
+    label_config = resolved_label_config(config)
+    label_payload = (
+        asdict(label_config)
+        if label_config is not None
+        else {"method": config.label_mode}
+    )
+    label_config_hash = stable_config_hash(label_payload)
+    print(
+        f"label_config={json.dumps(label_payload, sort_keys=True)} "
+        f"label_config_hash={label_config_hash}"
+    )
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_dir = args.output_dir or comparisons_dir() / stamp
     result = run_model_comparison(
@@ -197,6 +232,17 @@ def main(argv: list[str] | None = None):
                 else None
             ),
             "selected_tickers": selected_tickers,
+            "label_config": label_payload,
+            "label_config_hash": label_config_hash,
+            "fracdiff_config": asdict(config.fracdiff) if config.fracdiff else None,
+            "sample_weighting": asdict(config.sample_weighting) if config.sample_weighting else None,
+            "feature_set": config.feature_set,
+            "feature_sources": feature_sources,
+            "overfitting_control": (
+                asdict(config.overfitting_control)
+                if config.overfitting_control else None
+            ),
+            "feature_groups": config.expanded_feature_groups if config.feature_set == "expanded" else None,
             "survivor_bias_warning": warning,
         },
     )

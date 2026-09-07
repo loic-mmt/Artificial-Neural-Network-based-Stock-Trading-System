@@ -7,6 +7,7 @@ ANN/__pycache__/
 ANN/datasets/
 data/processed/
 data/derived/
+data/external/
 /artifacts/
 notebooks/.ipynb_checkpoints/
 archive/

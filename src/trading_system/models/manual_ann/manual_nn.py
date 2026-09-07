@@ -7,7 +7,7 @@ import numpy as np
 
 from trading_system.labels.schema import N_CLASSES
 from trading_system.models.base import FitResult, TrainingHistory
-from trading_system.training.weights import compute_class_weights
+from trading_system.training.weights import compute_class_weights, validate_sample_weight
 
 
 def relu(values: np.ndarray) -> np.ndarray:
@@ -69,6 +69,7 @@ class ManualANNConfig:
     epochs: int = 500
     batch_size: int = 32
     dropout_probability: float = 0.0
+    weight_decay: float = 0.0
     early_stopping_patience: int = 50
     early_stopping_min_delta: float = 1e-4
     seed: int = 1
@@ -81,6 +82,8 @@ class ManualANNConfig:
             raise ValueError("learning_rate must be positive.")
         if not 0.0 <= self.dropout_probability < 1.0:
             raise ValueError("dropout_probability must be in [0, 1).")
+        if not np.isfinite(self.weight_decay) or self.weight_decay < 0:
+            raise ValueError("weight_decay must be finite and non-negative.")
         if self.early_stopping_patience <= 0 or self.early_stopping_min_delta < 0:
             raise ValueError("Invalid early-stopping configuration.")
         if self.num_classes <= 1:
@@ -125,8 +128,11 @@ class ManualANNClassifier:
         probabilities: np.ndarray,
         labels: np.ndarray,
         class_weights: np.ndarray,
+        sample_weight: np.ndarray | None = None,
     ) -> float:
         sample_weights = class_weights[labels]
+        if sample_weight is not None:
+            sample_weights = sample_weights * sample_weight
         selected = probabilities[np.arange(len(labels)), labels]
         return float(
             -np.sum(sample_weights * np.log(selected + 1e-12)) / sample_weights.sum()
@@ -147,10 +153,19 @@ class ManualANNClassifier:
         X_val: np.ndarray | None = None,
         y_val: np.ndarray | None = None,
         class_weights: np.ndarray | None = None,
+        sample_weight: np.ndarray | None = None,
+        sample_weight_val: np.ndarray | None = None,
     ) -> FitResult:
         started = perf_counter()
         X = self._validate_X(X_train)
         y = self._validate_y(y_train, len(X))
+        sample_weight = validate_sample_weight(sample_weight, len(X))
+        if sample_weight_val is not None and X_val is None:
+            raise ValueError("sample_weight_val requires validation data.")
+        sample_weight_val = validate_sample_weight(
+            sample_weight_val, len(X_val) if X_val is not None else 0,
+            name="sample_weight_val",
+        )
         if (X_val is None) != (y_val is None):
             raise ValueError("X_val and y_val must be supplied together.")
         validation_X = (
@@ -166,7 +181,7 @@ class ManualANNClassifier:
             if class_weights is None
             else np.asarray(class_weights, dtype=np.float32)
         )
-        if weights.shape != (self.config.num_classes,) or (weights <= 0).any():
+        if weights.shape != (self.config.num_classes,) or not np.isfinite(weights).all() or (weights <= 0).any():
             raise ValueError("class_weights must contain one positive value per class.")
 
         rng = np.random.default_rng(self.config.seed)
@@ -210,7 +225,11 @@ class ManualANNClassifier:
                     hidden *= mask
                 probabilities = softmax(hidden @ W1 + b1)
                 sample_weights = weights[batch_y]
+                if sample_weight is not None:
+                    sample_weights = sample_weights * sample_weight[batch_indices]
                 weight_sum = float(sample_weights.sum())
+                if weight_sum == 0:
+                    continue
                 # Probabilities are no longer needed once backprop starts. Reuse
                 # their buffer rather than allocating one-hot targets/gradients.
                 output_gradient = probabilities
@@ -232,9 +251,15 @@ class ManualANNClassifier:
                 ):
                     gradient *= self.config.learning_rate
                     parameter -= gradient
+                # Decoupled weight decay mirrors AdamW semantics: weights only,
+                # no regularization term contaminating validation loss.
+                if self.config.weight_decay:
+                    decay = 1.0 - self.config.learning_rate * self.config.weight_decay
+                    W0 *= decay
+                    W1 *= decay
 
             train_loss = self._weighted_cross_entropy(
-                self._predict_validated(X), y, weights
+                self._predict_validated(X), y, weights, sample_weight
             )
             history.train_loss.append(train_loss)
             if validation_X is not None and validation_y is not None:
@@ -242,6 +267,7 @@ class ManualANNClassifier:
                     self._predict_validated(validation_X),
                     validation_y,
                     weights,
+                    sample_weight_val,
                 )
                 history.val_loss.append(selection_loss)
             else:

@@ -15,6 +15,7 @@ from trading_system.data.scaling import SequenceStandardizer, Standardizer
 from trading_system.data.splits import chronological_train_val_test_split
 from trading_system.experiments.runner import ExperimentResult
 from trading_system.reporting.warnings import current_universe_warning
+from trading_system.training.overfitting import generalization_diagnostics
 
 from .serialization import ArtifactManifest, save_model_artifact, stable_config_hash
 
@@ -116,8 +117,14 @@ def build_experiment_manifest(
         raise TypeError("result must be ExperimentResult.")
     config = result.config
     selection = result.bundle.model_selection
+    label_config = config.resolved_label_config()
     experiment_parameters = {
         "config": asdict(config),
+        "label_config": (
+            asdict(label_config)
+            if label_config is not None
+            else {"method": config.label_mode}
+        ),
         "dataset": {
             "path": str(Path(dataset_path).expanduser().resolve())
             if dataset_path is not None
@@ -134,6 +141,17 @@ def build_experiment_manifest(
         },
         "split_boundaries": _split_boundaries(frame, result),
         "split_sizes_after_features": dict(result.split_sizes),
+        "sample_weight_state": result.bundle.sample_weight_state,
+        "feature_sources": frame.attrs.get("feature_sources"),
+        "feature_selection": result.bundle.feature_selector.state_dict() if result.bundle.feature_selector else None,
+        "overfitting_feature_selection": (
+            result.bundle.overfitting_selector.state_dict()
+            if result.bundle.overfitting_selector else None
+        ),
+        "fracdiff_state": (
+            result.bundle.fracdiff_transformer.state_dict()
+            if result.bundle.fracdiff_transformer is not None else None
+        ),
     }
     decision_parameters = asdict(result.bundle.decision_policy)
     canonical = {
@@ -150,6 +168,7 @@ def build_experiment_manifest(
         config_hash=stable_config_hash(canonical),
         feature_columns=result.bundle.feature_columns,
         context_len=result.bundle.context_len,
+        class_names=config.resolved_class_names(),
         decision_parameters=decision_parameters,
         runtime_metadata=_runtime_metadata(),
     )
@@ -186,6 +205,7 @@ def save_experiment_artifact(
             "validation": result.val_backtest,
             "test": result.backtest,
         },
+        "generalization": generalization_diagnostics(fit),
         "advanced": _nullable_metadata(dict(advanced_diagnostics or {})),
     }
     return save_model_artifact(

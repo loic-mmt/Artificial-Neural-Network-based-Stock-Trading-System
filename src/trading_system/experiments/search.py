@@ -5,7 +5,7 @@ import io
 import itertools
 import json
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from time import perf_counter
 from typing import Any
 from weakref import ref
@@ -307,8 +307,26 @@ def run_walkforward_grid_search(
     winner report, never merged into selection columns.
     """
 
-    _validate_objective(objective)
+    if objective not in SELECTION_OBJECTIVES | {
+        "net_pnl", "net_return", "regularized_sharpe"
+    }:
+        raise ValueError(f"Unknown validation objective: {objective}")
     common = dict(common_parameters or {})
+    loss_config = common.get("financial_loss")
+    if loss_config is not None and not hasattr(loss_config, "objective"):
+        raise TypeError("financial_loss must be FinancialLossConfig or None.")
+    direct_financial = (
+        loss_config is not None and loss_config.objective != "cross_entropy"
+    )
+    financial_only = {"net_pnl", "net_return", "regularized_sharpe"}
+    classification_only = {
+        "acc", "bal_acc", "macro_f1", "precision_sell", "recall_sell",
+        "precision_hold", "recall_hold", "precision_buy", "recall_buy",
+    }
+    if direct_financial and objective in classification_only:
+        raise ValueError("Financial loss requires a financial validation objective.")
+    if not direct_financial and objective in financial_only:
+        raise ValueError("Direct financial validation objectives require pnl/sharpe loss.")
     if common.get("label_mode", "forward_return").startswith("oracle"):
         raise ValueError("Oracle labels are diagnostic only and cannot select a model.")
     if "evaluation_split" in common:
@@ -367,6 +385,18 @@ def run_walkforward_grid_search(
             "decision_mode": trial.decision_mode,
             "min_action_rate": trial.min_action_rate,
         }
+        if common.get("label_mode") == "volatility_position":
+            data_parameters["volatility_horizon"] = data_parameters.pop(
+                "forward_horizon"
+            )
+            data_parameters.pop("forward_buy_threshold")
+            data_parameters.pop("forward_sell_threshold")
+        elif common.get("label_mode") == "triple_barrier":
+            data_parameters["triple_barrier_max_holding"] = data_parameters.pop(
+                "forward_horizon"
+            )
+            data_parameters.pop("forward_buy_threshold")
+            data_parameters.pop("forward_sell_threshold")
         selection = (
             trial.model if isinstance(trial, WalkForwardModelTrialConfig) else None
         )
@@ -380,6 +410,30 @@ def run_walkforward_grid_search(
                 seed=seed,
             )
         row_parameters = dict(parameters)
+        if common.get("expanded_min_coverage") is not None:
+            row_parameters["expanded_min_coverage"] = common["expanded_min_coverage"]
+            row_parameters["candidate_features"] = json.dumps(list(feature_columns))
+        if common.get("sample_weighting") is not None:
+            row_parameters["sample_weighting"] = json.dumps(
+                asdict(common["sample_weighting"]), sort_keys=True
+            )
+        if common.get("fracdiff_config") is not None:
+            row_parameters["fracdiff_config"] = json.dumps(
+                asdict(common["fracdiff_config"]), sort_keys=True
+            )
+        if common.get("financial_loss") is not None:
+            row_parameters["financial_loss"] = json.dumps(
+                asdict(common["financial_loss"]), sort_keys=True
+            )
+        if common.get("overfitting_control") is not None:
+            row_parameters["overfitting_control"] = json.dumps(
+                asdict(common["overfitting_control"]), sort_keys=True
+            )
+        if common.get("label_mode") == "triple_barrier":
+            # Preserve the fixed estimator in exported rankings and winner metadata.
+            row_parameters["triple_barrier_volatility_estimator"] = common.get(
+                "triple_barrier_volatility_estimator", "rolling_std"
+            )
         if selection is not None:
             row_parameters.update(
                 model_name=selection.name,

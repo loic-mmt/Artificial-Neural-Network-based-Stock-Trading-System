@@ -72,6 +72,7 @@ def train_model(
                 "epochs": ann.epochs,
                 "batch_size": ann.batch_size,
                 "dropout_probability": ann.dropout_probability,
+                "weight_decay": ann.weight_decay,
                 "early_stopping_patience": ann.early_stopping_patience,
                 "early_stopping_min_delta": ann.early_stopping_min_delta,
             },

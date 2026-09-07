@@ -7,23 +7,33 @@ import numpy as np
 from trading_system.labels.schema import TradeLabel
 
 PositionMode = Literal["long_only", "long_short"]
+LabelSemantics = Literal["action", "target_position"]
 
 
 def labels_to_positions(
     predicted_labels: np.ndarray,
     *,
     position_mode: PositionMode = "long_short",
+    label_semantics: LabelSemantics = "action",
 ) -> np.ndarray:
-    """Convert action labels into persistent target positions."""
+    """Convert label IDs using an explicit action or target-state contract."""
 
     if position_mode not in ("long_only", "long_short"):
         raise ValueError(f"Unknown position_mode: {position_mode}")
+    if label_semantics not in ("action", "target_position"):
+        raise ValueError(f"Unknown label_semantics: {label_semantics}")
     labels = np.asarray(predicted_labels, dtype=np.int64)
     if labels.ndim != 1:
         raise ValueError("predicted_labels must be a 1D array.")
     invalid = ~np.isin(labels, [label.value for label in TradeLabel])
     if invalid.any():
         raise ValueError(f"Unknown label IDs: {np.unique(labels[invalid]).tolist()}")
+    if label_semantics == "target_position":
+        positions = labels.astype(np.float64) - 1.0
+        if position_mode == "long_only":
+            positions = np.maximum(positions, 0.0)
+        return positions
+
     positions = np.empty(len(labels), dtype=np.float64)
     current = 0.0
     for index, label in enumerate(labels):
@@ -77,6 +87,7 @@ pred_labels_to_target_positions = labels_to_positions
 
 __all__ = [
     "PositionMode",
+    "LabelSemantics",
     "apply_execution_delay",
     "labels_to_positions",
     "position_turnover",

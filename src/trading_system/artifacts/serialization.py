@@ -15,6 +15,13 @@ from typing import Any
 import numpy as np
 
 _CLASS_NAMES = ("Sell", "Hold", "Buy")
+_VALID_CLASS_SCHEMAS = frozenset(
+    {
+        _CLASS_NAMES,
+        ("Short", "Flat", "Long"),
+        ("Skip", "Take"),
+    }
+)
 _ARRAY_MARKER = "__artifact_array__"
 _TUPLE_MARKER = "__artifact_tuple__"
 
@@ -119,8 +126,11 @@ class ArtifactManifest:
         if len(features) != len(set(features)):
             raise ValueError("feature_columns must be unique and ordered.")
         classes = tuple(self.class_names)
-        if classes != _CLASS_NAMES:
-            raise ValueError(f"class_names must equal {_CLASS_NAMES}.")
+        if classes not in _VALID_CLASS_SCHEMAS:
+            raise ValueError(
+                "class_names must use a supported ordered schema: "
+                f"{sorted(_VALID_CLASS_SCHEMAS)!r}."
+            )
 
         model_parameters = to_jsonable(self.model_parameters)
         experiment_parameters = to_jsonable(self.experiment_parameters)

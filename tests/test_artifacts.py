@@ -88,6 +88,12 @@ def test_manifest_validates_hash_schema_and_defensive_metadata():
         make_manifest(class_names=("Hold", "Sell", "Buy"))
 
 
+def test_manifest_accepts_target_position_class_schema():
+    manifest = make_manifest(class_names=("Short", "Flat", "Long"))
+
+    assert manifest.class_names == ("Short", "Flat", "Long")
+
+
 def test_artifact_round_trip_overwrite_and_compatibility(tmp_path):
     destination = tmp_path / "model"
     manifest = make_manifest()
@@ -209,6 +215,16 @@ def test_experiment_artifact_contains_rerun_manifest_and_diagnostics(tmp_path):
         frame, result, dataset_path="data/processed/cac40_daily.parquet"
     )
     assert manifest.experiment_parameters["dataset"]["sha256"] == hash_dataframe(frame)
+    assert manifest.experiment_parameters["label_config"] == {
+        "method": "forward_return",
+        "objective": "absolute_return",
+        "semantics": "action",
+        "parameters": {
+            "horizon": config.forward_horizon,
+            "buy_threshold": config.forward_buy_threshold,
+            "sell_threshold": config.forward_sell_threshold,
+        },
+    }
     assert (
         manifest.experiment_parameters["dataset"]["survivor_bias_warning"]
         == SURVIVOR_BIAS_WARNING

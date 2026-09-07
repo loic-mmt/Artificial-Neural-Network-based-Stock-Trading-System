@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 
 from trading_system.models.base import FitResult, TrainingHistory
-from trading_system.training.weights import compute_class_weights
+from trading_system.training.weights import compute_class_weights, validate_sample_weight
 
 from .config import CommonTrainingConfig
 
@@ -74,6 +74,7 @@ def build_tensor_loader(
     seed: int,
     num_workers: int,
     torch_module: Any,
+    sample_weight: np.ndarray | None = None,
 ) -> Any:
     values = np.asarray(X, dtype=np.float32)
     if values.ndim != 3 or len(values) == 0 or not np.isfinite(values).all():
@@ -90,6 +91,11 @@ def build_tensor_loader(
         tensors.append(torch_module.from_numpy(np.ascontiguousarray(labels)))
     elif shuffle:
         raise ValueError("Unlabeled prediction loaders cannot shuffle.")
+    if sample_weight is not None:
+        if y is None:
+            raise ValueError("Sample weights require labels.")
+        weights = validate_sample_weight(sample_weight, len(values))
+        tensors.append(torch_module.from_numpy(np.ascontiguousarray(weights)))
     if batch_size <= 0 or num_workers < 0 or seed < 0:
         raise ValueError("Invalid loader batch_size, num_workers, or seed.")
     dataset = torch_module.utils.data.TensorDataset(*tensors)
@@ -118,6 +124,19 @@ def build_weighted_cross_entropy(
     return nn_module.CrossEntropyLoss(weight=tensor)
 
 
+def _batch_loss(logits, labels, criterion, sample_weight, torch_module):
+    if sample_weight is None:
+        return criterion(logits, labels), float(len(labels))
+    effective = sample_weight * criterion.weight[labels]
+    denominator = effective.sum()
+    if float(denominator.item()) == 0:
+        return None, 0.0
+    losses = torch_module.nn.functional.cross_entropy(
+        logits, labels, weight=criterion.weight, reduction="none"
+    )
+    return (losses * sample_weight).sum() / denominator, float(denominator.item())
+
+
 def train_one_epoch(
     model: Any,
     loader: Any,
@@ -131,12 +150,16 @@ def train_one_epoch(
     model.train()
     total_loss = 0.0
     total_samples = 0
-    for features, labels in loader:
+    for batch in loader:
+        features, labels = batch[:2]
+        sample_weight = batch[2].to(device) if len(batch) == 3 else None
         features = features.to(device)
         labels = labels.to(device)
         optimizer.zero_grad(set_to_none=True)
         logits = model(features)
-        loss = criterion(logits, labels)
+        loss, mass = _batch_loss(logits, labels, criterion, sample_weight, torch_module)
+        if loss is None:
+            continue
         if not bool(torch_module.isfinite(loss).item()):
             raise FloatingPointError("Training produced a non-finite loss.")
         loss.backward()
@@ -145,9 +168,8 @@ def train_one_epoch(
                 model.parameters(), gradient_clip_norm
             )
         optimizer.step()
-        batch_size = int(len(features))
-        total_loss += float(loss.detach().item()) * batch_size
-        total_samples += batch_size
+        total_loss += float(loss.detach().item()) * mass
+        total_samples += mass
     if total_samples == 0:
         raise ValueError("Training loader is empty.")
     return total_loss / total_samples
@@ -165,15 +187,18 @@ def evaluate_loss(
     total_loss = 0.0
     total_samples = 0
     with torch_module.no_grad():
-        for features, labels in loader:
+        for batch in loader:
+            features, labels = batch[:2]
+            sample_weight = batch[2].to(device) if len(batch) == 3 else None
             features = features.to(device)
             labels = labels.to(device)
-            loss = criterion(model(features), labels)
+            loss, mass = _batch_loss(model(features), labels, criterion, sample_weight, torch_module)
+            if loss is None:
+                continue
             if not bool(torch_module.isfinite(loss).item()):
                 raise FloatingPointError("Validation produced a non-finite loss.")
-            batch_size = int(len(features))
-            total_loss += float(loss.item()) * batch_size
-            total_samples += batch_size
+            total_loss += float(loss.item()) * mass
+            total_samples += mass
     if total_samples == 0:
         raise ValueError("Validation loader is empty.")
     return total_loss / total_samples
@@ -196,8 +221,14 @@ def fit_torch_model(
     *,
     num_classes: int,
     config: CommonTrainingConfig,
+    sample_weight: np.ndarray | None = None,
+    sample_weight_val: np.ndarray | None = None,
 ) -> FitResult:
     started = perf_counter()
+    if (X_val is None) != (y_val is None):
+        raise ValueError("X_val and y_val must be supplied together.")
+    if sample_weight_val is not None and X_val is None:
+        raise ValueError("sample_weight_val requires validation data.")
     torch_module, nn_module = require_torch()
     device = resolve_device(config.device, torch_module)
     seed_torch_run(config.seed, config.deterministic, torch_module)
@@ -210,6 +241,7 @@ def fit_torch_model(
         seed=config.seed,
         num_workers=config.num_workers,
         torch_module=torch_module,
+        sample_weight=sample_weight,
     )
     validation_loader = None
     if X_val is not None and y_val is not None:
@@ -221,6 +253,7 @@ def fit_torch_model(
             seed=config.seed,
             num_workers=config.num_workers,
             torch_module=torch_module,
+            sample_weight=sample_weight_val,
         )
     criterion = build_weighted_cross_entropy(
         y_train, num_classes, device, torch_module, nn_module

@@ -15,17 +15,20 @@ from trading_system.features.market import (
     MARKET_FEATURE_COLUMNS,
     compute_market_features,
 )
+from trading_system.features.fracdiff import FRACDIFF_FEATURE, FracDiffTransformer
+from trading_system.features.expanded import compute_expanded_features, feature_columns as expanded_columns, ExpandedFeatureSelector
+from trading_system.training.sample_weighting import prepare_sample_weights
+from trading_system.training.overfitting import (
+    TrainOnlyFeatureSelector,
+    apply_overfitting_profile,
+)
 from trading_system.features.technical import (
     TECHNICAL_FEATURE_COLUMNS,
     compute_technical_features,
 )
-from trading_system.labels.breakout import (
-    generate_breakout_labels,
-    generate_breakout_labels_by_ticker,
-    label_statistics,
-)
-from trading_system.labels.forward_return import build_forward_return_labels
+from trading_system.labels.config import LabelConfig
 from trading_system.labels.oracle_dp import build_oracle_labels_train_only
+from trading_system.labels.registry import LabelContext, create_default_label_registry
 from trading_system.models.base import (
     FitResult,
     ProbabilisticClassifier,
@@ -51,6 +54,10 @@ class TrainedModelBundle:
     feature_fill_values: pd.Series
     fit_result: FitResult
     model_selection: ModelSelection
+    fracdiff_transformer: FracDiffTransformer | None = None
+    sample_weight_state: dict | None = None
+    feature_selector: ExpandedFeatureSelector | None = None
+    overfitting_selector: TrainOnlyFeatureSelector | None = None
 
     def predict_proba(self, raw_windows: np.ndarray) -> np.ndarray:
         values = np.asarray(raw_windows, dtype=np.float32)
@@ -205,35 +212,19 @@ def _group_apply(
 
 
 def _apply_labels(frame: pd.DataFrame, config: ExperimentConfig) -> pd.DataFrame:
-    if config.label_mode == "breakout":
-        if config.universe == "multi":
-            return generate_breakout_labels_by_ticker(
-                frame,
-                config.label_window,
-                price_col=config.price_col,
-                group_col=config.group_col,
-                date_col=config.date_col,
-            )
-        return generate_breakout_labels(
+    label_config = config.resolved_label_config()
+    if label_config is not None:
+        result = create_default_label_registry().generate(
             frame,
-            config.label_window,
-            price_col=config.price_col,
-            date_col=config.date_col,
-        )
-
-    if config.label_mode == "forward_return":
-        return _group_apply(
-            frame,
-            config,
-            lambda group: build_forward_return_labels(
-                group,
+            label_config,
+            LabelContext(
                 price_col=config.price_col,
-                horizon=config.forward_horizon,
-                buy_threshold=config.forward_buy_threshold,
-                sell_threshold=config.forward_sell_threshold,
                 date_col=config.date_col,
-            )[0],
+                group_col=config.group_col if config.universe == "multi" else None,
+            ),
         )
+        result.frame["_label_known"] = result.known_mask
+        return result.frame
 
     if config.label_mode == "oracle_all":
         return _group_apply(
@@ -248,22 +239,20 @@ def _apply_labels(frame: pd.DataFrame, config: ExperimentConfig) -> pd.DataFrame
         )
 
     # Oracle train-only uses ordinary breakout labels for validation and test.
-    breakout = (
-        generate_breakout_labels_by_ticker(
-            frame,
-            config.label_window,
-            price_col=config.price_col,
-            group_col=config.group_col,
-            date_col=config.date_col,
-        )
-        if config.universe == "multi"
-        else generate_breakout_labels(
-            frame,
-            config.label_window,
+    breakout = create_default_label_registry().generate(
+        frame,
+        LabelConfig.breakout(
+            window=config.label_window,
+            buy_buffer=config.breakout_buy_buffer,
+            sell_buffer=config.breakout_sell_buffer,
+            alternating=config.breakout_alternating,
+        ),
+        LabelContext(
             price_col=config.price_col,
             date_col=config.date_col,
-        )
-    )
+            group_col=config.group_col if config.universe == "multi" else None,
+        ),
+    ).frame
     if "_experiment_split" not in breakout:
         raise ValueError("Oracle train-only labels require frozen split boundaries.")
     train_mask = breakout["_experiment_split"] == "train"
@@ -287,7 +276,10 @@ def _build_features(
     labeled: pd.DataFrame,
     config: ExperimentConfig,
 ) -> tuple[pd.DataFrame, tuple[str, ...]]:
-    if config.feature_set == "technical":
+    if config.feature_set == "expanded":
+        featured = compute_expanded_features(labeled, group_col=config.group_col, date_col=config.date_col)
+        columns = expanded_columns(config.expanded_feature_groups)
+    elif config.feature_set == "technical":
         featured = compute_technical_features(
             labeled,
             group_col=config.group_col if config.universe == "multi" else None,
@@ -322,6 +314,10 @@ def _prepare_splits(
     *,
     include_test: bool = False,
     fill_values: pd.Series | None = None,
+    fracdiff_transformer: FracDiffTransformer | None = None,
+    feature_selector: ExpandedFeatureSelector | None = None,
+    overfitting_selector: TrainOnlyFeatureSelector | None = None,
+    overfitting_supervised: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, tuple[str, ...]]:
     """Freeze raw split boundaries before labels/features; withhold test by default."""
 
@@ -339,30 +335,47 @@ def _prepare_splits(
         split = split.copy()
         split["_experiment_split"] = name
         split["_label_known"] = True
-        if config.label_mode == "forward_return":
-            # Exclude targets whose future price belongs to another partition,
-            # but keep their feature rows as chronological context.
-            groups = (
-                split.groupby(config.group_col, sort=False, dropna=False)
-                if config.universe == "multi"
-                else [(None, split)]
-            )
-            for _, group in groups:
-                unknown = group.tail(config.forward_horizon).index
-                split.loc[unknown, "_label_known"] = False
         parts.append(split)
     source = pd.concat(parts, ignore_index=True)
     labeled = _apply_labels(source, config)
+    if config.fracdiff is not None:
+        if fracdiff_transformer is None:
+            raise ValueError("Enabled FracDiff requires an explicit fitted/fittable transformer.")
+        if not fracdiff_transformer.groups:
+            if include_test:
+                raise ValueError("Final evaluation cannot fit FracDiff.")
+            fracdiff_transformer.fit(raw_splits[0])
+        labeled = fracdiff_transformer.transform(labeled)
     featured, columns = _build_features(labeled, config)
+    if config.fracdiff is not None:
+        columns = (*columns, FRACDIFF_FEATURE)
     train, val, test = (
         featured.loc[featured["_experiment_split"] == name].copy()
         for name in ("train", "val", "test")
     )
-    train = train.dropna(subset=[*columns, "Label_id"]).copy()
+    if config.feature_set == "expanded":
+        train = train.dropna(subset=["ret_20", "Label_id", *([FRACDIFF_FEATURE] if config.fracdiff else [])]).copy()
+        if feature_selector is None:
+            raise ValueError("Expanded features require a fitted/fittable selector.")
+        if feature_selector.state is None:
+            if include_test:
+                raise ValueError("Final evaluation cannot fit feature selection.")
+            feature_selector.fit(train, columns)
+        columns = feature_selector.columns
+    else:
+        train = train.dropna(subset=[*columns, "Label_id"]).copy()
     if train.empty:
         raise ValueError("No training rows remain after feature NaN removal.")
+    if overfitting_selector is not None:
+        if overfitting_selector.state is None:
+            if include_test:
+                raise ValueError("Final evaluation cannot fit overfitting feature selection.")
+            overfitting_selector.fit(train, columns, supervised=overfitting_supervised)
+        columns = overfitting_selector.columns
     if fill_values is None:
         fill_values = train[list(columns)].median(numeric_only=True).fillna(0.0)
+    if config.feature_set == "expanded":
+        train.loc[:, columns] = train[list(columns)].fillna(fill_values)
     for split in (val, test):
         split.loc[:, columns] = split[list(columns)].fillna(fill_values).fillna(0.0)
     if val.empty or (include_test and test.empty):
@@ -399,7 +412,7 @@ def _build_split_windows(
     if labels.ndim != 1 or not (len(labels) == len(sequences) == len(aligned)):
         raise RuntimeError("Sequences, labels and backtest rows are misaligned.")
     if (labels < 0).any() or (labels >= 3).any():
-        raise ValueError("Labels must use Sell/Hold/Buy IDs 0, 1 and 2.")
+        raise ValueError("Labels must use the configured class IDs 0, 1 and 2.")
     return sequences, labels, aligned
 
 
@@ -414,7 +427,10 @@ def _resolve_sequence_estimator(
     """Return a classifier accepting canonical ``(N, T, F)`` inputs."""
 
     if model is None:
-        selection = model_selection or config.model
+        selection = apply_overfitting_profile(
+            model_selection or config.model,
+            config.overfitting_control,
+        )
         context = ModelBuildContext(
             input_size=feature_count,
             context_len=config.context_len,
@@ -466,7 +482,23 @@ def run_validation_experiment(
     """Fit and calibrate using training/validation only, leaving test untouched."""
 
     work = _filter_universe(frame, config)
-    train, val, test, fill_values, feature_columns = _prepare_splits(work, config)
+    feature_selector = ExpandedFeatureSelector(config.expanded_min_coverage) if config.feature_set == "expanded" else None
+    overfitting_selector = (
+        TrainOnlyFeatureSelector(config.overfitting_control)
+        if config.overfitting_control is not None
+        else None
+    )
+    fracdiff_transformer = (
+        FracDiffTransformer(config.fracdiff, price_col=config.price_col,
+                            date_col=config.date_col,
+                            group_col=config.group_col if config.universe == "multi" else None)
+        if config.fracdiff is not None else None
+    )
+    train, val, test, fill_values, feature_columns = _prepare_splits(
+        work, config, fracdiff_transformer=fracdiff_transformer,
+        feature_selector=feature_selector,
+        overfitting_selector=overfitting_selector,
+    )
     del work
     X_train_raw, y_train, aligned_train = _build_split_windows(
         train, feature_columns, config
@@ -480,9 +512,17 @@ def run_validation_experiment(
         raise ValueError("Training and validation require observed label targets.")
     X_train_raw = _select_label_rows(X_train_raw, train_mask)
     y_train = _select_label_rows(y_train, train_mask)
-    labels_summary = label_statistics(
-        pd.concat([train.loc[train["_label_known"]], val.loc[val["_label_known"]]])
+    weight_arguments, sample_weight_state = prepare_sample_weights(
+        aligned_train.loc[train_mask], aligned_val.loc[val_mask], config.sample_weighting,
+        date_col=config.date_col, group_col=config.group_col if config.universe == "multi" else None,
     )
+    known_labels = pd.concat(
+        [train.loc[train["_label_known"]], val.loc[val["_label_known"]]]
+    )["Label"]
+    counts = known_labels.value_counts()
+    labels_summary = {
+        name: int(counts.get(name, 0)) for name in config.resolved_class_names()
+    }
 
     split_sizes = {
         "train": len(train),
@@ -526,6 +566,7 @@ def run_validation_experiment(
         y_train,
         X_val=_select_label_rows(X_val, val_mask),
         y_val=_select_label_rows(y_val, val_mask),
+        **weight_arguments,
     )
     if not isinstance(fit_result, FitResult):
         raise TypeError("model.fit() must return a FitResult.")
@@ -554,8 +595,9 @@ def run_validation_experiment(
         initial_capital=config.initial_capital,
         price_col=config.price_col,
         fee_per_trade=config.fee_per_trade,
-        position_mode=config.position_mode,
+        position_mode=config.resolved_backtest_position_mode(),
         execution_delay=config.execution_delay,
+        label_semantics=config.resolved_label_semantics(),
         group_col=config.group_col if config.universe == "multi" else None,
         date_col=config.date_col,
     )
@@ -568,6 +610,10 @@ def run_validation_experiment(
         feature_fill_values=fill_values.copy(),
         fit_result=fit_result,
         model_selection=resolved_selection,
+        fracdiff_transformer=fracdiff_transformer,
+        sample_weight_state=sample_weight_state,
+        feature_selector=feature_selector,
+        overfitting_selector=overfitting_selector,
     )
     return ValidationResult(
         bundle=bundle,
@@ -602,6 +648,9 @@ def evaluate_experiment_test(
         config,
         include_test=True,
         fill_values=bundle.feature_fill_values,
+        fracdiff_transformer=bundle.fracdiff_transformer,
+        feature_selector=bundle.feature_selector,
+        overfitting_selector=bundle.overfitting_selector,
     )
     if columns != bundle.feature_columns:
         raise ValueError("Test feature columns differ from the fitted bundle.")
@@ -622,8 +671,9 @@ def evaluate_experiment_test(
         initial_capital=config.initial_capital,
         price_col=config.price_col,
         fee_per_trade=config.fee_per_trade,
-        position_mode=config.position_mode,
+        position_mode=config.resolved_backtest_position_mode(),
         execution_delay=config.execution_delay,
+        label_semantics=config.resolved_label_semantics(),
         group_col=config.group_col if config.universe == "multi" else None,
         date_col=config.date_col,
     )

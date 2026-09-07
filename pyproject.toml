@@ -15,6 +15,7 @@ dependencies = [
     "matplotlib",
     "TA-Lib",
     "yfinance",
+    "vaderSentiment==3.3.2",
     "plotly",
     "ccxt",
     "scipy",
