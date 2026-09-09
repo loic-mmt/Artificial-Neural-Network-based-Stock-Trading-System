@@ -73,6 +73,8 @@ def _split_boundaries(frame: pd.DataFrame, result: ExperimentResult) -> dict[str
         group_col=group_col,
         date_col=config.date_col,
     )
+    if config.purged_split is not None:
+        splits = config.purged_split.split(work, config.date_col)
     output: dict[str, Any] = {}
     for name, split in zip(("train", "val", "test"), splits):
         if group_col is None:
@@ -142,6 +144,7 @@ def build_experiment_manifest(
         "split_boundaries": _split_boundaries(frame, result),
         "split_sizes_after_features": dict(result.split_sizes),
         "sample_weight_state": result.bundle.sample_weight_state,
+        "purging": result.bundle.purging_state,
         "feature_sources": frame.attrs.get("feature_sources"),
         "feature_selection": result.bundle.feature_selector.state_dict() if result.bundle.feature_selector else None,
         "overfitting_feature_selection": (

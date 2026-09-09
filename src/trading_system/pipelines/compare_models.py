@@ -25,6 +25,7 @@ from .label_arguments import (
 )
 from .feature_arguments import add_feature_arguments, apply_feature_arguments, apply_feature_sources
 from .training_arguments import add_weight_arguments, apply_weight_arguments
+from .cv_arguments import add_cv_arguments, validate_cv_arguments, execute_cv
 from .overfitting_arguments import (
     add_overfitting_arguments,
     overfitting_config_from_args,
@@ -129,6 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_label_arguments(parser)
     add_feature_arguments(parser)
     add_weight_arguments(parser)
+    add_cv_arguments(parser)
     add_overfitting_arguments(parser)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="cpu")
     parser.add_argument("--output-dir", type=Path)
@@ -165,6 +167,7 @@ def _parameter_sets(
 
 def main(argv: list[str] | None = None):
     args = build_parser().parse_args(argv)
+    validate_cv_arguments(args)
     registry = create_default_model_registry()
     unknown = sorted(set(args.models) - set(registry.names()))
     if unknown:
@@ -208,6 +211,8 @@ def main(argv: list[str] | None = None):
     )
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_dir = args.output_dir or comparisons_dir() / stamp
+    if args.cv_folds is not None:
+        return execute_cv(frame, config, parameter_sets, args, output_dir)
     result = run_model_comparison(
         frame,
         config,

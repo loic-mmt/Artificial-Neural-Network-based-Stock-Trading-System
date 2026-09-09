@@ -11,6 +11,7 @@ from trading_system.training.sample_weighting import SampleWeightConfig
 from trading_system.models.manual_ann.manual_nn import ManualANNConfig
 from trading_system.models.specs import ModelSelection
 from trading_system.training.overfitting import OverfittingControlConfig
+from trading_system.data.purged_cv import PurgedSplit
 
 UniverseMode = Literal["single", "multi"]
 FeatureSet = Literal["technical", "market", "expanded"]
@@ -84,8 +85,15 @@ class ExperimentConfig:
     expanded_feature_groups: tuple[str, ...] = DEFAULT_GROUPS
     expanded_min_coverage: float = 0.5
     overfitting_control: OverfittingControlConfig | None = None
+    purged_split: PurgedSplit | None = None
 
     def __post_init__(self) -> None:
+        if isinstance(self.purged_split, dict):
+            object.__setattr__(self, "purged_split", PurgedSplit(**self.purged_split))
+        if self.purged_split is not None and not isinstance(self.purged_split, PurgedSplit):
+            raise TypeError("purged_split must be PurgedSplit or None.")
+        if self.purged_split is not None and self.label_mode.startswith("oracle"):
+            raise ValueError("Oracle labels cannot be used for purged CV.")
         if isinstance(self.overfitting_control, dict):
             object.__setattr__(
                 self,

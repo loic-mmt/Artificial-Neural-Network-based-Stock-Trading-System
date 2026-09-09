@@ -90,7 +90,15 @@ def run_position_validation(frame, config, loss_config):
     del work
     X_train, _, aligned_train = _build_split_windows(train, columns, config)
     X_val, _, aligned_val = _build_split_windows(val, columns, config, train)
+    purging_state = train.attrs.get("purging")
     del train, val
+    if config.purged_split is not None:
+        # Direct return losses have one-step price targets. Exclude the gap from
+        # their paths, retaining its feature rows only as later causal context.
+        train_mask = ~aligned_train["_cv_gap"].to_numpy(dtype=bool)
+        val_mask = ~aligned_val["_cv_gap"].to_numpy(dtype=bool)
+        X_train, aligned_train = X_train[train_mask], aligned_train.loc[train_mask].copy()
+        X_val, aligned_val = X_val[val_mask], aligned_val.loc[val_mask].copy()
     train_panel, val_panel = _panel(aligned_train, config), _panel(aligned_val, config)
     known = aligned_train["_label_known"].to_numpy(dtype=bool)
     if not known.any():
@@ -108,7 +116,7 @@ def run_position_validation(frame, config, loss_config):
     metrics = val_panel.metrics(positions, loss_config, config.initial_capital)
     bundle = TrainedModelBundle(model, scaler, columns, config.context_len, DecisionPolicy(mode="argmax"),
                                 fills.copy(), fit, selection, fracdiff, None, selector,
-                                overfitting_selector)
+                                overfitting_selector, purging_state)
     return PositionValidation(bundle, config, loss_config, metrics)
 
 
@@ -121,6 +129,8 @@ def evaluate_position_test(frame, validation):
         _filter_universe(frame, config), config, include_test=True,
         fill_values=bundle.feature_fill_values, fracdiff_transformer=bundle.fracdiff_transformer,
         feature_selector=bundle.feature_selector,
+        overfitting_selector=bundle.overfitting_selector,
+        overfitting_supervised=validation.loss_config.objective == "cross_entropy",
     )
     if columns != bundle.feature_columns:
         raise ValueError("Final-test features differ from frozen training columns.")
@@ -156,6 +166,7 @@ def save_position_artifact(destination, frame, validation):
         ),
         "fracdiff_state": bundle.fracdiff_transformer.state_dict() if bundle.fracdiff_transformer else None,
         "sample_weight_state": bundle.sample_weight_state,
+        "purging": bundle.purging_state,
     }
     parameters = _nullable_metadata(parameters)
     decision = {"position_decoder": "probability_expectation", "position_mode": config.resolved_backtest_position_mode(),
@@ -200,6 +211,6 @@ def load_position_artifact(source):
     bundle = TrainedModelBundle(model, scaler, manifest.feature_columns, manifest.context_len,
                                 DecisionPolicy(**manifest.decision_parameters["legacy_policy"]), fills, fit,
                                 selection, fracdiff, parameters["sample_weight_state"], selector,
-                                overfitting_selector)
+                                overfitting_selector, parameters.get("purging"))
     return PositionValidation(bundle, config, FinancialLossConfig(**parameters["loss_config"]),
                               diagnostics["metrics"]["validation"], diagnostics["metrics"]["legacy_validation"])

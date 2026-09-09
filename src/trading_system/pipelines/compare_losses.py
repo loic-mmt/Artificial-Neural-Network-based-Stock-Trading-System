@@ -21,6 +21,8 @@ from .compare_models import build_parser as model_parser, PRESETS, _parameter_se
 from .feature_arguments import apply_feature_arguments, apply_feature_sources
 from .label_arguments import apply_label_arguments
 from .training_arguments import apply_weight_arguments
+from .cv_arguments import validate_cv_arguments, execute_cv
+from .overfitting_arguments import overfitting_config_from_args
 
 
 def build_parser():
@@ -62,6 +64,7 @@ def select_candidates(rows, seeds, metric):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    validate_cv_arguments(args)
     if len(set(args.losses)) != len(args.losses):
         raise ValueError("--losses must be unique.")
     if args.final_test and args.no_run_artifacts:
@@ -69,6 +72,7 @@ def main(argv=None):
     loss_configs = [FinancialLossConfig(name, args.loss_cost_bps, args.loss_annualization, args.loss_sharpe_epsilon) for name in args.losses]
     config = replace(PRESETS[args.preset], device=args.device)
     config = apply_weight_arguments(apply_feature_arguments(apply_label_arguments(config, args), args), args)
+    config = replace(config, overfitting_control=overfitting_config_from_args(args))
     config = replace(config, **{name: getattr(args, name) for name in
                                ("context_len", "train_ratio", "val_ratio", "position_mode", "execution_delay")
                                if getattr(args, name) is not None})
@@ -93,6 +97,8 @@ def main(argv=None):
         print(warning)
     target = args.output_dir or comparisons_dir() / ("losses-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
     target = target.expanduser().resolve()
+    if args.cv_folds is not None:
+        return execute_cv(frame, config, parameter_sets, args, target, loss_configs=loss_configs)
     if target.exists():
         raise FileExistsError(f"Objective comparison output already exists: {target}")
     target.mkdir(parents=True)

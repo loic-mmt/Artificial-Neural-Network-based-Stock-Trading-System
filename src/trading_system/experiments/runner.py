@@ -58,6 +58,7 @@ class TrainedModelBundle:
     sample_weight_state: dict | None = None
     feature_selector: ExpandedFeatureSelector | None = None
     overfitting_selector: TrainOnlyFeatureSelector | None = None
+    purging_state: dict | None = None
 
     def predict_proba(self, raw_windows: np.ndarray) -> np.ndarray:
         values = np.asarray(raw_windows, dtype=np.float32)
@@ -321,13 +322,16 @@ def _prepare_splits(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, tuple[str, ...]]:
     """Freeze raw split boundaries before labels/features; withhold test by default."""
 
-    raw_splits = chronological_train_val_test_split(
-        frame,
-        train_ratio=config.train_ratio,
-        val_ratio=config.val_ratio,
-        group_col=config.group_col if config.universe == "multi" else None,
-        date_col=config.date_col,
-    )
+    if config.purged_split is not None:
+        raw_splits = config.purged_split.split(frame, config.date_col)
+    else:
+        raw_splits = chronological_train_val_test_split(
+            frame,
+            train_ratio=config.train_ratio,
+            val_ratio=config.val_ratio,
+            group_col=config.group_col if config.universe == "multi" else None,
+            date_col=config.date_col,
+        )
     parts = []
     for name, split in zip(("train", "val", "test"), raw_splits):
         if name == "test" and not include_test:
@@ -338,13 +342,21 @@ def _prepare_splits(
         parts.append(split)
     source = pd.concat(parts, ignore_index=True)
     labeled = _apply_labels(source, config)
+    if config.purged_split is not None:
+        from .purging import purge_labeled_splits
+        labeled = purge_labeled_splits(source, labeled, config)
     if config.fracdiff is not None:
         if fracdiff_transformer is None:
             raise ValueError("Enabled FracDiff requires an explicit fitted/fittable transformer.")
         if not fracdiff_transformer.groups:
             if include_test:
                 raise ValueError("Final evaluation cannot fit FracDiff.")
-            fracdiff_transformer.fit(raw_splits[0])
+            fracdiff_train = raw_splits[0]
+            if config.purged_split is not None:
+                # ADF needs consecutive observations, not a series compressed by
+                # an event-label mask. Only the pre-validation gap is withheld.
+                fracdiff_train = labeled.loc[labeled["_experiment_split"].eq("train") & ~labeled["_cv_gap"]]
+            fracdiff_transformer.fit(fracdiff_train)
         labeled = fracdiff_transformer.transform(labeled)
     featured, columns = _build_features(labeled, config)
     if config.fracdiff is not None:
@@ -360,7 +372,7 @@ def _prepare_splits(
         if feature_selector.state is None:
             if include_test:
                 raise ValueError("Final evaluation cannot fit feature selection.")
-            feature_selector.fit(train, columns)
+            feature_selector.fit(train.loc[train["_fit_eligible"]] if config.purged_split else train, columns)
         columns = feature_selector.columns
     else:
         train = train.dropna(subset=[*columns, "Label_id"]).copy()
@@ -370,10 +382,13 @@ def _prepare_splits(
         if overfitting_selector.state is None:
             if include_test:
                 raise ValueError("Final evaluation cannot fit overfitting feature selection.")
-            overfitting_selector.fit(train, columns, supervised=overfitting_supervised)
+            overfitting_selector.fit(train.loc[train["_fit_eligible"]] if config.purged_split else train, columns, supervised=overfitting_supervised)
         columns = overfitting_selector.columns
     if fill_values is None:
-        fill_values = train[list(columns)].median(numeric_only=True).fillna(0.0)
+        fit_frame = train.loc[train["_fit_eligible"]] if config.purged_split else train
+        if fit_frame.empty:
+            raise ValueError("Purging leaves no eligible preprocessing rows.")
+        fill_values = fit_frame[list(columns)].median(numeric_only=True).fillna(0.0)
     if config.feature_set == "expanded":
         train.loc[:, columns] = train[list(columns)].fillna(fill_values)
     for split in (val, test):
@@ -499,6 +514,7 @@ def run_validation_experiment(
         feature_selector=feature_selector,
         overfitting_selector=overfitting_selector,
     )
+    purging_state = train.attrs.get("purging")
     del work
     X_train_raw, y_train, aligned_train = _build_split_windows(
         train, feature_columns, config
@@ -614,6 +630,7 @@ def run_validation_experiment(
         sample_weight_state=sample_weight_state,
         feature_selector=feature_selector,
         overfitting_selector=overfitting_selector,
+        purging_state=purging_state,
     )
     return ValidationResult(
         bundle=bundle,

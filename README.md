@@ -223,6 +223,14 @@ The previous cross-entropy trainer and discrete backtest remain available unchan
 the new report also compares every loss using the same continuous position decoder.
 See [financial loss definitions, comparison and final-test protocol](docs/financial-loss.md).
 
+## Optional purged cross-validation
+
+Optional nested purged cross-validation: add `--cv-folds 3 --cv-gap-bars 5` to
+`scripts/run_model_comparison.py` or `scripts/run_loss_comparison.py`. Selection
+uses all outer folds/seeds; final test stays sealed unless `--cv-final-test` is
+supplied. Omit these flags to retain the previous workflow. See
+[purging, embargo semantics and comparison protocol](docs/purged-cv.md).
+
 ## Inspiration
 
 This repository contains my personal implementation inspired by the paper  
