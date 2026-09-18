@@ -86,7 +86,7 @@ def _diagnostics(values: np.ndarray, original: np.ndarray) -> dict:
         return {"adf_pvalue": None, "correlation": None, "status": "constant"}
     from statsmodels.tsa.stattools import adfuller
     try:
-        result = adfuller(values, regression="c", autolag="AIC")
+        result = adfuller(values, regression="c", autolag="AIC", result_object=False)
         pvalue = float(result[1])
         correlation = (
             float(np.corrcoef(values, original)[0, 1]) if np.std(original) > 0 else None
