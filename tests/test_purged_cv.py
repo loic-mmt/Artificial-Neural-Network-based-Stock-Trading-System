@@ -131,10 +131,29 @@ def test_cv_selects_only_complete_candidates_before_final_test(tmp_path, monkeyp
     original_eval = search.evaluate_experiment_test
     target = tmp_path / "cv"
     final_calls = []
-    def fit(frame, cfg):
+    progress_calls = []
+    progress_updates = []
+
+    class FakeProgress:
+        def __init__(self, items):
+            self.items = list(items)
+
+        def __iter__(self):
+            return iter(self.items)
+
+        def set_postfix_str(self, *args, **kwargs):
+            progress_updates.append(args[0])
+            return None
+
+    def progress(items, **kwargs):
+        wrapped = FakeProgress(items)
+        progress_calls.append((len(wrapped.items), kwargs))
+        return wrapped
+
+    def fit(frame, cfg, **kwargs):
         if cfg.model.parameters["hidden_size"] == 5:
             raise ValueError("Synthetic candidate failure")
-        return original_fit(frame, cfg)
+        return original_fit(frame, cfg, **kwargs)
     def evaluate(frame, validation):
         if len(frame) == 280:
             selected = json.loads((target / "selection.json").read_text())["metadata"]["selected"]
@@ -144,8 +163,11 @@ def test_cv_selects_only_complete_candidates_before_final_test(tmp_path, monkeyp
         return original_eval(frame, validation)
     monkeypatch.setattr(search, "run_validation_experiment", fit)
     monkeypatch.setattr(search, "evaluate_experiment_test", evaluate)
+    monkeypatch.setattr(search, "tqdm", progress)
     result = search.run_purged_cv(prices(), config(), {"manual_ann": [{"epochs": 1, "hidden_size": 4}, {"epochs": 1, "hidden_size": 5}]},
                                   [1, 2], target, n_splits=2, final_test=True)
+    assert progress_calls == [(8, {"desc": "CV trainings", "unit": "fit", "dynamic_ncols": True, "disable": None})]
+    assert any("tr=" in update and "va=" in update for update in progress_updates)
     assert len(final_calls) == 2
     assert len(result["final_test"]) == 2
     assert sum(row["complete"] for row in result["summary"]) == 1

@@ -21,6 +21,7 @@ from .config import ExperimentConfig
 from .runner import (
     TrainedModelBundle, _filter_universe, _prepare_splits, _build_split_windows,
     _resolve_sequence_estimator, _select_label_rows, run_validation_experiment,
+    _report_sequence_memory,
 )
 
 
@@ -43,6 +44,34 @@ def _panel(frame, config):
                        execution_delay=config.execution_delay)
 
 
+def _align_position_calendar(frame, config):
+    """Keep only dates observed for every asset in a multi-asset portfolio.
+
+    Financial objectives aggregate simultaneous asset returns, so incomplete
+    dates cannot be retained without either inventing prices or changing the
+    portfolio composition.  The intersection is deterministic and is applied
+    before splitting, feature fitting, or label generation.
+    """
+    if config.universe != "multi":
+        return frame
+    work = frame.copy()
+    dates = pd.to_datetime(work[config.date_col], utc=True, errors="raise")
+    keys = pd.DataFrame({"asset": work[config.group_col].to_numpy(),
+                         "date": dates.to_numpy()}, index=work.index)
+    if keys.duplicated(["asset", "date"]).any():
+        raise ValueError("Position comparisons require unique dates per asset.")
+    asset_count = work[config.group_col].nunique()
+    if asset_count == 0:
+        raise ValueError("Position comparisons require at least one asset.")
+    coverage = keys.groupby("date", sort=False)["asset"].nunique()
+    common_dates = coverage.index[coverage.eq(asset_count)]
+    aligned = work.loc[dates.isin(common_dates)].copy()
+    if aligned.empty:
+        raise ValueError("Position comparisons have no common asset calendar.")
+    aligned.attrs.update(frame.attrs)
+    return aligned
+
+
 def _validate_config(frame, config, loss_config):
     if config.evaluation_mode != "static":
         raise ValueError("Position objectives currently support static chronological experiments only.")
@@ -61,14 +90,17 @@ def _validate_config(frame, config, loss_config):
             dates = current
 
 
-def run_position_validation(frame, config, loss_config):
+def run_position_validation(frame, config, loss_config, *, progress_callback=None):
     """Fit on train, select checkpoint on validation; never construct test returns."""
     work = _filter_universe(frame, config)
+    work = _align_position_calendar(work, config)
     _validate_config(work, config, loss_config)
     if loss_config.objective == "cross_entropy":
         # Preserve the previous trainer, class/sample weights, calibration and
         # legacy cash-fee backtest exactly; add a common continuous evaluation.
-        legacy = run_validation_experiment(work, config)
+        legacy = run_validation_experiment(
+            work, config, progress_callback=progress_callback
+        )
         panel = _panel(legacy.aligned_val_frame, config)
         positions = probabilities_to_positions(legacy.val_probabilities, config.resolved_backtest_position_mode())
         return PositionValidation(legacy.bundle, config, loss_config,
@@ -99,6 +131,10 @@ def run_position_validation(frame, config, loss_config):
         val_mask = ~aligned_val["_cv_gap"].to_numpy(dtype=bool)
         X_train, aligned_train = X_train[train_mask], aligned_train.loc[train_mask].copy()
         X_val, aligned_val = X_val[val_mask], aligned_val.loc[val_mask].copy()
+    if progress_callback is not None:
+        _report_sequence_memory(
+            (("train", X_train), ("val", X_val)), progress_callback
+        )
     train_panel, val_panel = _panel(aligned_train, config), _panel(aligned_val, config)
     known = aligned_train["_label_known"].to_numpy(dtype=bool)
     if not known.any():
@@ -125,8 +161,9 @@ def evaluate_position_test(frame, validation):
     if validation.test_evaluated:
         raise ValueError("Final test already evaluated for this position result.")
     config, bundle = validation.config, validation.bundle
+    work = _align_position_calendar(_filter_universe(frame, config), config)
     train, val, test, _, columns = _prepare_splits(
-        _filter_universe(frame, config), config, include_test=True,
+        work, config, include_test=True,
         fill_values=bundle.feature_fill_values, fracdiff_transformer=bundle.fracdiff_transformer,
         feature_selector=bundle.feature_selector,
         overfitting_selector=bundle.overfitting_selector,

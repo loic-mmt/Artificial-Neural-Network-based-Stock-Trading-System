@@ -486,6 +486,31 @@ def _select_label_rows(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return values[mask]
 
 
+def _report_sequence_memory(arrays, progress_callback=None) -> dict:
+    """Report sequence allocation details to a callback or the standalone CLI."""
+
+    diagnostics = {
+        name: {
+            "shape": tuple(int(value) for value in array.shape),
+            "dtype": str(array.dtype),
+            "gib": float(array.nbytes / 1024**3),
+        }
+        for name, array in arrays
+    }
+    if progress_callback is not None:
+        progress_callback(diagnostics)
+        return diagnostics
+
+    print("\n=== SEQUENCE MEMORY ===")
+    for name, values in diagnostics.items():
+        print(
+            f"{name:5s}: shape={values['shape']}, dtype={values['dtype']}, "
+            f"size={values['gib']:.3f} GiB"
+        )
+    print("=======================\n")
+    return diagnostics
+
+
 def run_validation_experiment(
     frame: pd.DataFrame,
     config: ExperimentConfig,
@@ -493,6 +518,7 @@ def run_validation_experiment(
     *,
     model_selection: ModelSelection | None = None,
     registry: ModelRegistry | None = None,
+    progress_callback=None,
 ) -> ValidationResult:
     """Fit and calibrate using training/validation only, leaving test untouched."""
 
@@ -549,21 +575,9 @@ def run_validation_experiment(
 
     # Fit statistics only on training windows. Validation and test receive the
     # exact same per-feature normalization, without data-dependent refitting.
-    print("\n=== SEQUENCE MEMORY ===")
-
-    for name, X in [
-        ("train", X_train_raw),
-        ("val", X_val_raw),
-    ]:
-        print(
-            f"{name:5s}: "
-            f"shape={X.shape}, "
-            f"dtype={X.dtype}, "
-            f"size={X.nbytes / 1024**3:.3f} GiB"
-        )
-
-    print("=======================\n")
-    del X  # The diagnostic loop must not keep the last raw tensor alive.
+    _report_sequence_memory(
+        (("train", X_train_raw), ("val", X_val_raw)), progress_callback
+    )
     scaler = SequenceStandardizer()
     X_train = scaler.fit_transform(X_train_raw)
     del X_train_raw

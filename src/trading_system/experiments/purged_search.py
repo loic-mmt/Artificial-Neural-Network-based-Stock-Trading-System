@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from tqdm.auto import tqdm
 
 from trading_system.artifacts.experiment import _nullable_metadata, hash_dataframe, save_experiment_artifact
 from trading_system.artifacts.serialization import stable_config_hash
@@ -14,6 +15,20 @@ from trading_system.models.specs import ModelSelection
 from trading_system.reporting.warnings import current_universe_warning
 from .runner import _filter_universe, run_validation_experiment, evaluate_experiment_test
 from .position_objectives import run_position_validation, evaluate_position_test, save_position_artifact
+
+
+def _progress_details(name, parameters, objective, seed, fold, memory=None):
+    pooling = parameters.get("temporal_pooling", "last")
+    details = [f"{name}/{pooling}", objective, f"seed={seed}", f"fold={fold}"]
+    if memory is not None:
+        for split in ("train", "val"):
+            values = memory[split]
+            shape = "x".join(str(value) for value in values["shape"])
+            dtype = str(values["dtype"]).replace("float", "f").replace("int", "i")
+            details.append(
+                f"{split[:2]}={shape}/{dtype}/{values['gib']:.3f}G"
+            )
+    return " ".join(details)
 
 
 def run_purged_cv(frame, config, parameter_sets, seeds, destination, *, n_splits=3,
@@ -52,10 +67,11 @@ def run_purged_cv(frame, config, parameter_sets, seeds, destination, *, n_splits
         raise FileExistsError(f"CV output already exists: {target}")
     target.mkdir(parents=True)
     dates = pd.to_datetime(frame[config.date_col], utc=True)
-    candidates, rows = {}, []
+    candidates, rows, tasks = {}, [], []
+    loss_choices = loss_configs if loss_configs is not None else [None]
     for name, choices in parameter_sets.items():
         for parameters in choices:
-            for loss in loss_configs if loss_configs is not None else [None]:
+            for loss in loss_choices:
                 description = {"model": name, "parameters": parameters, "loss": asdict(loss) if loss else None}
                 candidate = stable_config_hash(description)
                 if candidate in candidates:
@@ -63,44 +79,84 @@ def run_purged_cv(frame, config, parameter_sets, seeds, destination, *, n_splits
                 candidates[candidate] = (ModelSelection(name, parameters), loss)
                 for seed in seeds:
                     for fold in folds:
-                        fold_frame = frame.loc[dates <= pd.Timestamp(fold["end"])].copy()
-                        configured = replace(config, model=candidates[candidate][0], seed=seed, purged_split=fold["split"])
-                        row = {"candidate": candidate, "model": name, "parameters": parameters,
-                               "objective": loss.objective if loss else "cross_entropy",
-                               "seed": seed, "fold": fold["fold"],
-                               "split": asdict(fold["split"]), "outer_end": fold["end"]}
-                        print(f"cv model={name} loss={row['objective']} seed={seed} fold={fold['fold']}", flush=True)
-                        try:
-                            if loss is None:
-                                fitted = run_validation_experiment(fold_frame, configured)
-                                evaluated = evaluate_experiment_test(fold_frame, fitted)
-                                metrics = {**evaluated.test_metrics, **evaluated.backtest}
-                            else:
-                                fitted = run_position_validation(fold_frame, configured, loss)
-                                evaluated = evaluate_position_test(fold_frame, fitted)
-                                metrics = evaluated["continuous"]
-                            score = float(metrics[selection_metric])
-                            if not np.isfinite(score):
-                                raise ValueError("CV selection score must be finite.")
-                            row.update(status="ok", score=score, outer_metrics=metrics,
-                                       purging=fitted.bundle.purging_state, best_epoch=fitted.bundle.fit_result.best_epoch)
-                            if save_artifacts:
-                                artifact = target / "folds" / f"{len(rows):05d}"
-                                if loss is None:
-                                    save_experiment_artifact(artifact, fold_frame, evaluated, dataset_path=dataset_path)
-                                else:
-                                    save_position_artifact(artifact, fold_frame, fitted)
-                                row["artifact_path"] = str(artifact)
-                            del fitted, evaluated
-                        except Exception as error:
-                            if fail_fast:
-                                raise
-                            row.update(status="error", error_type=type(error).__name__, error=str(error))
-                        finally:
-                            fitted = evaluated = None
-                        rows.append(row)
-                        # Incremental progress survives interruption; never mixes final outcomes.
-                        (target / "folds.json").write_text(json.dumps(_nullable_metadata(rows), indent=2, allow_nan=False))
+                        tasks.append((candidate, name, parameters, loss, seed, fold))
+    progress = tqdm(
+        tasks,
+        desc="CV trainings",
+        unit="fit",
+        dynamic_ncols=True,
+        disable=None,
+    )
+    for candidate, name, parameters, loss, seed, fold in progress:
+        fold_frame = frame.loc[dates <= pd.Timestamp(fold["end"])].copy()
+        configured = replace(
+            config,
+            model=candidates[candidate][0],
+            seed=seed,
+            purged_split=fold["split"],
+        )
+        row = {"candidate": candidate, "model": name, "parameters": parameters,
+               "objective": loss.objective if loss else "cross_entropy",
+               "seed": seed, "fold": fold["fold"],
+               "split": asdict(fold["split"]), "outer_end": fold["end"]}
+        progress.set_postfix_str(
+            _progress_details(
+                name, parameters, row["objective"], seed, fold["fold"]
+            ),
+            refresh=True,
+        )
+
+        def update_memory(memory):
+            progress.set_postfix_str(
+                _progress_details(
+                    name,
+                    parameters,
+                    row["objective"],
+                    seed,
+                    fold["fold"],
+                    memory,
+                ),
+                refresh=True,
+            )
+
+        try:
+            if loss is None:
+                fitted = run_validation_experiment(
+                    fold_frame, configured, progress_callback=update_memory
+                )
+                evaluated = evaluate_experiment_test(fold_frame, fitted)
+                metrics = {**evaluated.test_metrics, **evaluated.backtest}
+            else:
+                fitted = run_position_validation(
+                    fold_frame,
+                    configured,
+                    loss,
+                    progress_callback=update_memory,
+                )
+                evaluated = evaluate_position_test(fold_frame, fitted)
+                metrics = evaluated["continuous"]
+            score = float(metrics[selection_metric])
+            if not np.isfinite(score):
+                raise ValueError("CV selection score must be finite.")
+            row.update(status="ok", score=score, outer_metrics=metrics,
+                       purging=fitted.bundle.purging_state, best_epoch=fitted.bundle.fit_result.best_epoch)
+            if save_artifacts:
+                artifact = target / "folds" / f"{len(rows):05d}"
+                if loss is None:
+                    save_experiment_artifact(artifact, fold_frame, evaluated, dataset_path=dataset_path)
+                else:
+                    save_position_artifact(artifact, fold_frame, fitted)
+                row["artifact_path"] = str(artifact)
+            del fitted, evaluated
+        except Exception as error:
+            if fail_fast:
+                raise
+            row.update(status="error", error_type=type(error).__name__, error=str(error))
+        finally:
+            fitted = evaluated = None
+        rows.append(row)
+        # Incremental progress survives interruption; never mixes final outcomes.
+        (target / "folds.json").write_text(json.dumps(_nullable_metadata(rows), indent=2, allow_nan=False))
     summary = []
     for candidate in candidates:
         runs = [row for row in rows if row["candidate"] == candidate]

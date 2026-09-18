@@ -23,6 +23,7 @@ dependencies = [
     "hmmlearn",
     "scikit-learn",
     "ipython",
+    "tqdm",
 ]
 
 [project.optional-dependencies]

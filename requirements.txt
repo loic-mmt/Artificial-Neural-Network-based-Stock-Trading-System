@@ -15,6 +15,7 @@ statsmodels
 hmmlearn
 scikit-learn
 ipython
+tqdm
 
 torch>=2
 pytest>=8

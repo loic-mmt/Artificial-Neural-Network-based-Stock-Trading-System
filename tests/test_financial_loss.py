@@ -10,7 +10,8 @@ from trading_system.models.factory import create_default_model_registry
 from trading_system.models.specs import ModelBuildContext, ModelSelection
 from trading_system.experiments.config import ExperimentConfig
 from trading_system.experiments.position_objectives import (
-    run_position_validation, evaluate_position_test, save_position_artifact, load_position_artifact,
+    _align_position_calendar, run_position_validation, evaluate_position_test,
+    save_position_artifact, load_position_artifact,
 )
 from trading_system.experiments.runner import run_validation_experiment
 
@@ -64,6 +65,21 @@ def test_sharpe_flat_finite_and_panel_calendar_errors():
         ReturnPanel(pd.concat([data, data.iloc[:1]]))
     with pytest.raises(ValueError, match="execution_delay"):
         ReturnPanel(data, execution_delay=0)
+
+
+def test_position_workflow_aligns_multi_asset_calendar_without_imputation():
+    first = prices(10)
+    second = prices(10, "B").drop(index=[2, 7])
+    frame = pd.concat([first, second], ignore_index=True)
+    frame.attrs["source"] = "test"
+    cfg = ExperimentConfig(universe="multi", group_col="ticker")
+
+    aligned = _align_position_calendar(frame, cfg)
+
+    assert aligned.groupby("ticker").size().tolist() == [8, 8]
+    assert aligned.groupby("ticker").date.apply(tuple).nunique() == 1
+    assert aligned.attrs["source"] == "test"
+    assert not aligned.date.isin(first.loc[[2, 7], "date"]).any()
 
 
 @pytest.mark.parametrize("fields", [{"objective": "bad"}, {"cost_bps": -1}, {"cost_bps": np.nan},
