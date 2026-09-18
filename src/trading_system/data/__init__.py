@@ -1,5 +1,6 @@
-"""Market data loading, splitting, windowing, and scaling."""
+"""Market data loading, validation, splitting, windowing, and scaling."""
 
+from .cleaning import clean_ohlc_frame, clean_ohlc_parquet
 from .io import read_parquet_dataset
 from .scaling import SequenceStandardizer, Standardizer, standardize_features
 from .splits import chronological_train_val_split, chronological_train_val_test_split
@@ -23,6 +24,8 @@ __all__ = [
     "build_sequence_features",
     "chronological_train_val_split",
     "chronological_train_val_test_split",
+    "clean_ohlc_frame",
+    "clean_ohlc_parquet",
     "read_parquet_dataset",
     "standardize_features",
 ]
