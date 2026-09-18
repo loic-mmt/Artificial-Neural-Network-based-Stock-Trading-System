@@ -29,12 +29,177 @@ def test_neural_config_validation_and_recurrent_dropout_policy():
     assert RNNConfig(num_layers=1, dropout=0.5).dropout == 0.0
     assert LSTMConfig(num_layers=2, dropout=0.5).dropout == 0.5
     assert GRUConfig(num_layers=1, dropout=0.5).dropout == 0.0
+    assert GRUConfig().temporal_pooling == "last"
     with pytest.raises(ValueError, match="learning_rate"):
         CommonTrainingConfig(learning_rate=0)
     with pytest.raises(ValueError, match="divisible"):
         TransformerConfig(d_model=10, n_heads=3)
     with pytest.raises(ValueError, match="pooling"):
         TransformerConfig(pooling="bad")
+    assert GRUConfig(temporal_pooling="mean").temporal_pooling == "mean"
+    with pytest.raises(ValueError, match="temporal_pooling"):
+        GRUConfig(temporal_pooling="bad")
+    with pytest.raises(ValueError, match="positive integer"):
+        GRUConfig(temporal_pooling="attention", attention_hidden_size=0)
+    with pytest.raises(ValueError, match="requires attention"):
+        GRUConfig(temporal_pooling="mean", attention_hidden_size=4)
+
+
+def test_gru_a0_uses_final_hidden_state():
+    context = ModelBuildContext(3, 4, seed=21, device="cpu")
+    model = create_default_model_registry().build(
+        "gru",
+        context,
+        {"hidden_size": 5, "bidirectional": True, "temporal_pooling": "last"},
+    )
+    sequences = torch.randn(6, context.context_len, context.input_size)
+
+    logits = model.module(sequences)
+    _, hidden = model.module.recurrent(sequences)
+    hidden = hidden.reshape(1, 2, len(sequences), 5)[-1]
+    expected = model.module.head(hidden.transpose(0, 1).reshape(len(sequences), -1))
+
+    torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+
+
+def test_gru_a1_mean_pools_all_temporal_outputs():
+    context = ModelBuildContext(3, 4, seed=21, device="cpu")
+    model = create_default_model_registry().build(
+        "gru",
+        context,
+        {"hidden_size": 5, "bidirectional": True, "temporal_pooling": "mean"},
+    )
+    sequences = torch.randn(6, context.context_len, context.input_size)
+
+    logits = model.module(sequences)
+    outputs, _ = model.module.recurrent(sequences)
+    expected = model.module.head(outputs.mean(dim=1))
+
+    torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+
+
+def test_gru_a1_has_same_parameter_count_as_a0():
+    context = ModelBuildContext(3, 4, seed=21, device="cpu")
+    registry = create_default_model_registry()
+    common = {"hidden_size": 5, "bidirectional": True}
+
+    last = registry.build("gru", context, {**common, "temporal_pooling": "last"})
+    mean = registry.build("gru", context, {**common, "temporal_pooling": "mean"})
+
+    assert mean.parameter_count() == last.parameter_count()
+
+
+def test_gru_a2_flattens_all_temporal_outputs():
+    context = ModelBuildContext(3, 4, seed=21, device="cpu")
+    model = create_default_model_registry().build(
+        "gru",
+        context,
+        {"hidden_size": 5, "bidirectional": True, "temporal_pooling": "flatten"},
+    )
+    sequences = torch.randn(6, context.context_len, context.input_size)
+
+    logits = model.module(sequences)
+    outputs, _ = model.module.recurrent(sequences)
+    expected = model.module.head(outputs.reshape(len(sequences), -1))
+
+    assert model.module.head.in_features == context.context_len * 10
+    torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("pooling", ["attention", "last_attention"])
+def test_gru_a3_a4_attention_weights_and_features(pooling):
+    context = ModelBuildContext(3, 4, seed=21, device="cpu")
+    model = create_default_model_registry().build(
+        "gru",
+        context,
+        {
+            "hidden_size": 5,
+            "bidirectional": True,
+            "temporal_pooling": pooling,
+            "attention_hidden_size": 7,
+        },
+    )
+    sequences = torch.randn(6, context.context_len, context.input_size)
+
+    logits, weights = model.module.forward_with_attention(sequences)
+    outputs, hidden = model.module.recurrent(sequences)
+    scores = model.module.attention_score(
+        torch.tanh(model.module.attention_projection(outputs))
+    ).squeeze(-1)
+    expected_weights = torch.softmax(scores, dim=1)
+    attended = torch.sum(outputs * expected_weights.unsqueeze(-1), dim=1)
+    if pooling == "attention":
+        expected_features = attended
+        expected_head_size = 10
+    else:
+        hidden = hidden.reshape(1, 2, len(sequences), 5)[-1]
+        final = hidden.transpose(0, 1).reshape(len(sequences), -1)
+        expected_features = torch.cat((final, attended), dim=1)
+        expected_head_size = 20
+
+    assert weights.shape == (len(sequences), context.context_len)
+    assert torch.all(weights >= 0)
+    torch.testing.assert_close(
+        weights.sum(dim=1), torch.ones(len(sequences)), rtol=1e-6, atol=1e-6
+    )
+    assert model.module.head.in_features == expected_head_size
+    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
+    torch.testing.assert_close(
+        logits, model.module.head(expected_features), rtol=0, atol=0
+    )
+
+
+def test_gru_attention_propagates_gradients_to_early_steps_and_attention():
+    context = ModelBuildContext(3, 4, seed=21, device="cpu")
+    model = create_default_model_registry().build(
+        "gru",
+        context,
+        {"hidden_size": 5, "temporal_pooling": "attention"},
+    )
+    sequences = torch.randn(
+        6, context.context_len, context.input_size, requires_grad=True
+    )
+
+    model.module(sequences).sum().backward()
+
+    assert torch.count_nonzero(sequences.grad[:, 0]).item() > 0
+    assert torch.count_nonzero(model.module.attention_projection.weight.grad).item() > 0
+    assert torch.count_nonzero(model.module.attention_score.weight.grad).item() > 0
+
+
+def test_gru_attention_parameters_exist_only_when_used():
+    context = ModelBuildContext(3, 4, seed=21, device="cpu")
+    registry = create_default_model_registry()
+    common = {"hidden_size": 5, "bidirectional": True}
+    last = registry.build("gru", context, {**common, "temporal_pooling": "last"})
+    attention = registry.build(
+        "gru", context, {**common, "temporal_pooling": "attention"}
+    )
+    last_attention = registry.build(
+        "gru", context, {**common, "temporal_pooling": "last_attention"}
+    )
+
+    assert not hasattr(last.module, "attention_projection")
+    assert attention.parameter_count() > last.parameter_count()
+    assert last_attention.parameter_count() > attention.parameter_count()
+
+
+def test_gru_loads_state_saved_before_temporal_pooling_config():
+    context = ModelBuildContext(3, 4, seed=21, device="cpu")
+    registry = create_default_model_registry()
+    original = registry.build("gru", context, {"hidden_size": 5})
+    legacy_state = original.state_dict()
+    legacy_state["config"] = {
+        key: value
+        for key, value in legacy_state["config"].items()
+        if key not in ("temporal_pooling", "attention_hidden_size")
+    }
+
+    restored = registry.build("gru", context, {"hidden_size": 5})
+    restored.load_state_dict(legacy_state)
+
+    assert restored.gru_config.temporal_pooling == "last"
+    assert restored.gru_config.attention_hidden_size is None
 
 
 def test_torch_helpers_device_seed_loader_and_masks():
@@ -68,6 +233,10 @@ def test_torch_helpers_device_seed_loader_and_masks():
         ("rnn", {"hidden_size": 6}),
         ("lstm", {"hidden_size": 6}),
         ("gru", {"hidden_size": 6}),
+        ("gru", {"hidden_size": 6, "temporal_pooling": "mean"}),
+        ("gru", {"hidden_size": 6, "temporal_pooling": "flatten"}),
+        ("gru", {"hidden_size": 6, "temporal_pooling": "attention"}),
+        ("gru", {"hidden_size": 6, "temporal_pooling": "last_attention"}),
         (
             "transformer",
             {

@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from typing import Literal
 
 DeviceMode = Literal["auto", "cpu", "cuda", "mps"]
+GRUTemporalPoolingMode = Literal[
+    "last", "mean", "flatten", "attention", "last_attention"
+]
 PoolingMode = Literal["last", "mean", "cls"]
 PositionEncodingMode = Literal["sinusoidal", "learned"]
 
@@ -88,12 +91,37 @@ class GRUConfig(CommonTrainingConfig):
     num_layers: int = 1
     dropout: float = 0.0
     bidirectional: bool = False
+    temporal_pooling: GRUTemporalPoolingMode = "last"
+    attention_hidden_size: int | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
         _validate_recurrent(self.hidden_size, self.num_layers, self.dropout)
         if not isinstance(self.bidirectional, bool):
             raise TypeError("bidirectional must be boolean.")
+        pooling_modes = (
+            "last",
+            "mean",
+            "flatten",
+            "attention",
+            "last_attention",
+        )
+        if self.temporal_pooling not in pooling_modes:
+            raise ValueError(
+                "temporal_pooling must be 'last', 'mean', 'flatten', "
+                "'attention', or 'last_attention'."
+            )
+        if self.attention_hidden_size is not None:
+            if (
+                isinstance(self.attention_hidden_size, bool)
+                or not isinstance(self.attention_hidden_size, int)
+                or self.attention_hidden_size <= 0
+            ):
+                raise ValueError("attention_hidden_size must be a positive integer.")
+            if self.temporal_pooling not in ("attention", "last_attention"):
+                raise ValueError(
+                    "attention_hidden_size requires attention-based temporal pooling."
+                )
         if self.num_layers == 1 and self.dropout:
             object.__setattr__(self, "dropout", 0.0)
 
@@ -140,6 +168,7 @@ __all__ = [
     "CommonTrainingConfig",
     "DeviceMode",
     "GRUConfig",
+    "GRUTemporalPoolingMode",
     "LSTMConfig",
     "PoolingMode",
     "PositionEncodingMode",
