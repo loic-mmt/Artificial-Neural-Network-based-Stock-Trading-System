@@ -19,5 +19,6 @@ MT5/
 .gitkeep
 .aider*
 docs/papers
+.env
 
 src/*.egg-info/
