@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 from trading_system.training.financial_loss import FinancialLossConfig, ReturnPanel, probabilities_to_positions
+from trading_system.evaluation.position_gate import GateSearchConfig, PositionGate, fit_position_gate
 from trading_system.training.position_trainer import fit_position_model, predict_positions
 from trading_system.models.factory import create_default_model_registry
 from trading_system.models.specs import ModelBuildContext, ModelSelection
@@ -83,16 +84,115 @@ def test_position_workflow_aligns_multi_asset_calendar_without_imputation():
 
 
 @pytest.mark.parametrize("fields", [{"objective": "bad"}, {"cost_bps": -1}, {"cost_bps": np.nan},
-                                      {"annualization": 0}, {"sharpe_epsilon": 0}, {"sharpe_epsilon": np.inf}])
+                                      {"annualization": 0}, {"sharpe_epsilon": 0}, {"sharpe_epsilon": np.inf},
+                                      {"cara_gamma": -1}, {"cara_gamma": np.inf},
+                                      {"combined_pnl_weight": -0.1}, {"combined_pnl_weight": 1.1},
+                                      {"combined_pnl_scale": 0}, {"combined_pnl_scale": np.nan}])
 def test_loss_configuration_rejects_invalid_inputs(fields):
     with pytest.raises(ValueError):
         FinancialLossConfig(**fields)
+
+
+def test_cara_zero_and_combined_endpoints_match_existing_objectives():
+    panel = ReturnPanel(prices(18))
+    positions = np.random.default_rng(13).uniform(-0.7, 0.7, panel.rows)
+    pnl = panel.loss_and_gradient(positions, FinancialLossConfig("pnl"))
+    sharpe = panel.loss_and_gradient(positions, FinancialLossConfig("sharpe"))
+    cara_zero = panel.loss_and_gradient(positions, FinancialLossConfig("cara", cara_gamma=0))
+    combined_pnl = panel.loss_and_gradient(positions, FinancialLossConfig(
+        "combined", combined_pnl_weight=1, combined_pnl_scale=1e-4
+    ))
+    combined_sharpe = panel.loss_and_gradient(positions, FinancialLossConfig(
+        "combined", combined_pnl_weight=0
+    ))
+    assert cara_zero[0] == pnl[0]
+    np.testing.assert_array_equal(cara_zero[1], pnl[1])
+    np.testing.assert_allclose(combined_pnl[0], pnl[0] / 1e-4)
+    np.testing.assert_allclose(combined_pnl[1], pnl[1] / 1e-4)
+    assert combined_sharpe[0] == sharpe[0]
+    np.testing.assert_array_equal(combined_sharpe[1], sharpe[1])
+
+
+@pytest.mark.parametrize("loss", [
+    FinancialLossConfig("cara", cost_bps=17, cara_gamma=10),
+    FinancialLossConfig("cara", cost_bps=17, cara_gamma=100),
+    FinancialLossConfig("combined", cost_bps=17, combined_pnl_weight=0.25),
+    FinancialLossConfig("combined", cost_bps=17, combined_pnl_weight=0.75),
+])
+def test_new_loss_gradients_match_finite_differences_with_costs(loss):
+    frame = pd.concat([prices(13), prices(13, "B").assign(
+        adj_close=lambda f: f.adj_close * np.linspace(1, 1.03, len(f))
+    )], ignore_index=True).sample(frac=1, random_state=7)
+    panel = ReturnPanel(frame, group_col="ticker", execution_delay=2)
+    positions = np.random.default_rng(3).uniform(-0.7, 0.7, len(frame))
+    value, gradient = panel.loss_and_gradient(positions, loss)
+    numerical = np.zeros_like(gradient)
+    for index in range(len(positions)):
+        step = np.zeros_like(positions)
+        step[index] = 1e-6
+        numerical[index] = (
+            panel.loss_and_gradient(positions + step, loss)[0]
+            - panel.loss_and_gradient(positions - step, loss)[0]
+        ) / 2e-6
+    assert np.isfinite(value)
+    np.testing.assert_allclose(gradient, numerical, atol=2e-6, rtol=2e-5)
+
+
+def test_cara_large_exponent_fails_explicitly():
+    panel = ReturnPanel(prices(13))
+    with pytest.raises(FloatingPointError, match="CARA exponent"):
+        panel.loss_and_gradient(np.ones(panel.rows), FinancialLossConfig(
+            "cara", cost_bps=100, cara_gamma=1e6
+        ))
 
 
 def test_probability_decoder():
     p = np.array([[.2, .3, .5], [1., 0., 0.]])
     np.testing.assert_allclose(probabilities_to_positions(p, "long_short"), [.3, -1])
     np.testing.assert_allclose(probabilities_to_positions(p, "long_only"), [.5, 0])
+
+
+def test_position_gate_search_uses_validation_returns_and_preserves_raw_signal():
+    panel = ReturnPanel(prices(20))
+    raw = np.linspace(-0.8, 0.8, 20)
+    search = GateSearchConfig(quantiles=(0.25, 0.5, 0.75), min_coverage=0.3)
+    selection = fit_position_gate(raw, panel, FinancialLossConfig("sharpe"), 10000, search)
+
+    assert selection.candidates[0]["threshold"] == 0
+    assert selection.candidates[0]["coverage"] == 1
+    assert selection.gate.threshold in {row["threshold"] for row in selection.candidates}
+    np.testing.assert_array_equal(PositionGate().apply(raw), raw)
+    filtered = selection.gate.apply(raw)
+    assert np.all(filtered[np.abs(raw) < selection.gate.threshold] == 0)
+    with pytest.raises(ValueError, match="threshold"):
+        PositionGate(float("nan"))
+    with pytest.raises(ValueError, match="quantiles"):
+        GateSearchConfig(quantiles=(0.2, 0.2))
+
+
+def test_gated_position_artifact_freezes_policy_and_outer_test(tmp_path):
+    frame = prices()
+    loss = FinancialLossConfig("sharpe")
+    fitted = run_position_validation(
+        frame, config(), loss,
+        gate_search=GateSearchConfig(quantiles=(0.25, 0.5, 0.75)),
+    )
+    assert fitted.gate_selection is not None
+    assert fitted.raw_validation_metrics is not None
+    assert fitted.position_gate.threshold == fitted.gate_selection.gate.threshold
+    changed = frame.copy()
+    start = int(len(frame) * (config().train_ratio + config().val_ratio))
+    changed.loc[start:, ["open", "high", "low", "close", "adj_close"]] *= 10
+    refit = run_position_validation(
+        changed, config(), loss,
+        gate_search=GateSearchConfig(quantiles=(0.25, 0.5, 0.75)),
+    )
+    assert refit.position_gate == fitted.position_gate
+    assert refit.validation_metrics == fitted.validation_metrics
+    artifact = save_position_artifact(tmp_path / "gated", frame, fitted)
+    restored = load_position_artifact(artifact)
+    assert restored.position_gate == fitted.position_gate
+    assert evaluate_position_test(frame, fitted) == evaluate_position_test(frame, restored)
 
 
 def model(name, *, batch_size=7, epochs=3, dropout=False):
@@ -203,6 +303,79 @@ def test_cli_comparison_seals_test_by_default_and_freezes_selection(tmp_path, mo
     assert len(report["validation"]) == 3
     assert all(row["status"] == "ok" for row in report["validation"])
     assert (tmp_path / "report" / "selection.json").exists()
+
+
+def test_cli_position_gate_requires_cv_and_records_paired_scores(tmp_path):
+    from trading_system.pipelines.compare_losses import main
+    data = tmp_path / "prices.parquet"
+    prices(280).to_parquet(data)
+    arguments = [
+        "--data", str(data), "--preset", "multi_ticker_long_short",
+        "--models", "manual_ann", "--seeds", "1", "--context-len", "3",
+        "--model-parameter-sets", '{"manual_ann":[{"epochs":1,"hidden_size":4}]}',
+        "--losses", "sharpe", "--position-gate-quantiles", "0.25,0.5,0.75",
+    ]
+    with pytest.raises(ValueError, match="requires --cv-folds"):
+        main(arguments)
+    report = main([
+        *arguments, "--cv-folds", "2", "--output-dir", str(tmp_path / "gate-cli"),
+        "--fail-fast",
+    ])
+    assert len(report["folds"]) == 2
+    assert all("outer_metrics_raw" in row for row in report["folds"])
+    assert report["final_test"] == []
+
+
+def test_cli_cara_and_combined_cv_trains_only_new_objectives(tmp_path):
+    from trading_system.pipelines.compare_losses import main
+
+    data = tmp_path / "prices.parquet"
+    prices(280).to_parquet(data)
+    report = main([
+        "--data", str(data), "--preset", "multi_ticker_long_short",
+        "--models", "manual_ann", "--seeds", "1", "--context-len", "3",
+        "--model-parameter-sets", '{"manual_ann":[{"epochs":1,"hidden_size":4}]}',
+        "--losses", "cara", "combined", "--cara-gammas", "5,50",
+        "--combined-weights", "0.25,0.75", "--cv-folds", "2",
+        "--output-dir", str(tmp_path / "new-loss-cv"), "--fail-fast",
+    ])
+    assert report["final_test"] == []
+    assert len(report["folds"]) == 8
+    assert all(row["status"] == "ok" for row in report["folds"])
+    assert {row["objective"] for row in report["folds"]} == {"cara", "combined"}
+    assert {row["loss_config"]["cara_gamma"] for row in report["folds"] if row["objective"] == "cara"} == {5, 50}
+    assert {row["loss_config"]["combined_pnl_weight"] for row in report["folds"] if row["objective"] == "combined"} == {0.25, 0.75}
+    assert all("loss_config" in row for row in report["summary"])
+
+
+def test_cli_new_losses_require_nonredundant_explicit_grids():
+    from trading_system.pipelines.compare_losses import build_parser, _loss_configs
+
+    parser = build_parser()
+    with pytest.raises(ValueError, match="cara-gammas"):
+        _loss_configs(parser.parse_args(["--losses", "cara"]))
+    with pytest.raises(ValueError, match="combined-weights"):
+        _loss_configs(parser.parse_args(["--losses", "combined"]))
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--losses", "cara", "--cara-gammas", "0,10"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--losses", "combined", "--combined-weights", "0.5,1"])
+
+
+@pytest.mark.parametrize("loss", [
+    FinancialLossConfig("cara", cara_gamma=50),
+    FinancialLossConfig("combined", combined_pnl_weight=0.5),
+])
+def test_gru_new_financial_loss_artifact_roundtrip(tmp_path, loss):
+    pytest.importorskip("torch")
+    frame = prices()
+    cfg = replace(config(), model=ModelSelection("gru", {"epochs": 1, "hidden_size": 4}))
+    fitted = run_position_validation(frame, cfg, loss)
+    artifact = save_position_artifact(tmp_path / loss.objective, frame, fitted)
+    restored = load_position_artifact(artifact)
+    assert restored.loss_config == loss
+    assert np.isfinite(restored.validation_metrics["regularized_sharpe"])
+    assert evaluate_position_test(frame, fitted) == evaluate_position_test(frame, restored)
 
 
 def test_cli_final_test_only_opens_selected_candidates_after_persisting_selection(tmp_path, monkeypatch):

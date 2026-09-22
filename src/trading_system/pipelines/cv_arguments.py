@@ -18,7 +18,8 @@ def validate_cv_arguments(args):
         raise ValueError("CV parameters require --cv-folds.")
 
 
-def execute_cv(frame, config, parameter_sets, args, output_dir, *, loss_configs=None):
+def execute_cv(frame, config, parameter_sets, args, output_dir, *, loss_configs=None,
+               gate_search=None):
     from trading_system.experiments.purged_search import run_purged_cv
     metric = args.cv_score or (args.selection_metric if loss_configs is not None else "macro_f1")
     return run_purged_cv(
@@ -29,5 +30,5 @@ def execute_cv(frame, config, parameter_sets, args, output_dir, *, loss_configs=
         selection_metric=metric,
         final_test=args.cv_final_test or getattr(args, "final_test", False),
         save_artifacts=not args.no_run_artifacts, fail_fast=args.fail_fast,
-        dataset_path=args.data,
+        dataset_path=args.data, gate_search=gate_search,
     )

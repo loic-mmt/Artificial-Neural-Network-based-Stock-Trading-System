@@ -13,16 +13,25 @@ class FinancialLossConfig:
     cost_bps: float = 5.0
     annualization: int = 252
     sharpe_epsilon: float = 1e-4
+    cara_gamma: float = 0.0
+    combined_pnl_weight: float = 0.5
+    combined_pnl_scale: float = 1e-4
 
     def __post_init__(self):
-        if self.objective not in ("cross_entropy", "pnl", "sharpe"):
-            raise ValueError("objective must be cross_entropy, pnl, or sharpe.")
+        if self.objective not in ("cross_entropy", "pnl", "sharpe", "cara", "combined"):
+            raise ValueError("objective must be cross_entropy, pnl, sharpe, cara, or combined.")
         if not math.isfinite(self.cost_bps) or not 0 <= self.cost_bps < 10000:
             raise ValueError("cost_bps must be finite and in [0, 10000).")
         if isinstance(self.annualization, bool) or not isinstance(self.annualization, int) or self.annualization <= 0:
             raise ValueError("annualization must be a positive integer.")
         if not math.isfinite(self.sharpe_epsilon) or self.sharpe_epsilon <= 0:
             raise ValueError("sharpe_epsilon must be finite and positive.")
+        if not math.isfinite(self.cara_gamma) or self.cara_gamma < 0:
+            raise ValueError("cara_gamma must be finite and non-negative.")
+        if not math.isfinite(self.combined_pnl_weight) or not 0 <= self.combined_pnl_weight <= 1:
+            raise ValueError("combined_pnl_weight must be finite and in [0, 1].")
+        if not math.isfinite(self.combined_pnl_scale) or self.combined_pnl_scale <= 0:
+            raise ValueError("combined_pnl_scale must be finite and positive.")
 
 
 def position_coefficients(position_mode):
@@ -108,12 +117,30 @@ class ReturnPanel:
         if config.objective == "pnl":
             loss = -mean
             upstream = np.full(count, -1. / count)
+        elif config.objective == "cara":
+            if config.cara_gamma == 0:
+                loss = -mean
+                upstream = np.full(count, -1. / count)
+            else:
+                exponent = -config.cara_gamma * net
+                if not np.isfinite(exponent).all() or np.max(exponent) > np.log(np.finfo(np.float64).max) - 1:
+                    raise FloatingPointError("CARA exponent exceeds finite float64 range.")
+                loss = np.expm1(exponent).mean(dtype=np.float64) / config.cara_gamma
+                upstream = -np.exp(exponent) / count
         else:
             centered = net - mean
             scale = np.sqrt(np.mean(centered ** 2) + config.sharpe_epsilon ** 2)
             annual = np.sqrt(config.annualization)
-            loss = -annual * mean / scale
-            upstream = -annual / count * (1 / scale - mean * centered / scale ** 3)
+            sharpe_loss = -annual * mean / scale
+            sharpe_upstream = -annual / count * (1 / scale - mean * centered / scale ** 3)
+            if config.objective == "sharpe":
+                loss, upstream = sharpe_loss, sharpe_upstream
+            else:
+                weight = config.combined_pnl_weight
+                pnl_loss = -mean / config.combined_pnl_scale
+                loss = (1 - weight) * sharpe_loss + weight * pnl_loss
+                upstream = ((1 - weight) * sharpe_upstream
+                            - weight / (count * config.combined_pnl_scale))
         upstream = upstream / len(self.indices)
         rate = config.cost_bps * 1e-4
         signs = np.sign(delta)  # zero subgradient at the absolute-value kink
@@ -139,7 +166,7 @@ class ReturnPanel:
         # Flat portfolios have zero Sharpe; nonzero constant returns have no
         # unregularized Sharpe and are explicitly unavailable in the report.
         sharpe = np.sqrt(config.annualization) * net.mean() / std if std > 0 else (0. if np.all(net == 0) else None)
-        return {
+        metrics = {
             "net_pnl": float(initial_capital * (wealth[-1] - 1)),
             "net_return": float(wealth[-1] - 1),
             "mean_net_return": float(net.mean()),
@@ -152,3 +179,6 @@ class ReturnPanel:
             "periods": len(net),
             "assets": len(self.indices),
         }
+        if config.objective == "cara":
+            metrics["cara_max_abs_gamma_net"] = float(np.max(np.abs(config.cara_gamma * net)))
+        return metrics

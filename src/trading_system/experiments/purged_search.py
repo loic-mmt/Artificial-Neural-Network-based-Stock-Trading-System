@@ -11,6 +11,7 @@ from tqdm.auto import tqdm
 from trading_system.artifacts.experiment import _nullable_metadata, hash_dataframe, save_experiment_artifact
 from trading_system.artifacts.serialization import stable_config_hash
 from trading_system.data.purged_cv import expanding_calendar_folds
+from trading_system.evaluation.position_gate import GateSearchConfig
 from trading_system.models.specs import ModelSelection
 from trading_system.reporting.warnings import current_universe_warning
 from .runner import _filter_universe, run_validation_experiment, evaluate_experiment_test
@@ -34,7 +35,8 @@ def _progress_details(name, parameters, objective, seed, fold, memory=None):
 def run_purged_cv(frame, config, parameter_sets, seeds, destination, *, n_splits=3,
                   initial_train_fraction=.5, inner_val_fraction=.2, gap_bars=0,
                   embargo_bars=0, loss_configs=None, selection_metric="macro_f1",
-                  final_test=False, save_artifacts=True, fail_fast=False, dataset_path=None):
+                  final_test=False, save_artifacts=True, fail_fast=False, dataset_path=None,
+                  gate_search: GateSearchConfig | None = None):
     """Score each candidate on every outer fold/seed; refit only the selected one.
 
     Fold 'test' fields from shared runners denote outer CV validation here. The
@@ -55,6 +57,11 @@ def run_purged_cv(frame, config, parameter_sets, seeds, destination, *, n_splits
         raise ValueError(f"Unsupported CV score {selection_metric!r}; choose {sorted(allowed_metrics)}.")
     if loss_configs is not None and not loss_configs:
         raise ValueError("loss_configs cannot be empty.")
+    if gate_search is not None:
+        if not isinstance(gate_search, GateSearchConfig):
+            raise TypeError("gate_search must be GateSearchConfig.")
+        if loss_configs is None or any(loss.objective == "cross_entropy" for loss in loss_configs):
+            raise ValueError("Position gate search requires financial losses only.")
     frame = _filter_universe(frame, config)
     folds, final_split = expanding_calendar_folds(
         frame, n_splits=n_splits, initial_train_fraction=initial_train_fraction,
@@ -97,6 +104,7 @@ def run_purged_cv(frame, config, parameter_sets, seeds, destination, *, n_splits
         )
         row = {"candidate": candidate, "model": name, "parameters": parameters,
                "objective": loss.objective if loss else "cross_entropy",
+               "loss_config": asdict(loss) if loss else None,
                "seed": seed, "fold": fold["fold"],
                "split": asdict(fold["split"]), "outer_end": fold["end"]}
         progress.set_postfix_str(
@@ -132,7 +140,15 @@ def run_purged_cv(frame, config, parameter_sets, seeds, destination, *, n_splits
                     configured,
                     loss,
                     progress_callback=update_memory,
+                    gate_search=gate_search,
                 )
+                if gate_search is not None:
+                    raw_evaluated = evaluate_position_test(
+                        fold_frame, replace(fitted, position_gate=None)
+                    )
+                    row["outer_metrics_raw"] = raw_evaluated["continuous"]
+                    row["inner_metrics_raw"] = fitted.raw_validation_metrics
+                    row["inner_gate"] = asdict(fitted.gate_selection)
                 evaluated = evaluate_position_test(fold_frame, fitted)
                 metrics = evaluated["continuous"]
             score = float(metrics[selection_metric])
@@ -162,10 +178,34 @@ def run_purged_cv(frame, config, parameter_sets, seeds, destination, *, n_splits
         runs = [row for row in rows if row["candidate"] == candidate]
         complete = len(runs) == len(seeds) * n_splits and all(row["status"] == "ok" for row in runs)
         scores = [row["score"] for row in runs] if complete else []
-        summary.append({"candidate": candidate, "complete": complete,
+        summary.append({"candidate": candidate, "objective": candidates[candidate][1].objective if candidates[candidate][1] else "cross_entropy",
+                        "loss_config": asdict(candidates[candidate][1]) if candidates[candidate][1] else None,
+                        "complete": complete,
                         "mean": float(np.mean(scores)) if scores else None,
                         "std": float(np.std(scores)) if scores else None,
                         "min": float(np.min(scores)) if scores else None})
+    policy_comparison = []
+    if gate_search is not None:
+        for candidate in candidates:
+            paired = [row for row in rows if row["candidate"] == candidate and row["status"] == "ok"]
+            raw_scores = [row["outer_metrics_raw"][selection_metric] for row in paired]
+            gated_scores = [row["outer_metrics"][selection_metric] for row in paired]
+            deltas = np.asarray(gated_scores) - np.asarray(raw_scores)
+            policy_comparison.append({
+                "candidate": candidate,
+                "n_pairs": len(paired),
+                "raw_mean": float(np.mean(raw_scores)) if paired else None,
+                "gated_mean": float(np.mean(gated_scores)) if paired else None,
+                "mean_delta": float(np.mean(deltas)) if paired else None,
+                "gated_wins": int(np.count_nonzero(deltas > 0)),
+                "equal": int(np.count_nonzero(deltas == 0)),
+                "raw_signal_coverage_mean": float(np.mean([
+                    row["outer_metrics_raw"]["signal_coverage"] for row in paired
+                ])) if paired else None,
+                "gated_signal_coverage_mean": float(np.mean([
+                    row["outer_metrics"]["signal_coverage"] for row in paired
+                ])) if paired else None,
+            })
     eligible = [row for row in summary if row["complete"]]
     winner = max(eligible, key=lambda row: row["mean"])["candidate"] if eligible else None
     metadata = {"config": asdict(config), "n_splits": n_splits, "seeds": list(seeds),
@@ -176,6 +216,8 @@ def run_purged_cv(frame, config, parameter_sets, seeds, destination, *, n_splits
                 "survivor_bias_warning": current_universe_warning(dataset_path),
                 "protocol": "nested_expanding_purged_cv", "selected": winner,
                 "embargo_note": "Post-validation embargo has no additional exclusions when training is past-only."}
+    if gate_search is not None:
+        metadata["position_gate_search"] = asdict(gate_search)
     (target / "selection.json").write_text(json.dumps(_nullable_metadata({"metadata": metadata, "summary": summary}), indent=2, allow_nan=False))
     final = []
     if final_test:
@@ -189,7 +231,7 @@ def run_purged_cv(frame, config, parameter_sets, seeds, destination, *, n_splits
                 evaluated = evaluate_experiment_test(frame, fitted)
                 metrics = {"classification": evaluated.test_metrics, "backtest": evaluated.backtest}
             else:
-                fitted = run_position_validation(frame, configured, loss)
+                fitted = run_position_validation(frame, configured, loss, gate_search=gate_search)
                 metrics = evaluate_position_test(frame, fitted)
             if save_artifacts:
                 artifact = target / "final" / f"seed-{seed}"
@@ -202,9 +244,12 @@ def run_purged_cv(frame, config, parameter_sets, seeds, destination, *, n_splits
             del fitted
             if loss is None:
                 del evaluated
-    report = _nullable_metadata({"metadata": metadata, "folds": rows, "summary": summary, "final_test": final})
+    report = _nullable_metadata({"metadata": metadata, "folds": rows, "summary": summary,
+                                 "policy_comparison": policy_comparison, "final_test": final})
     (target / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False))
-    pd.DataFrame([{key: value for key, value in row.items() if key not in ("outer_metrics", "purging", "split", "parameters")}
+    pd.DataFrame([{key: value for key, value in row.items() if key not in (
+        "outer_metrics", "outer_metrics_raw", "inner_metrics_raw", "inner_gate",
+        "purging", "split", "parameters", "loss_config")}
                   for row in rows]).to_csv(target / "folds.csv", index=False)
     print(f"cv_saved={target} selected={winner} final_tests={len(final)}")
     return report

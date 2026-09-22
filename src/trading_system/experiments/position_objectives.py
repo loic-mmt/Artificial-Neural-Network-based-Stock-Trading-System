@@ -9,6 +9,9 @@ import pandas as pd
 from trading_system.artifacts.experiment import hash_dataframe, _runtime_metadata, _nullable_metadata
 from trading_system.artifacts.serialization import ArtifactManifest, stable_config_hash, save_model_artifact, load_model_artifact
 from trading_system.data.scaling import SequenceStandardizer
+from trading_system.evaluation.position_gate import (
+    GateSearchConfig, GateSelection, PositionGate, fit_position_gate, signal_coverage,
+)
 from trading_system.evaluation.thresholds import DecisionPolicy
 from trading_system.features.expanded import ExpandedFeatureSelector
 from trading_system.features.fracdiff import FracDiffTransformer
@@ -33,9 +36,15 @@ class PositionValidation:
     validation_metrics: dict
     legacy_validation_metrics: dict | None = None
     test_evaluated: bool = False
+    position_gate: PositionGate | None = None
+    gate_selection: GateSelection | None = None
+    raw_validation_metrics: dict | None = None
 
     def predict_positions(self, windows):
-        return probabilities_to_positions(self.bundle.predict_proba(windows), self.config.resolved_backtest_position_mode())
+        positions = probabilities_to_positions(
+            self.bundle.predict_proba(windows), self.config.resolved_backtest_position_mode()
+        )
+        return self.position_gate.apply(positions) if self.position_gate else positions
 
 
 def _panel(frame, config):
@@ -90,11 +99,14 @@ def _validate_config(frame, config, loss_config):
             dates = current
 
 
-def run_position_validation(frame, config, loss_config, *, progress_callback=None):
+def run_position_validation(frame, config, loss_config, *, progress_callback=None,
+                            gate_search: GateSearchConfig | None = None):
     """Fit on train, select checkpoint on validation; never construct test returns."""
     work = _filter_universe(frame, config)
     work = _align_position_calendar(work, config)
     _validate_config(work, config, loss_config)
+    if gate_search is not None and loss_config.objective == "cross_entropy":
+        raise ValueError("Position gate search requires a financial objective.")
     if loss_config.objective == "cross_entropy":
         # Preserve the previous trainer, class/sample weights, calibration and
         # legacy cash-fee backtest exactly; add a common continuous evaluation.
@@ -149,11 +161,27 @@ def run_position_validation(frame, config, loss_config, *, progress_callback=Non
     fit = fit_position_model(model, X_train, train_panel, X_val, val_panel, loss_config, config.resolved_backtest_position_mode())
     del X_train, aligned_train
     positions = predict_positions(model, X_val, config.resolved_backtest_position_mode())
-    metrics = val_panel.metrics(positions, loss_config, config.initial_capital)
+    raw_metrics = val_panel.metrics(positions, loss_config, config.initial_capital)
+    gate_selection = None
+    if gate_search is not None:
+        gate_selection = fit_position_gate(
+            positions, val_panel, loss_config, config.initial_capital, gate_search
+        )
+        filtered = gate_selection.gate.apply(positions)
+        metrics = val_panel.metrics(filtered, loss_config, config.initial_capital)
+        metrics["signal_coverage"] = signal_coverage(filtered)
+        raw_metrics["signal_coverage"] = signal_coverage(positions)
+    else:
+        metrics = raw_metrics
     bundle = TrainedModelBundle(model, scaler, columns, config.context_len, DecisionPolicy(mode="argmax"),
                                 fills.copy(), fit, selection, fracdiff, None, selector,
                                 overfitting_selector, purging_state)
-    return PositionValidation(bundle, config, loss_config, metrics)
+    return PositionValidation(
+        bundle, config, loss_config, metrics,
+        position_gate=gate_selection.gate if gate_selection else None,
+        gate_selection=gate_selection,
+        raw_validation_metrics=raw_metrics if gate_selection else None,
+    )
 
 
 def evaluate_position_test(frame, validation):
@@ -176,6 +204,8 @@ def evaluate_position_test(frame, validation):
     positions = validation.predict_positions(X)
     panel = _panel(aligned, config)
     metrics = panel.metrics(positions, validation.loss_config, config.initial_capital)
+    if validation.gate_selection is not None or validation.position_gate is not None:
+        metrics["signal_coverage"] = signal_coverage(positions)
     output = {"continuous": metrics}
     if validation.loss_config.objective == "cross_entropy":
         from trading_system.backtest.engine import evaluate_strategy_vs_buy_hold
@@ -207,7 +237,8 @@ def save_position_artifact(destination, frame, validation):
     }
     parameters = _nullable_metadata(parameters)
     decision = {"position_decoder": "probability_expectation", "position_mode": config.resolved_backtest_position_mode(),
-                "legacy_policy": asdict(bundle.decision_policy)}
+                "legacy_policy": asdict(bundle.decision_policy),
+                "position_gate": asdict(validation.position_gate) if validation.position_gate else None}
     canonical = {"model_name": bundle.model_selection.name, "model_parameters": bundle.model_selection.parameters,
                  "experiment_parameters": parameters, "decision_parameters": decision}
     manifest = ArtifactManifest(1, bundle.model_selection.name, bundle.model_selection.parameters, parameters,
@@ -249,5 +280,7 @@ def load_position_artifact(source):
                                 DecisionPolicy(**manifest.decision_parameters["legacy_policy"]), fills, fit,
                                 selection, fracdiff, parameters["sample_weight_state"], selector,
                                 overfitting_selector, parameters.get("purging"))
+    gate_state = manifest.decision_parameters.get("position_gate")
     return PositionValidation(bundle, config, FinancialLossConfig(**parameters["loss_config"]),
-                              diagnostics["metrics"]["validation"], diagnostics["metrics"]["legacy_validation"])
+                              diagnostics["metrics"]["validation"], diagnostics["metrics"]["legacy_validation"],
+                              position_gate=PositionGate(**gate_state) if gate_state is not None else None)

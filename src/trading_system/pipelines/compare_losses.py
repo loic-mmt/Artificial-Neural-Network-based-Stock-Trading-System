@@ -1,8 +1,10 @@
 """Validation-first, matched objective comparison with optional frozen final test."""
 
+import argparse
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import json
+import math
 
 import numpy as np
 import pandas as pd
@@ -10,6 +12,7 @@ import pandas as pd
 from trading_system.artifacts.experiment import _nullable_metadata, hash_dataframe
 from trading_system.artifacts.serialization import stable_config_hash
 from trading_system.data.io import read_parquet_dataset
+from trading_system.evaluation.position_gate import GateSearchConfig
 from trading_system.experiments.position_objectives import (
     run_position_validation, save_position_artifact, load_position_artifact, evaluate_position_test,
 )
@@ -25,13 +28,68 @@ from .cv_arguments import validate_cv_arguments, execute_cv
 from .overfitting_arguments import overfitting_config_from_args
 
 
+def _gate_quantiles(value):
+    try:
+        quantiles = tuple(float(part.strip()) for part in value.split(","))
+        GateSearchConfig(quantiles=quantiles)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    return quantiles
+
+
+def _positive_grid(value):
+    try:
+        values = tuple(float(part.strip()) for part in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("Expected comma-separated positive numbers.") from error
+    if not values or any(not math.isfinite(item) or item <= 0 for item in values) or len(set(values)) != len(values):
+        raise argparse.ArgumentTypeError("Grid values must be unique, finite and positive.")
+    return values
+
+
+def _unit_grid(value):
+    values = _positive_grid(value)
+    if any(item >= 1 for item in values):
+        raise argparse.ArgumentTypeError("Combined weights must be strictly between 0 and 1.")
+    return values
+
+
+def _loss_configs(args):
+    if ("cara" in args.losses) != (args.cara_gammas is not None):
+        raise ValueError("--cara-gammas is required exactly when --losses includes cara.")
+    if ("combined" in args.losses) != (args.combined_weights is not None):
+        raise ValueError("--combined-weights is required exactly when --losses includes combined.")
+    if not math.isfinite(args.combined_pnl_scale) or args.combined_pnl_scale <= 0:
+        raise ValueError("--combined-pnl-scale must be finite and positive.")
+    if args.combined_pnl_scale != 1e-4 and "combined" not in args.losses:
+        raise ValueError("--combined-pnl-scale requires combined loss.")
+    common = (args.loss_cost_bps, args.loss_annualization, args.loss_sharpe_epsilon)
+    choices = []
+    for name in args.losses:
+        if name == "cara":
+            choices.extend(FinancialLossConfig(name, *common, cara_gamma=gamma) for gamma in args.cara_gammas)
+        elif name == "combined":
+            choices.extend(FinancialLossConfig(name, *common, combined_pnl_weight=weight,
+                                               combined_pnl_scale=args.combined_pnl_scale)
+                           for weight in args.combined_weights)
+        else:
+            choices.append(FinancialLossConfig(name, *common))
+    return choices
+
+
 def build_parser():
     parser = model_parser()
-    parser.description = "Compare cross-entropy, net P&L and Sharpe on validation; final test stays sealed by default."
-    parser.add_argument("--losses", nargs="+", choices=("cross_entropy", "pnl", "sharpe"), default=["cross_entropy", "pnl", "sharpe"])
+    parser.description = "Compare financial training objectives on validation; final test stays sealed by default."
+    parser.add_argument("--losses", nargs="+", choices=("cross_entropy", "pnl", "sharpe", "cara", "combined"), default=["cross_entropy", "pnl", "sharpe"])
     parser.add_argument("--loss-cost-bps", type=float, default=5.)
     parser.add_argument("--loss-sharpe-epsilon", type=float, default=1e-4)
     parser.add_argument("--loss-annualization", type=int, default=252)
+    parser.add_argument("--cara-gammas", type=_positive_grid,
+                        help="Positive CARA risk aversions; gamma=0 duplicates pnl and is excluded from the benchmark.")
+    parser.add_argument("--combined-weights", type=_unit_grid,
+                        help="Weights on normalized mean net return; 0 and 1 duplicate existing Sharpe/PnL objectives.")
+    parser.add_argument("--combined-pnl-scale", type=float, default=1e-4,
+                        help="Fixed daily return scale for the PnL term in combined loss (default: 1e-4).")
     parser.add_argument("--selection-metric", choices=("regularized_sharpe", "net_return"), default="regularized_sharpe")
     parser.add_argument("--final-test", action="store_true", help="After validation selection, evaluate the frozen CE control and financial winner across their predeclared seeds.")
     parser.add_argument("--context-len", type=int)
@@ -39,6 +97,12 @@ def build_parser():
     parser.add_argument("--val-ratio", type=float)
     parser.add_argument("--position-mode", choices=("long_only", "long_short"))
     parser.add_argument("--execution-delay", type=int)
+    parser.add_argument(
+        "--position-gate-quantiles", type=_gate_quantiles,
+        help="Enable inner-validation signal-strength gating; comma-separated quantiles in (0,1). CV only.",
+    )
+    parser.add_argument("--position-gate-min-coverage", type=float,
+                        help="Minimum retained nonzero signal fraction for gated candidates (default: 0.2).")
     return parser
 
 
@@ -69,7 +133,19 @@ def main(argv=None):
         raise ValueError("--losses must be unique.")
     if args.final_test and args.no_run_artifacts:
         raise ValueError("--final-test requires persisted run artifacts.")
-    loss_configs = [FinancialLossConfig(name, args.loss_cost_bps, args.loss_annualization, args.loss_sharpe_epsilon) for name in args.losses]
+    if args.position_gate_min_coverage is not None and args.position_gate_quantiles is None:
+        raise ValueError("--position-gate-min-coverage requires --position-gate-quantiles.")
+    if args.position_gate_quantiles is not None and args.cv_folds is None:
+        raise ValueError("--position-gate-quantiles requires --cv-folds.")
+    if args.position_gate_quantiles is not None and "cross_entropy" in args.losses:
+        raise ValueError("Position gate benchmark requires financial losses only.")
+    gate_search = (
+        GateSearchConfig(args.position_gate_quantiles,
+                         args.position_gate_min_coverage if args.position_gate_min_coverage is not None else 0.2,
+                         args.cv_score or args.selection_metric)
+        if args.position_gate_quantiles is not None else None
+    )
+    loss_configs = _loss_configs(args)
     config = replace(PRESETS[args.preset], device=args.device)
     config = apply_weight_arguments(apply_feature_arguments(apply_label_arguments(config, args), args), args)
     config = replace(config, overfitting_control=overfitting_config_from_args(args))
@@ -98,7 +174,8 @@ def main(argv=None):
     target = args.output_dir or comparisons_dir() / ("losses-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
     target = target.expanduser().resolve()
     if args.cv_folds is not None:
-        return execute_cv(frame, config, parameter_sets, args, target, loss_configs=loss_configs)
+        return execute_cv(frame, config, parameter_sets, args, target,
+                          loss_configs=loss_configs, gate_search=gate_search)
     if target.exists():
         raise FileExistsError(f"Objective comparison output already exists: {target}")
     target.mkdir(parents=True)
@@ -110,7 +187,8 @@ def main(argv=None):
                 for seed in args.seeds:
                     configured = replace(config, model=ModelSelection(model_name, parameters), seed=seed)
                     row = {"candidate": candidate, "objective": loss_config.objective, "model_name": model_name,
-                           "model_parameters": json.dumps(parameters, sort_keys=True), "seed": seed,
+                           "model_parameters": json.dumps(parameters, sort_keys=True),
+                           "loss_config": json.dumps(asdict(loss_config), sort_keys=True), "seed": seed,
                            "config_hash": stable_config_hash({"experiment": asdict(configured), "loss": asdict(loss_config)})}
                     print(f"loss={loss_config.objective} model={model_name} seed={seed}", flush=True)
                     try:

@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from trading_system.data.purged_cv import PurgedSplit, expanding_calendar_folds, purge_intervals
+from trading_system.evaluation.position_gate import GateSearchConfig
 from trading_system.experiments.config import ExperimentConfig
 from trading_system.experiments.runner import _prepare_splits, run_validation_experiment
 from trading_system.experiments.purged_search import run_purged_cv
@@ -123,6 +124,51 @@ def test_cv_real_end_to_end_seals_final_and_persists_purge(tmp_path, losses):
     assert len(report["folds"]) == 2
     assert all(row["purging"]["train"]["kept_after_gap"] > 0 for row in report["folds"])
     assert (tmp_path / "cv" / "selection.json").exists()
+
+
+def test_cv_position_gate_compares_raw_and_gated_on_paired_outer_folds(tmp_path):
+    report = run_purged_cv(
+        prices(), config(), {"manual_ann": [{"epochs": 1, "hidden_size": 4}]},
+        [1], tmp_path / "gate", n_splits=2,
+        loss_configs=[FinancialLossConfig("sharpe")],
+        selection_metric="regularized_sharpe", gap_bars=2,
+        gate_search=GateSearchConfig(quantiles=(0.25, 0.5, 0.75)),
+        fail_fast=True,
+    )
+    assert report["final_test"] == []
+    assert len(report["folds"]) == 2
+    assert all(row["status"] == "ok" for row in report["folds"])
+    for row in report["folds"]:
+        assert "outer_metrics_raw" in row
+        assert "signal_coverage" in row["outer_metrics_raw"]
+        assert "signal_coverage" in row["outer_metrics"]
+        assert row["inner_gate"]["gate"]["threshold"] >= 0
+    assert report["metadata"]["position_gate_search"]["score_metric"] == "regularized_sharpe"
+    assert report["policy_comparison"][0]["n_pairs"] == 2
+    assert report["policy_comparison"][0]["mean_delta"] == pytest.approx(
+        report["policy_comparison"][0]["gated_mean"] - report["policy_comparison"][0]["raw_mean"]
+    )
+
+
+def test_gru_normalization_ladder_runs_in_sealed_financial_cv(tmp_path):
+    from trading_system.experiments.position_objectives import load_position_artifact
+
+    report = run_purged_cv(
+        prices(), config(),
+        {"gru": [
+            {"epochs": 1, "hidden_size": 4},
+            {"epochs": 1, "hidden_size": 4, "input_normalization": "revin_side"},
+        ]},
+        [1], tmp_path / "normalization", n_splits=2,
+        loss_configs=[FinancialLossConfig("sharpe")],
+        selection_metric="regularized_sharpe", gap_bars=2, fail_fast=True,
+    )
+    assert report["final_test"] == []
+    assert len(report["summary"]) == 2
+    assert all(row["status"] == "ok" for row in report["folds"])
+    normalized = next(row for row in report["folds"] if row["parameters"].get("input_normalization"))
+    restored = load_position_artifact(normalized["artifact_path"])
+    assert restored.bundle.estimator.gru_config.input_normalization == "revin_side"
 
 
 def test_cv_selects_only_complete_candidates_before_final_test(tmp_path, monkeypatch):
