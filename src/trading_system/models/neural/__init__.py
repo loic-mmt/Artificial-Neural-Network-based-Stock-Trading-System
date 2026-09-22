@@ -12,6 +12,7 @@ from .config import (
     TransformerConfig,
 )
 from .gru import GRUClassifier
+from .gru_base import GRUVariantClassifier, create_gru_variant_classifier
 from .lstm import LSTMClassifier
 from .rnn import RNNClassifier
 from .transformer import TransformerClassifier
@@ -20,6 +21,7 @@ __all__ = [
     "CommonTrainingConfig",
     "GRUConfig",
     "GRUClassifier",
+    "GRUVariantClassifier",
     "LSTMConfig",
     "LSTMClassifier",
     "RNNConfig",
@@ -27,4 +29,5 @@ __all__ = [
     "TorchSequenceClassifier",
     "TransformerConfig",
     "TransformerClassifier",
+    "create_gru_variant_classifier",
 ]

@@ -5,13 +5,17 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from trading_system.models.factory import create_default_model_registry
+from trading_system.models.factory import ModelRegistry, create_default_model_registry
 from trading_system.models.neural.config import (
     CommonTrainingConfig,
     GRUConfig,
     LSTMConfig,
     RNNConfig,
     TransformerConfig,
+)
+from trading_system.models.neural.gru_base import (
+    GRUVariantClassifier,
+    create_gru_variant_classifier,
 )
 from trading_system.models.neural.trainer import (
     build_tensor_loader,
@@ -43,6 +47,56 @@ def test_neural_config_validation_and_recurrent_dropout_policy():
         GRUConfig(temporal_pooling="attention", attention_hidden_size=0)
     with pytest.raises(ValueError, match="requires attention"):
         GRUConfig(temporal_pooling="mean", attention_hidden_size=4)
+    with pytest.raises(ValueError, match="head_type"):
+        GRUConfig(head_type="bad")
+    with pytest.raises(ValueError, match="positive integer"):
+        GRUConfig(head_type="mlp", head_hidden_size=0)
+    with pytest.raises(ValueError, match="requires an MLP"):
+        GRUConfig(head_hidden_size=4)
+    with pytest.raises(ValueError, match="head_dropout"):
+        GRUConfig(head_type="mlp", head_dropout=1.0)
+    with pytest.raises(ValueError, match="requires an MLP"):
+        GRUConfig(head_dropout=0.1)
+    with pytest.raises(ValueError, match="input_normalization"):
+        GRUConfig(input_normalization="future")
+    with pytest.raises(ValueError, match="normalization_window"):
+        GRUConfig(normalization_window=0)
+    with pytest.raises(ValueError, match="normalization_feature_indices"):
+        GRUConfig(normalization_feature_indices=(0, 0))
+
+
+@pytest.mark.parametrize("mode", ["expanding", "rolling", "revin", "revin_side", "gas"])
+def test_gru_window_normalization_is_finite_and_reloadable(mode):
+    context = ModelBuildContext(3, 6, seed=21, device="cpu")
+    parameters = {"hidden_size": 5, "input_normalization": mode,
+                  "normalization_feature_indices": [0, 2]}
+    registry = create_default_model_registry()
+    model = registry.build("gru", context, parameters)
+    values = torch.ones(2, 6, 3)
+    values[:, :, 1] = torch.arange(6, dtype=torch.float32)
+    normalized, side = model.module.window_normalizer(values)
+    assert torch.isfinite(normalized).all()
+    torch.testing.assert_close(normalized[:, :, 1], values[:, :, 1])
+    assert (side is not None) is (mode == "revin_side")
+    logits = model.module(values)
+    assert logits.shape == (2, 3)
+    restored = registry.build("gru", context, parameters)
+    restored.load_state_dict(model.state_dict())
+    torch.testing.assert_close(restored.module(values), logits)
+
+
+@pytest.mark.parametrize("mode", ["expanding", "rolling", "gas"])
+def test_online_window_normalization_ignores_future_observations(mode):
+    context = ModelBuildContext(2, 6, seed=21, device="cpu")
+    model = create_default_model_registry().build(
+        "gru", context, {"input_normalization": mode, "normalization_window": 3}
+    )
+    earlier = torch.arange(12, dtype=torch.float32).reshape(1, 6, 2)
+    changed = earlier.clone()
+    changed[:, 4:] += 1000
+    first, _ = model.module.window_normalizer(earlier)
+    second, _ = model.module.window_normalizer(changed)
+    torch.testing.assert_close(first[:, :4], second[:, :4])
 
 
 def test_gru_a0_uses_final_hidden_state():
@@ -184,6 +238,164 @@ def test_gru_attention_parameters_exist_only_when_used():
     assert last_attention.parameter_count() > attention.parameter_count()
 
 
+@pytest.mark.parametrize(
+    "head_type,has_norm,has_hidden",
+    [
+        ("linear", False, False),
+        ("layernorm_linear", True, False),
+        ("mlp", False, True),
+        ("layernorm_mlp", True, True),
+    ],
+)
+@pytest.mark.parametrize("pooling", ["last", "attention"])
+def test_gru_head_is_independent_of_temporal_pooling(
+    head_type, has_norm, has_hidden, pooling
+):
+    context = ModelBuildContext(3, 4, seed=21, device="cpu")
+    parameters = {
+        "hidden_size": 8,
+        "temporal_pooling": pooling,
+        "head_type": head_type,
+    }
+    if has_hidden:
+        parameters.update(head_hidden_size=5, head_dropout=0.1)
+    model = create_default_model_registry().build("gru", context, parameters)
+    sequences = torch.randn(6, context.context_len, context.input_size)
+
+    logits = model.module(sequences)
+
+    assert logits.shape == (6, 3)
+    assert model.module.embedding_size == 8
+    if pooling == "attention":
+        model.module.eval()
+        attention_logits, weights = model.module.forward_with_attention(sequences)
+        assert weights.shape == (6, 4)
+        torch.testing.assert_close(model.module(sequences), attention_logits)
+    if head_type == "linear":
+        assert isinstance(model.module.head, torch.nn.Linear)
+        assert "head.weight" in model.state_dict()["module_state"]
+    else:
+        assert isinstance(model.module.head, torch.nn.Sequential)
+        assert ("norm" in model.module.head._modules) is has_norm
+        assert ("hidden" in model.module.head._modules) is has_hidden
+        assert model.module.head.output.out_features == 3
+        if has_hidden:
+            assert model.module.head.hidden.out_features == 5
+            assert model.module.head.dropout.p == 0.1
+
+
+def test_gru_attention_layernorm_mlp_fits_and_round_trips():
+    context = ModelBuildContext(3, 4, seed=21, device="cpu")
+    parameters = {
+        "hidden_size": 8,
+        "temporal_pooling": "attention",
+        "head_type": "layernorm_mlp",
+        "epochs": 1,
+    }
+    registry = create_default_model_registry()
+    model = registry.build("gru", context, parameters)
+    rng = np.random.default_rng(17)
+    sequences = rng.normal(size=(12, 4, 3)).astype(np.float32)
+    labels = np.tile(np.arange(3), 4)
+
+    model.fit(sequences[:9], labels[:9], X_val=sequences[9:], y_val=labels[9:])
+    probabilities = model.predict_proba(sequences[9:])
+    restored = registry.build("gru", context, parameters)
+    restored.load_state_dict(model.state_dict())
+
+    assert model.module.head.hidden.out_features == 4
+    np.testing.assert_array_equal(restored.predict_proba(sequences[9:]), probabilities)
+
+
+@pytest.mark.parametrize(
+    "pooling,embedding_size",
+    [
+        ("last", 10),
+        ("mean", 10),
+        ("flatten", 40),
+        ("attention", 10),
+        ("last_attention", 20),
+    ],
+)
+def test_gru_shared_encoder_matches_head_and_preserves_state_keys(
+    pooling, embedding_size
+):
+    context = ModelBuildContext(3, 4, seed=21, device="cpu")
+    model = create_default_model_registry().build(
+        "gru",
+        context,
+        {"hidden_size": 5, "bidirectional": True, "temporal_pooling": pooling},
+    )
+    sequences = torch.randn(6, context.context_len, context.input_size)
+
+    embedding = model.module.encode(sequences)
+    logits = model.module(sequences)
+
+    assert embedding.shape == (len(sequences), embedding_size)
+    assert model.module.embedding_size == embedding_size
+    assert "input_adapter" not in model.module._modules
+    torch.testing.assert_close(logits, model.module.head(embedding), rtol=0, atol=0)
+    keys = model.state_dict()["module_state"]
+    assert "recurrent.weight_ih_l0" in keys
+    assert "head.weight" in keys
+    assert not any(key.startswith("input_adapter.") for key in keys)
+
+
+def test_gru_variant_hooks_register_fit_predict_and_round_trip():
+    class ProbeVariant(GRUVariantClassifier):
+        model_name = "gru_probe"
+
+        def _input_adapter_factory(self, nn_module):
+            return lambda: nn_module.Linear(
+                self.context.input_size, self.context.input_size, bias=False
+            )
+
+        def _head_factory(self, nn_module):
+            return lambda width, classes: nn_module.Sequential(
+                nn_module.LayerNorm(width), nn_module.Linear(width, classes)
+            )
+
+    registry = ModelRegistry()
+    registry.register(
+        "gru_probe",
+        lambda context, parameters: create_gru_variant_classifier(
+            context, parameters, ProbeVariant
+        ),
+    )
+    context = ModelBuildContext(3, 4, seed=21, device="cpu")
+    parameters = {"hidden_size": 5, "temporal_pooling": "last_attention", "epochs": 1}
+    model = registry.build("gru_probe", context, parameters)
+    rng = np.random.default_rng(17)
+    sequences = rng.normal(size=(12, 4, 3)).astype(np.float32)
+    labels = np.tile(np.arange(3), 4)
+
+    model.fit(sequences[:9], labels[:9], X_val=sequences[9:], y_val=labels[9:])
+    probabilities = model.predict_proba(sequences[9:])
+    restored = registry.build("gru_probe", context, parameters)
+    restored.load_state_dict(model.state_dict())
+
+    assert model.module.encode(torch.from_numpy(sequences[:2])).shape == (2, 10)
+    assert "input_adapter.weight" in model.state_dict()["module_state"]
+    np.testing.assert_array_equal(restored.predict_proba(sequences[9:]), probabilities)
+    with pytest.raises(ValueError, match="model_name differs"):
+        create_default_model_registry().build("gru", context, parameters).load_state_dict(
+            model.state_dict()
+        )
+
+
+def test_gru_variant_rejects_shape_changing_input_adapter():
+    class BadVariant(GRUVariantClassifier):
+        model_name = "gru_bad"
+
+        def _input_adapter_factory(self, nn_module):
+            return lambda: nn_module.Linear(self.context.input_size, 1)
+
+    context = ModelBuildContext(3, 4, seed=21, device="cpu")
+    model = create_gru_variant_classifier(context, {"hidden_size": 5}, BadVariant)
+    with pytest.raises(ValueError, match="preserve"):
+        model.module(torch.randn(2, 4, 3))
+
+
 def test_gru_loads_state_saved_before_temporal_pooling_config():
     context = ModelBuildContext(3, 4, seed=21, device="cpu")
     registry = create_default_model_registry()
@@ -192,7 +404,13 @@ def test_gru_loads_state_saved_before_temporal_pooling_config():
     legacy_state["config"] = {
         key: value
         for key, value in legacy_state["config"].items()
-        if key not in ("temporal_pooling", "attention_hidden_size")
+        if key not in (
+            "temporal_pooling",
+            "attention_hidden_size",
+            "head_type",
+            "head_hidden_size",
+            "head_dropout",
+        )
     }
 
     restored = registry.build("gru", context, {"hidden_size": 5})
@@ -200,6 +418,7 @@ def test_gru_loads_state_saved_before_temporal_pooling_config():
 
     assert restored.gru_config.temporal_pooling == "last"
     assert restored.gru_config.attention_hidden_size is None
+    assert restored.gru_config.head_type == "linear"
 
 
 def test_torch_helpers_device_seed_loader_and_masks():

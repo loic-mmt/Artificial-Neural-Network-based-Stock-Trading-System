@@ -7,6 +7,7 @@ DeviceMode = Literal["auto", "cpu", "cuda", "mps"]
 GRUTemporalPoolingMode = Literal[
     "last", "mean", "flatten", "attention", "last_attention"
 ]
+GRUHeadMode = Literal["linear", "layernorm_linear", "mlp", "layernorm_mlp"]
 PoolingMode = Literal["last", "mean", "cls"]
 PositionEncodingMode = Literal["sinusoidal", "learned"]
 
@@ -93,9 +94,30 @@ class GRUConfig(CommonTrainingConfig):
     bidirectional: bool = False
     temporal_pooling: GRUTemporalPoolingMode = "last"
     attention_hidden_size: int | None = None
+    head_type: GRUHeadMode = "linear"
+    head_hidden_size: int | None = None
+    head_dropout: float = 0.0
+    input_normalization: Literal["none", "expanding", "rolling", "revin", "revin_side", "gas"] = "none"
+    normalization_window: int = 20
+    normalization_rate: float = 0.1
+    normalization_epsilon: float = 1e-5
+    normalization_feature_indices: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.input_normalization not in ("none", "expanding", "rolling", "revin", "revin_side", "gas"):
+            raise ValueError("Unsupported input_normalization.")
+        if isinstance(self.normalization_window, bool) or not isinstance(self.normalization_window, int) or self.normalization_window <= 0:
+            raise ValueError("normalization_window must be a positive integer.")
+        if not 0 < self.normalization_rate <= 1:
+            raise ValueError("normalization_rate must be in (0, 1].")
+        if not 0 < self.normalization_epsilon < 1:
+            raise ValueError("normalization_epsilon must be in (0, 1).")
+        if self.normalization_feature_indices is not None:
+            indices = tuple(self.normalization_feature_indices)
+            if not indices or any(isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in indices) or len(set(indices)) != len(indices):
+                raise ValueError("normalization_feature_indices must be unique non-negative integers.")
+            object.__setattr__(self, "normalization_feature_indices", indices)
         _validate_recurrent(self.hidden_size, self.num_layers, self.dropout)
         if not isinstance(self.bidirectional, bool):
             raise TypeError("bidirectional must be boolean.")
@@ -122,6 +144,23 @@ class GRUConfig(CommonTrainingConfig):
                 raise ValueError(
                     "attention_hidden_size requires attention-based temporal pooling."
                 )
+        if self.head_type not in (
+            "linear", "layernorm_linear", "mlp", "layernorm_mlp"
+        ):
+            raise ValueError("Unsupported GRU head_type.")
+        if self.head_hidden_size is not None:
+            if (
+                isinstance(self.head_hidden_size, bool)
+                or not isinstance(self.head_hidden_size, int)
+                or self.head_hidden_size <= 0
+            ):
+                raise ValueError("head_hidden_size must be a positive integer.")
+            if self.head_type not in ("mlp", "layernorm_mlp"):
+                raise ValueError("head_hidden_size requires an MLP head_type.")
+        if not 0 <= self.head_dropout < 1:
+            raise ValueError("head_dropout must be in [0, 1).")
+        if self.head_dropout and self.head_type not in ("mlp", "layernorm_mlp"):
+            raise ValueError("head_dropout requires an MLP head_type.")
         if self.num_layers == 1 and self.dropout:
             object.__setattr__(self, "dropout", 0.0)
 
@@ -168,6 +207,7 @@ __all__ = [
     "CommonTrainingConfig",
     "DeviceMode",
     "GRUConfig",
+    "GRUHeadMode",
     "GRUTemporalPoolingMode",
     "LSTMConfig",
     "PoolingMode",
