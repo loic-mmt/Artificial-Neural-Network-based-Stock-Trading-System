@@ -13,10 +13,12 @@ from .manual_ann import (
     ManualANNConfig,
     ManualANNSequenceAdapter,
 )
+from .multimodal_contract import BranchOutput
 from .specs import ModelBuildContext, ModelSelection
 
 __all__ = [
     "FitResult",
+    "BranchOutput",
     "ManualANNClassifier",
     "ManualANNConfig",
     "ManualANNSequenceAdapter",

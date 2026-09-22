@@ -81,6 +81,7 @@ def build_transformer_module(
             )
             self.encoder = nn_module.TransformerEncoder(layer, config.num_layers)
             self.norm = nn_module.LayerNorm(config.d_model)
+            self.embedding_size = config.d_model
             self.head = nn_module.Linear(config.d_model, context.num_classes)
             mask = (
                 build_causal_attention_mask(length, torch_module=torch_module)
@@ -89,7 +90,7 @@ def build_transformer_module(
             )
             self.register_buffer("attention_mask", mask, persistent=False)
 
-        def forward(self, sequences: Any) -> Any:
+        def encode(self, sequences: Any) -> Any:
             if sequences.ndim != 3 or sequences.shape[1:] != (
                 context.context_len,
                 context.input_size,
@@ -104,7 +105,10 @@ def build_transformer_module(
                 pooled = encoded[:, -1]
             else:
                 pooled = encoded.mean(dim=1)
-            return self.head(self.norm(pooled))
+            return self.norm(pooled)
+
+        def forward(self, sequences: Any) -> Any:
+            return self.head(self.encode(sequences))
 
     return TransformerModule()
 
