@@ -235,6 +235,44 @@ class GNNBranch(nn.Module):
         normalizer = weight * degree[src].rsqrt() * degree[dst].rsqrt()
         return src, dst, normalizer
 
+    @staticmethod
+    def _dense_normalized_adjacency(
+        batch: MultimodalBatch,
+        date_index: int,
+        active: torch.Tensor,
+        *,
+        graph_mode: str,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build the same directed GCN operator without MPS scatter operations."""
+        active_slots = active.detach().cpu().numpy().astype(bool)
+        slots = np.flatnonzero(active_slots)
+        if graph_mode == "identity":
+            src = dst = slots
+            weight = np.ones(len(slots), dtype=np.float32)
+        else:
+            snapshot = batch.graphs[date_index]
+            if snapshot is None:
+                raise ValueError("A provided graph is missing for an available date.")
+            edges = np.asarray(snapshot.edge_index)
+            weights = np.asarray(snapshot.edge_weight)
+            if (weights < 0).any():
+                raise ValueError("Standard GCN requires non-negative edge weights.")
+            if edges.shape[1] and (edges[0] == edges[1]).any():
+                raise ValueError("Provided graphs must omit self-edges.")
+            if edges.shape[1] and len(set(map(tuple, edges.T))) != edges.shape[1]:
+                raise ValueError("Provided graph edges must be unique.")
+            if edges.shape[1] and not (active_slots[edges[0]] & active_slots[edges[1]]).all():
+                raise ValueError("Graph edges reference unavailable nodes.")
+            src = np.concatenate((edges[0], slots))
+            dst = np.concatenate((edges[1], slots))
+            weight = np.concatenate((weights, np.ones(len(slots), dtype=np.float32)))
+        degree = np.bincount(dst, weights=weight, minlength=len(active_slots))
+        normalized = weight / np.sqrt(degree[src] * degree[dst])
+        adjacency = np.zeros((len(active_slots), len(active_slots)), dtype=np.float32)
+        adjacency[dst, src] = normalized.astype(np.float32)
+        return torch.as_tensor(adjacency, dtype=torch.float32, device=device)
+
     def forward(self, batch: MultimodalBatch) -> BranchOutput:
         dates, assets = _validate_batch(batch)
         if batch.node.shape != (dates, assets, self.input_size):
@@ -257,16 +295,27 @@ class GNNBranch(nn.Module):
                 representations.append(values.new_zeros((assets, self.hidden_size)))
                 logits.append(values.new_zeros((assets, 3)))
                 continue
-            src, dst, weight = self._normalized_edges(
-                batch, date_index, active,
-                graph_mode=self.graph_mode, device=device,
-            )
+            # MPS has no deterministic index_add implementation. The graphs in
+            # this benchmark are small, so dense matmul preserves determinism.
+            if device.type == "mps":
+                adjacency = self._dense_normalized_adjacency(
+                    batch, date_index, active,
+                    graph_mode=self.graph_mode, device=device,
+                )
+            else:
+                src, dst, weight = self._normalized_edges(
+                    batch, date_index, active,
+                    graph_mode=self.graph_mode, device=device,
+                )
             hidden = F.relu(self.input_projection(values[date_index]))
             hidden = hidden * active.unsqueeze(-1)
             for convolution in self.convolutions:
-                aggregated = torch.zeros_like(hidden).index_add(
-                    0, dst, hidden[src] * weight.unsqueeze(-1)
-                )
+                if device.type == "mps":
+                    aggregated = adjacency @ hidden
+                else:
+                    aggregated = torch.zeros_like(hidden).index_add(
+                        0, dst, hidden[src] * weight.unsqueeze(-1)
+                    )
                 hidden = self.dropout(F.relu(convolution(aggregated)))
                 hidden = hidden * active.unsqueeze(-1)
             representations.append(hidden)

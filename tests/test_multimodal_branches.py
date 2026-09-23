@@ -149,6 +149,40 @@ def test_gnn_is_independent_of_temporal_features_and_uses_sparse_neighbors():
     assert model.convolutions[0].weight.grad is not None
 
 
+@pytest.mark.parametrize("graph_mode", ["identity", "provided"])
+def test_dense_gnn_operator_matches_sparse_values_and_gradients(graph_mode):
+    batch = _batch(graph=_graph())
+    active = torch.as_tensor(
+        batch.asset_mask[0] & batch.node_mask[0]
+        & (batch.graph_mask[0] if graph_mode == "provided" else True)
+    )
+    kwargs = dict(graph_mode=graph_mode, device=torch.device("cpu"))
+    src, dst, weight = GNNBranch._normalized_edges(batch, 0, active, **kwargs)
+    adjacency = GNNBranch._dense_normalized_adjacency(batch, 0, active, **kwargs)
+    hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+    sparse = torch.zeros_like(hidden).index_add(
+        0, dst, hidden[src] * weight.unsqueeze(-1)
+    )
+    dense = adjacency @ hidden
+    torch.testing.assert_close(dense, sparse)
+    dense_grad = torch.autograd.grad(dense.square().sum(), hidden, retain_graph=True)[0]
+    sparse_grad = torch.autograd.grad(sparse.square().sum(), hidden)[0]
+    torch.testing.assert_close(dense_grad, sparse_grad)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
+def test_gnn_mps_forward_backward_with_deterministic_algorithms():
+    previous = torch.are_deterministic_algorithms_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        model = GNNBranch(1, hidden_size=4, graph_mode="provided").to("mps")
+        output = model(_batch(graph=_graph()))
+        output.logits.sum().backward()
+        assert model.convolutions[0].weight.grad is not None
+    finally:
+        torch.use_deterministic_algorithms(previous)
+
+
 def test_multimodal_gru_keeps_configured_benchmark_head():
     branch = GRUBranch(
         1, 1,
