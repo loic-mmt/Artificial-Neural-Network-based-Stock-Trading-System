@@ -10,6 +10,7 @@ import pytest
 pytest.importorskip("torch")
 
 from trading_system.experiments.graph_ablation import GraphAblationConfig, run_graph_ablation
+from trading_system.pipelines.diagnose_gnn_information import run_information_tests
 from trading_system.pipelines.multi_ticker_long_short import DEFAULT_CONFIG
 from trading_system.training.financial_loss import FinancialLossConfig
 
@@ -37,13 +38,26 @@ def test_graph_ablation_uses_matched_folds_and_resumes_without_retraining(tmp_pa
     parameters = {"hidden_size": 4, "epochs": 1, "early_stopping_patience": 1}
     ablation = GraphAblationConfig(graph_lookback=10, graph_threshold=.3,
                                     gnn_hidden_size=4, date_batch_size=16)
-    args = (_frame(), config, loss, parameters, [1], tmp_path / "graphs")
+    data_path = tmp_path / "prices.parquet"
+    _frame().to_parquet(data_path, index=False)
+    selection_path = tmp_path / "tickers.json"
+    selection_path.write_text(json.dumps({"tickers": ["A", "B", "C"]}))
+    args = (pd.read_parquet(data_path), config, loss, parameters, [1], tmp_path / "graphs")
     options = dict(ablation=ablation, n_splits=2, gap_bars=2)
     report = run_graph_ablation(*args, **options)
     assert len(report["folds"]) == 10
     assert len(report["summary"]) == 5
     assert len(report["paired_vs_gru"]) == 4
     assert report["final_test"] == []
+    information = run_information_tests(
+        tmp_path / "graphs", tmp_path / "information", data_path, selection_path,
+        modes=("identity",), folds=[0], seeds=[1], device="cpu",
+        block_length=5, bootstrap_samples=100,
+    )
+    assert information["final_holdout_opened"] is False
+    assert information["hash_mismatch_override"] is False
+    assert len(information["statistics"]) == 1
+    assert (tmp_path / "information" / "predictions.parquet").is_file()
     for fold in (0, 1):
         rows = [row for row in report["folds"] if row["fold"] == fold]
         assert len({row["outer_dates"] for row in rows}) == 1
