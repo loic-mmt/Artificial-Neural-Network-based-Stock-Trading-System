@@ -100,6 +100,7 @@ class GraphSnapshot:
     source_end: object
     edge_index: np.ndarray
     edge_weight: np.ndarray
+    source_start: object | None = None
 
     def __post_init__(self) -> None:
         session = _sessions([self.session], "graph session")[0]
@@ -107,6 +108,14 @@ class GraphSnapshot:
         if source_end.tzinfo is None or pd.isna(source_end):
             raise ValueError("Graph source_end must be a timezone-aware timestamp.")
         source_end = source_end.tz_convert("UTC")
+        source_start = None
+        if self.source_start is not None:
+            source_start = pd.Timestamp(self.source_start)
+            if pd.isna(source_start) or source_start.tzinfo is None:
+                raise ValueError("Graph source_start must be a timezone-aware timestamp.")
+            source_start = source_start.tz_convert("UTC")
+            if source_start > source_end:
+                raise ValueError("Graph source_start cannot follow source_end.")
         # Source may include close-J prices, but never observations from J+1.
         if source_end >= session + pd.Timedelta(days=1):
             raise ValueError("Graph uses data after its prediction session.")
@@ -124,6 +133,7 @@ class GraphSnapshot:
         weights.setflags(write=False)
         object.__setattr__(self, "session", session)
         object.__setattr__(self, "source_end", source_end)
+        object.__setattr__(self, "source_start", source_start)
         object.__setattr__(self, "edge_index", edges)
         object.__setattr__(self, "edge_weight", weights)
 
