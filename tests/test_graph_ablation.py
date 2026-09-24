@@ -51,12 +51,12 @@ def test_graph_ablation_uses_matched_folds_and_resumes_without_retraining(tmp_pa
     assert report["final_test"] == []
     information = run_information_tests(
         tmp_path / "graphs", tmp_path / "information", data_path, selection_path,
-        modes=("identity",), folds=[0], seeds=[1], device="cpu",
+        modes=("identity", "sector"), folds=[0], seeds=[1], device="cpu",
         block_length=5, bootstrap_samples=100,
     )
     assert information["final_holdout_opened"] is False
     assert information["hash_mismatch_override"] is False
-    assert len(information["statistics"]) == 1
+    assert len(information["statistics"]) == 2
     assert (tmp_path / "information" / "predictions.parquet").is_file()
     for fold in (0, 1):
         rows = [row for row in report["folds"] if row["fold"] == fold]

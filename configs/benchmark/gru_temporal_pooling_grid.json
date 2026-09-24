@@ -1,0 +1,41 @@
+{
+  "gru": [
+    {
+      "hidden_size": 32,
+      "num_layers": 1,
+      "weight_decay": 0.00001,
+      "early_stopping_patience": 15,
+      "temporal_pooling": "last"
+    },
+    {
+      "hidden_size": 32,
+      "num_layers": 1,
+      "weight_decay": 0.00001,
+      "early_stopping_patience": 15,
+      "temporal_pooling": "mean"
+    },
+    {
+      "hidden_size": 32,
+      "num_layers": 1,
+      "weight_decay": 0.00001,
+      "early_stopping_patience": 15,
+      "temporal_pooling": "flatten"
+    },
+    {
+      "hidden_size": 32,
+      "num_layers": 1,
+      "weight_decay": 0.00001,
+      "early_stopping_patience": 15,
+      "temporal_pooling": "attention",
+      "attention_hidden_size": 32
+    },
+    {
+      "hidden_size": 32,
+      "num_layers": 1,
+      "weight_decay": 0.00001,
+      "early_stopping_patience": 15,
+      "temporal_pooling": "last_attention",
+      "attention_hidden_size": 32
+    }
+  ]
+}

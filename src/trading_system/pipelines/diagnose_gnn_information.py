@@ -61,10 +61,10 @@ def _outer_fold(fold_frame, config, ablation, fold):
     return prepared, _scale(outer, columns, prepared.scaler), _scale(history, columns, prepared.scaler)
 
 
-def _degrees(graphs, outer, tickers, mode):
+def _degrees(graphs, outer, tickers, mode, date_col):
     if mode in ("gru", "identity"):
         return np.zeros(len(outer), dtype=np.int64)
-    dates = _dates(outer).unique().sort_values()
+    dates = _dates(outer, date_col).unique().sort_values()
     if len(graphs) != len(dates) or any(graph.session != day for graph, day in zip(graphs, dates)):
         raise ValueError("Replayed graph dates do not match outer predictions.")
     return np.stack([np.bincount(graph.edge_index[1], minlength=len(tickers))
@@ -164,7 +164,7 @@ def run_information_tests(
         for mode in ("gru", *modes):
             graphs, _ = _graphs(fold_frame, config, prepared, ablation, mode, outer)
             dataset = _dataset(outer, history, prepared.columns, config, graphs)
-            degree = _degrees(graphs, outer, prepared.tickers, mode)
+            degree = _degrees(graphs, outer, prepared.tickers, mode, config.date_col)
             for seed in sorted(wanted_seeds):
                 saved_row = saved.get((mode, fold_id, seed))
                 if saved_row is None:
