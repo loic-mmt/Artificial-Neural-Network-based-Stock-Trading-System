@@ -23,6 +23,11 @@ def build_parser():
     parser.set_defaults(models=["gru"], losses=["sharpe"])
     parser.add_argument("--market-close-columns", default="market_close,vix_close",
                         help="Comma-separated close-observed global series; no publication-dated macro inputs.")
+    parser.add_argument("--market-context-data",
+                        help="Optional one-row-per-session Parquet containing audited ETF closes.")
+    parser.add_argument("--market-cross-section", action="store_true",
+                        help="Add causal breadth, equal-weight return and dispersion features.")
+    parser.add_argument("--market-realized-vol-window", type=int, default=20)
     parser.add_argument("--market-transformer-width", type=int, default=32)
     parser.add_argument("--market-transformer-heads", type=int, default=4)
     parser.add_argument("--market-transformer-layers", type=int, default=1)
@@ -60,12 +65,18 @@ def main(argv=None):
             raise ValueError(f"Selected tickers missing from dataset: {sorted(missing)}")
         frame = frame.loc[frame[config.group_col].isin(selected)].copy()
     frame, _ = apply_feature_sources(frame, args, config)
+    market_context = (
+        read_parquet_dataset(args.market_context_data)
+        if args.market_context_data else None
+    )
     ablation = MarketAblationConfig(
         close_columns=tuple(item.strip() for item in args.market_close_columns.split(",")),
         date_batch_size=args.date_batch_size,
         transformer_width=args.market_transformer_width,
         transformer_heads=args.market_transformer_heads,
         transformer_layers=args.market_transformer_layers,
+        include_cross_section=args.market_cross_section,
+        realized_vol_window=args.market_realized_vol_window,
     )
     target = args.output_dir or comparisons_dir() / ("market-gru-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
     return run_market_gru_ablation(
@@ -74,7 +85,8 @@ def main(argv=None):
         initial_train_fraction=args.cv_initial_train_fraction,
         inner_val_fraction=args.cv_inner_val_fraction,
         gap_bars=args.cv_gap_bars, embargo_bars=args.cv_embargo_bars,
-        dataset_path=args.data, resume=args.resume,
+        dataset_path=args.data, market_context=market_context,
+        market_context_path=args.market_context_data, resume=args.resume,
     )
 
 

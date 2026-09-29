@@ -74,3 +74,52 @@ def test_graph_ablation_uses_matched_folds_and_resumes_without_retraining(tmp_pa
     assert len({(row["candidate"], row["seed"], row["fold"]) for row in resumed["folds"]}) == 10
     with pytest.raises(ValueError, match="Resume metadata"):
         run_graph_ablation(*args, **{**options, "ablation": replace(ablation, graph_threshold=.4)}, resume=True)
+
+
+def test_graph_ablation_supports_topk_residuals_and_market_transformer_gate(tmp_path):
+    frame = _frame()
+    dates = pd.DatetimeIndex(frame["date"].unique())
+    context = pd.DataFrame({
+        "date": dates,
+        "spy_close": 300 + .2 * np.arange(len(dates)) + np.sin(np.arange(len(dates)) / 9),
+        "xlf_close": 100 + .1 * np.arange(len(dates)) + np.sin(np.arange(len(dates)) / 7),
+        "xle_close": 80 + .08 * np.arange(len(dates)) + np.cos(np.arange(len(dates)) / 8),
+    })
+    context["source_end"] = context["date"] + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+    market = pd.DataFrame({
+        "date": dates,
+        "spy_return": context["spy_close"].pct_change(fill_method=None),
+        "source_end": context["source_end"],
+    })
+    config = replace(DEFAULT_CONFIG, context_len=5, device="cpu")
+    ablation = GraphAblationConfig(
+        graph_lookback=10,
+        graph_weight_mode="absolute",
+        graph_neighbors=1,
+        graph_rebalance_bars=3,
+        gnn_hidden_size=4,
+        date_batch_size=16,
+        candidates=("gru", "rolling_topk_market", "rolling_residual_topk_market"),
+        market_transformer_width=8,
+        market_transformer_heads=2,
+    )
+    report = run_graph_ablation(
+        frame,
+        config,
+        FinancialLossConfig("sharpe"),
+        {"hidden_size": 4, "epochs": 1, "early_stopping_patience": 1},
+        [1],
+        tmp_path / "relational-market",
+        ablation=ablation,
+        n_splits=2,
+        gap_bars=2,
+        graph_context=context,
+        sector_context_columns={"Finance": "xlf_close", "Energy": "xle_close"},
+        market_frame=market,
+        market_columns=("spy_return",),
+    )
+    assert len(report["folds"]) == 6
+    assert {row["candidate"] for row in report["summary"]} == set(ablation.candidates)
+    residual = next(row for row in report["folds"]
+                    if row["candidate"] == "rolling_residual_topk_market")
+    assert residual["graph_outer"]["mean_isolated"] == 0

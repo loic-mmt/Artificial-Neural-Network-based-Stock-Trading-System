@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+.venv/bin/python scripts/run_gnn_graph_comparison.py \
+  --data data/processed/mt5_stocks_us_daily_clean.parquet \
+  --ticker-selection configs/benchmark/stocks_us_gnn_complete_2005.json \
+  --preset multi_ticker_long_short \
+  --models gru \
+  --model-parameter-sets configs/benchmark/gru_market_context.json \
+  --losses combined \
+  --combined-weights 0.25 \
+  --loss-cost-bps 5 \
+  --selection-metric regularized_sharpe \
+  --context-len 60 \
+  --position-mode long_short \
+  --execution-delay 1 \
+  --train-ratio 0.7 \
+  --val-ratio 0.15 \
+  --label-method triple-barrier \
+  --label-max-holding 10 \
+  --label-vol-window 20 \
+  --label-volatility-estimator atr \
+  --label-profit-barrier 0.75 \
+  --label-stop-barrier 0.75 \
+  --label-event-filter cusum \
+  --label-cusum-threshold 0.5 \
+  --label-between-events hold \
+  --label-cost-bps 5 \
+  --feature-set expanded \
+  --feature-groups technical,market,sector \
+  --no-external-features \
+  --overfitting-control \
+  --overfitting-max-features 32 \
+  --overfitting-max-feature-correlation 0.95 \
+  --graph-candidates gru,gru_market,identity,sector,rolling_topk,rolling_residual_topk,rolling_topk_market,rolling_residual_topk_market \
+  --graph-lookback 252 \
+  --graph-weight-mode absolute \
+  --graph-neighbors 5 \
+  --graph-rebalance-bars 20 \
+  --market-context-data data/processed/us_market_context_daily.parquet \
+  --market-close-columns vix_close,spy_close,qqq_close,iwm_close,xlb_close,vox_close,xle_close,xlf_close,xli_close,xlk_close,xlp_close,vnq_close,xlu_close,xlv_close,xly_close \
+  --market-cross-section \
+  --market-realized-vol-window 20 \
+  --market-transformer-width 32 \
+  --market-transformer-heads 4 \
+  --market-transformer-layers 1 \
+  --market-gate-temperature 1.0 \
+  --gnn-hidden-size 32 \
+  --gnn-layers 1 \
+  --gnn-dropout 0.0 \
+  --date-batch-size 16 \
+  --cv-folds 3 \
+  --cv-gap-bars 5 \
+  --cv-score regularized_sharpe \
+  --seeds 1,7,19 \
+  --device auto \
+  --output-dir artifacts/comparisons/us-relational-market/01-combined-025 \
+  --fail-fast

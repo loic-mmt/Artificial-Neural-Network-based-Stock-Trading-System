@@ -47,6 +47,31 @@ def test_market_frame_rejects_conflicts_and_unverified_macro():
         build_close_market_frame(frame, "date", ("ust10y",))
 
 
+def test_market_frame_accepts_audited_etfs_and_cross_sectional_state():
+    frame = _frame()
+    days = pd.date_range("2020-01-01", periods=160, freq="B", tz="UTC")
+    context = pd.DataFrame({
+        "date": days,
+        "spy_close": 300 + np.arange(len(days)) * .2,
+        "xlk_close": 100 + np.arange(len(days)) * .1,
+        "source_end": days + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1),
+    })
+    result, audit = build_close_market_frame(
+        frame, "date", ("vix_close", "spy_close", "xlk_close"),
+        context_frame=context, include_cross_section=True, realized_vol_window=5,
+    )
+    assert {"spy_close_ret_1", "xlk_close_ret_1", "breadth_positive",
+            "return_dispersion", "broad_realized_vol_5"}.issubset(result)
+    assert audit["external_context"] is True
+    assert audit["cross_sectional_features"] is True
+    changed = context.copy()
+    changed.loc[0, "source_end"] = days[0] + pd.Timedelta(days=1)
+    with pytest.raises(ValueError, match="future information"):
+        build_close_market_frame(
+            frame, "date", ("spy_close",), context_frame=changed,
+        )
+
+
 def test_market_ablation_matches_folds_and_resumes(tmp_path):
     frame = _frame()
     config = replace(DEFAULT_CONFIG, context_len=5, device="cpu")

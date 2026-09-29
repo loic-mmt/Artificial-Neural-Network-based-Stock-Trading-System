@@ -62,3 +62,52 @@ def test_graph_builder_rejects_missing_history_and_future_prediction():
         _build(frame, "train_pearson", ["2020-01-03"])
     with pytest.raises(ValueError, match="Prediction sessions"):
         _build(frame, "sector", ["2020-01-15"])
+
+
+def test_topk_graph_has_neighbors_and_honors_rebalance_schedule():
+    frame = _prices()
+    graphs = build_graph_snapshots(
+        frame,
+        tickers=("A", "B", "C"),
+        prediction_sessions=["2020-01-07", "2020-01-08", "2020-01-10"],
+        training_end="2020-01-09T00:00:00Z",
+        config=GraphBuildConfig(
+            "rolling_topk", lookback=4, weight_mode="absolute",
+            neighbors=1, rebalance_bars=2,
+        ),
+    )
+    for graph in graphs:
+        assert np.bincount(graph.edge_index[1], minlength=3).min() >= 1
+        edges = set(map(tuple, graph.edge_index.T))
+        assert all((destination, source) in edges for source, destination in edges)
+    assert graphs[1].source_end == graphs[0].source_end
+    assert graphs[2].source_end > graphs[1].source_end
+
+
+def test_residual_topk_uses_only_causal_market_and_sector_context():
+    frame = _prices()
+    dates = pd.date_range("2020-01-01", periods=12, tz="UTC")
+    context = pd.DataFrame({
+        "date": dates,
+        "spy_close": 100 + np.arange(12) + np.sin(np.arange(12)),
+        "industrial_close": 80 + .7 * np.arange(12) + np.cos(np.arange(12)),
+        "energy_close": 70 + .4 * np.arange(12) + np.sin(np.arange(12) / 2),
+    })
+    options = dict(
+        tickers=("A", "B", "C"), prediction_sessions=["2020-01-07"],
+        training_end="2020-01-09T00:00:00Z",
+        config=GraphBuildConfig(
+            "rolling_residual_topk", lookback=4, weight_mode="absolute", neighbors=1,
+        ),
+        context_frame=context,
+        sector_context_columns={
+            "industrial": "industrial_close", "energy": "energy_close",
+        },
+    )
+    original = build_graph_snapshots(frame, **options)[0]
+    future = context.copy()
+    future.loc[future.date.ge("2020-01-08"), "spy_close"] *= 10
+    unchanged = build_graph_snapshots(frame, **{**options, "context_frame": future})[0]
+    np.testing.assert_array_equal(original.edge_index, unchanged.edge_index)
+    np.testing.assert_allclose(original.edge_weight, unchanged.edge_weight)
+    assert np.bincount(original.edge_index[1], minlength=3).min() == 1

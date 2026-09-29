@@ -13,7 +13,9 @@ import numpy as np
 import pandas as pd
 
 from trading_system.artifacts.experiment import _nullable_metadata, hash_dataframe
-from trading_system.data.causal_graphs import GraphBuildConfig, build_graph_snapshots, graph_diagnostics
+from trading_system.data.causal_graphs import (
+    GRAPH_MODES, GraphBuildConfig, build_graph_snapshots, graph_diagnostics,
+)
 from trading_system.data.multimodal import build_multimodal_dataset
 from trading_system.data.purged_cv import expanding_calendar_folds
 from trading_system.data.scaling import Standardizer
@@ -21,7 +23,9 @@ from trading_system.evaluation.classification import evaluate_predictions
 from trading_system.features.expanded import ExpandedFeatureSelector
 from trading_system.features.fracdiff import FracDiffTransformer
 from trading_system.models.multimodal_branches import GRUBranch, GNNBranch
-from trading_system.models.neural.config import GRUConfig
+from trading_system.models.market_gnn import MarketGNNControl
+from trading_system.models.market_gru_ablation import MarketGRUControl
+from trading_system.models.neural.config import GRUConfig, TransformerConfig
 from trading_system.models.neural.trainer import resolve_device, seed_torch_run
 from trading_system.models.specs import ModelSelection
 from trading_system.reporting.warnings import current_universe_warning
@@ -34,24 +38,56 @@ from .runner import _filter_universe, _prepare_splits
 MODES = ("gru", "identity", "sector", "train_pearson", "rolling_pearson")
 
 
+def _candidate_parts(candidate: str) -> tuple[str, bool]:
+    market = candidate.endswith("_market")
+    base = candidate[:-7] if market else candidate
+    if base != "gru" and base not in GRAPH_MODES:
+        raise ValueError(f"Unsupported graph candidate: {candidate}")
+    return base, market
+
+
 @dataclass(frozen=True)
 class GraphAblationConfig:
     graph_lookback: int = 252
     graph_threshold: float = 0.7
     graph_weight_mode: str = "positive"
+    graph_neighbors: int = 5
+    graph_rebalance_bars: int = 1
     gnn_hidden_size: int = 32
     gnn_layers: int = 1
     gnn_dropout: float = 0.0
     date_batch_size: int = 32
+    candidates: tuple[str, ...] = MODES
+    market_transformer_width: int = 32
+    market_transformer_heads: int = 4
+    market_transformer_layers: int = 1
+    market_gate_temperature: float = 1.0
 
     def __post_init__(self) -> None:
-        GraphBuildConfig("train_pearson", self.graph_lookback,
-                         self.graph_threshold, self.graph_weight_mode)
+        GraphBuildConfig(
+            "train_pearson", self.graph_lookback, self.graph_threshold,
+            self.graph_weight_mode, self.graph_neighbors, self.graph_rebalance_bars,
+        )
         if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0
-               for value in (self.gnn_hidden_size, self.gnn_layers, self.date_batch_size)):
+               for value in (
+                   self.gnn_hidden_size, self.gnn_layers, self.date_batch_size,
+                   self.market_transformer_width, self.market_transformer_heads,
+                   self.market_transformer_layers,
+               )):
             raise ValueError("GNN width, layers and date batch size must be positive integers.")
         if not np.isfinite(self.gnn_dropout) or not 0 <= self.gnn_dropout < 1:
             raise ValueError("gnn_dropout must be in [0, 1).")
+        if (not self.candidates or len(self.candidates) != len(set(self.candidates))
+                or any(not isinstance(item, str) for item in self.candidates)):
+            raise ValueError("Graph candidates must be unique non-empty names.")
+        if "gru" not in self.candidates:
+            raise ValueError("Graph candidates must retain the matched GRU reference.")
+        for candidate in self.candidates:
+            _candidate_parts(candidate)
+        if self.market_transformer_width % self.market_transformer_heads:
+            raise ValueError("Market Transformer width must be divisible by head count.")
+        if not np.isfinite(self.market_gate_temperature) or self.market_gate_temperature <= 0:
+            raise ValueError("Market gate temperature must be positive.")
 
 
 def _dates(frame, date_col):
@@ -120,34 +156,68 @@ def _prepare(frame, config, ablation):
     )
 
 
-def _graphs(frame, config, prepared, ablation, mode, target):
+def _graphs(
+    frame, config, prepared, ablation, candidate, target, *,
+    graph_context=None, sector_context_columns=None,
+):
+    mode, _ = _candidate_parts(candidate)
     if mode in ("gru", "identity"):
         return (), {"sessions": len(_dates(target, config.date_col).unique()),
                     "mean_density": 0.0,
                     "mean_isolated": float(len(prepared.tickers)) if mode == "identity" else None,
                     "mean_degree": 0.0, "mean_edge_turnover": 0.0}
-    graph_config = GraphBuildConfig(mode, ablation.graph_lookback,
-                                     ablation.graph_threshold, ablation.graph_weight_mode)
+    graph_config = GraphBuildConfig(
+        mode, ablation.graph_lookback, ablation.graph_threshold,
+        ablation.graph_weight_mode, ablation.graph_neighbors,
+        ablation.graph_rebalance_bars,
+    )
     sessions = _dates(target, config.date_col).unique().sort_values()
     train_end = _dates(prepared.history_validation, config.date_col).max()
     snapshots = build_graph_snapshots(
         frame, tickers=sorted(frame[config.group_col].unique()),
         prediction_sessions=sessions, training_end=train_end, config=graph_config,
         date_col=config.date_col, ticker_col=config.group_col, price_col=config.price_col,
+        context_frame=graph_context,
+        sector_context_columns=sector_context_columns,
     )
     return snapshots, graph_diagnostics(snapshots, frame[config.group_col].nunique())
 
 
-def _dataset(target, history, columns, config, graphs):
+def _dataset(
+    target, history, columns, config, graphs, *, market=None,
+    market_columns=(), require_market=False,
+):
     dataset = build_multimodal_dataset(
         target, tickers=sorted(target[config.group_col].unique()), context_len=config.context_len,
         temporal_columns=columns, node_columns=columns, history_frame=history,
         graphs=graphs, date_col=config.date_col, ticker_col=config.group_col,
+        market_frame=market,
+        market_close_columns=market_columns,
+        market_context_len=config.context_len,
     )
     for batch in dataset.iter_batches(128):
         if not batch.asset_mask.all() or not batch.temporal_mask.all() or not batch.node_mask.all():
             raise ValueError("Graph ablation requires identical complete GRU/GNN ticker-date rows.")
+        if require_market and not batch.market_sequence_mask.all():
+            first = next(str(day) for day, ok in zip(batch.sessions, batch.market_sequence_mask) if not ok)
+            raise ValueError(f"Incomplete market context at {first}.")
     return dataset
+
+
+def _scaled_market_for_fold(market, columns, train, config):
+    if market is None or not columns:
+        return market, None
+    fit_dates = set(_dates(train.loc[train["_fit_eligible"]], config.date_col))
+    fit = market.loc[market[config.date_col].isin(fit_dates), list(columns)].dropna()
+    if fit.empty:
+        raise ValueError("No complete train-only market observations for scaling.")
+    scaler = Standardizer().fit(fit.to_numpy(dtype=np.float32))
+    scaled = market.copy()
+    valid = scaled[list(columns)].notna().all(axis=1)
+    scaled.loc[valid, list(columns)] = scaler.transform(
+        scaled.loc[valid, list(columns)].to_numpy(dtype=np.float32)
+    )
+    return scaled, scaler
 
 
 def _positions(model, dataset, *, mode, config, batch_dates, torch, backward=None,
@@ -259,7 +329,12 @@ def run_graph_ablation(frame, config, loss, gru_parameters, seeds, destination, 
                        ablation=GraphAblationConfig(), n_splits=3,
                        initial_train_fraction=.5, inner_val_fraction=.2,
                        gap_bars=5, embargo_bars=0, dataset_path=None,
-                       resume=False):
+                       graph_context: pd.DataFrame | None = None,
+                       graph_context_path=None,
+                       sector_context_columns=None,
+                       market_frame: pd.DataFrame | None = None,
+                       market_columns=(), market_audit=None,
+                       market_context_path=None, resume=False):
     """Evaluate G0-G4 on matched outer folds; final holdout stays unopened."""
     import torch
 
@@ -271,6 +346,17 @@ def run_graph_ablation(frame, config, loss, gru_parameters, seeds, destination, 
         raise ValueError("Graph ablation does not support classification sample weights.")
     if not seeds or len(seeds) != len(set(seeds)):
         raise ValueError("Seeds must be non-empty and unique.")
+    candidates = ablation.candidates
+    needs_market = any(_candidate_parts(candidate)[1] for candidate in candidates)
+    needs_residual = any(
+        _candidate_parts(candidate)[0] == "rolling_residual_topk"
+        for candidate in candidates
+    )
+    market_columns = tuple(market_columns)
+    if needs_market and (market_frame is None or not market_columns):
+        raise ValueError("Market-gated candidates require a prepared market frame.")
+    if needs_residual and graph_context is None:
+        raise ValueError("Residual top-k candidates require ETF graph context.")
     config = replace(config, model=ModelSelection("gru", dict(gru_parameters)))
     target = Path(destination).expanduser().resolve()
     if target.exists() and not resume:
@@ -290,6 +376,13 @@ def run_graph_ablation(frame, config, loss, gru_parameters, seeds, destination, 
                 "seeds": list(seeds), "n_splits": n_splits,
                 "dataset_sha256": hash_dataframe(work),
                 "dataset_path": str(Path(dataset_path).resolve()) if dataset_path else None,
+                "graph_context_path": str(Path(graph_context_path).resolve()) if graph_context_path else None,
+                "graph_context_sha256": hash_dataframe(graph_context) if graph_context is not None else None,
+                "sector_context_columns": dict(sector_context_columns or {}),
+                "market_context_path": str(Path(market_context_path).resolve()) if market_context_path else None,
+                "market_context_sha256": hash_dataframe(market_frame) if market_frame is not None else None,
+                "market_columns": market_columns,
+                "market_audit": market_audit,
                 "survivor_bias_warning": current_universe_warning(dataset_path),
                 "final_split": asdict(final_split), "final_holdout_opened": False,
                 "protocol": "matched_purged_graph_ablation"}
@@ -306,6 +399,15 @@ def run_graph_ablation(frame, config, loss, gru_parameters, seeds, destination, 
         target.mkdir(parents=True)
         (target / "metadata.json").write_text(json.dumps(metadata, indent=2, allow_nan=False))
         rows, completed = [], set()
+    transformer_template = TransformerConfig(
+        d_model=ablation.market_transformer_width,
+        n_heads=ablation.market_transformer_heads,
+        num_layers=ablation.market_transformer_layers,
+        dim_feedforward=2 * ablation.market_transformer_width,
+        dropout=0.0,
+        pooling="last",
+        causal_attention=True,
+    )
     for fold in folds:
         fold_frame = work.loc[pd.to_datetime(work[config.date_col], utc=True) <= pd.Timestamp(fold["end"])].copy()
         fold_config = replace(config, purged_split=fold["split"])
@@ -316,26 +418,61 @@ def run_graph_ablation(frame, config, loss, gru_parameters, seeds, destination, 
         val_panel = ReturnPanel(prepared.validation, price_col=config.price_col,
                                 date_col=config.date_col, group_col=config.group_col,
                                 execution_delay=config.execution_delay)
+        fold_market, market_scaler = _scaled_market_for_fold(
+            market_frame, market_columns, prepared.history_validation, config,
+        )
         graphs_by_mode = {}
-        for mode in MODES:
-            if all((mode, seed, fold["fold"]) in completed for seed in seeds):
+        for candidate in candidates:
+            if all((candidate, seed, fold["fold"]) in completed for seed in seeds):
                 continue
-            graphs_train, diag_train = _graphs(fold_frame, config, prepared, ablation, mode, prepared.train)
-            graphs_val, diag_val = _graphs(fold_frame, config, prepared, ablation, mode, prepared.validation)
-            graph_path = _write_graphs(target / f"fold-{fold['fold']}-{mode}-graphs.json.gz",
+            mode, market_gate = _candidate_parts(candidate)
+            if mode not in graphs_by_mode:
+                graphs_by_mode[mode] = (
+                    *_graphs(
+                        fold_frame, config, prepared, ablation, candidate, prepared.train,
+                        graph_context=graph_context,
+                        sector_context_columns=sector_context_columns,
+                    ),
+                    *_graphs(
+                        fold_frame, config, prepared, ablation, candidate, prepared.validation,
+                        graph_context=graph_context,
+                        sector_context_columns=sector_context_columns,
+                    ),
+                )
+            graphs_train, diag_train, graphs_val, diag_val = graphs_by_mode[mode]
+            graph_path = _write_graphs(target / f"fold-{fold['fold']}-{candidate}-graphs.json.gz",
                                        (*graphs_train, *graphs_val))
             train_ds = _dataset(prepared.train, prepared.history_train,
-                                prepared.columns, config, graphs_train)
+                                prepared.columns, config, graphs_train,
+                                market=fold_market, market_columns=market_columns,
+                                require_market=market_gate)
             val_ds = _dataset(prepared.validation, prepared.history_validation,
-                              prepared.columns, config, graphs_val)
+                              prepared.columns, config, graphs_val,
+                              market=fold_market, market_columns=market_columns,
+                              require_market=market_gate)
             for seed in seeds:
-                if (mode, seed, fold["fold"]) in completed:
+                if (candidate, seed, fold["fold"]) in completed:
                     continue
                 seed_torch_run(seed, training_template.deterministic, torch)
                 device = resolve_device(config.device, torch)
                 training = replace(training_template, seed=seed, device=config.device)
-                if mode == "gru":
+                if mode == "gru" and market_gate:
+                    model = MarketGRUControl(
+                        "market_gate_transformer", len(prepared.columns),
+                        len(market_columns), config.context_len, training,
+                        transformer_template,
+                    ).to(device)
+                elif mode == "gru":
                     model = GRUBranch(len(prepared.columns), config.context_len, training).to(device)
+                elif market_gate:
+                    model = MarketGNNControl(
+                        len(prepared.columns), len(market_columns), config.context_len,
+                        transformer_template, hidden_size=ablation.gnn_hidden_size,
+                        num_layers=ablation.gnn_layers, dropout=ablation.gnn_dropout,
+                        graph_mode="identity" if mode == "identity" else "provided",
+                        market_gate=True,
+                        gate_temperature=ablation.market_gate_temperature,
+                    ).to(device)
                 else:
                     model = GNNBranch(len(prepared.columns), hidden_size=ablation.gnn_hidden_size,
                                       num_layers=ablation.gnn_layers, dropout=ablation.gnn_dropout,
@@ -344,7 +481,7 @@ def run_graph_ablation(frame, config, loss, gru_parameters, seeds, destination, 
                               loss, config, training, ablation, torch)
                 model.eval()
                 with torch.no_grad():
-                    positions = _positions(model, val_ds, mode=mode, config=config,
+                    positions = _positions(model, val_ds, mode=candidate, config=config,
                                            batch_dates=ablation.date_batch_size, torch=torch)
                 inner = val_panel.metrics(positions, loss, config.initial_capital)
                 # Outer validation is prepared only after the checkpoint is fixed.
@@ -361,23 +498,34 @@ def run_graph_ablation(frame, config, loss, gru_parameters, seeds, destination, 
                 history_outer = pd.concat((raw_train, raw_val), ignore_index=True)
                 outer_scaled = _scale(outer, prepared.columns, prepared.scaler)
                 history_scaled = _scale(history_outer, prepared.columns, prepared.scaler)
-                graphs_outer, diag_outer = _graphs(fold_frame, config, prepared, ablation, mode, outer_scaled)
-                outer_ds = _dataset(outer_scaled, history_scaled, prepared.columns, config, graphs_outer)
+                outer_key = (mode, "outer")
+                if outer_key not in graphs_by_mode:
+                    graphs_by_mode[outer_key] = _graphs(
+                        fold_frame, config, prepared, ablation, candidate, outer_scaled,
+                        graph_context=graph_context,
+                        sector_context_columns=sector_context_columns,
+                    )
+                graphs_outer, diag_outer = graphs_by_mode[outer_key]
+                outer_ds = _dataset(
+                    outer_scaled, history_scaled, prepared.columns, config, graphs_outer,
+                    market=fold_market, market_columns=market_columns,
+                    require_market=market_gate,
+                )
                 outer_panel = ReturnPanel(outer_scaled, price_col=config.price_col,
                                           date_col=config.date_col, group_col=config.group_col,
                                           execution_delay=config.execution_delay)
                 with torch.no_grad():
                     outer_positions, outer_probabilities = _positions(
-                        model, outer_ds, mode=mode, config=config,
+                        model, outer_ds, mode=candidate, config=config,
                         batch_dates=ablation.date_batch_size, torch=torch,
                         return_probabilities=True,
                     )
                 outer_metrics = outer_panel.metrics(outer_positions, loss, config.initial_capital)
                 classification = _classification(outer, outer_probabilities)
                 outer_graph_path = _write_graphs(
-                    target / f"fold-{fold['fold']}-{mode}-outer-graphs.json.gz", graphs_outer
-                ) if seed == seeds[0] else str(target / f"fold-{fold['fold']}-{mode}-outer-graphs.json.gz") if graphs_outer else None
-                row = {"candidate": mode, "seed": seed, "fold": fold["fold"],
+                    target / f"fold-{fold['fold']}-{candidate}-outer-graphs.json.gz", graphs_outer
+                ) if seed == seeds[0] else str(target / f"fold-{fold['fold']}-{candidate}-outer-graphs.json.gz") if graphs_outer else None
+                row = {"candidate": candidate, "seed": seed, "fold": fold["fold"],
                        "status": "ok", "inner_metrics": inner, "outer_metrics": outer_metrics,
                        "classification": classification,
                        "score": outer_metrics["regularized_sharpe"], "fit": fitted,
@@ -387,18 +535,25 @@ def run_graph_ablation(frame, config, loss, gru_parameters, seeds, destination, 
                        "purging": prepared.purging, "feature_columns": prepared.columns,
                        "train_dates": len(train_ds), "inner_dates": len(val_ds),
                        "outer_dates": len(outer_ds)}
-                model_path = target / f"fold-{fold['fold']}-{mode}-seed-{seed}.pt"
+                model_path = target / f"fold-{fold['fold']}-{candidate}-seed-{seed}.pt"
                 torch.save({"model_state": model.state_dict(),
                             "scaler_mean": prepared.scaler.mean_,
                             "scaler_scale": prepared.scaler.scale_,
                             "feature_columns": prepared.columns,
-                            "mode": mode, "seed": seed}, model_path)
+                            "mode": candidate, "seed": seed,
+                            "market_columns": market_columns,
+                            "market_scaler_mean": (
+                                market_scaler.mean_ if market_scaler is not None else None
+                            ),
+                            "market_scaler_scale": (
+                                market_scaler.scale_ if market_scaler is not None else None
+                            )}, model_path)
                 row["model_artifact"] = str(model_path)
                 rows.append(row)
                 (target / "folds.json").write_text(json.dumps(_nullable_metadata(rows), indent=2, allow_nan=False))
-                print(f"graph_cv={len(rows)}/{len(MODES)*len(seeds)*len(folds)} {mode} seed={seed} fold={fold['fold']} score={row['score']:.4f}", flush=True)
+                print(f"graph_cv={len(rows)}/{len(candidates)*len(seeds)*len(folds)} {candidate} seed={seed} fold={fold['fold']} score={row['score']:.4f}", flush=True)
     summary = []
-    for mode in MODES:
+    for mode in candidates:
         selected = [row for row in rows if row["candidate"] == mode]
         scores = np.asarray([row["score"] for row in selected])
         summary.append({"candidate": mode, "mean": float(scores.mean()),
@@ -412,7 +567,9 @@ def run_graph_ablation(frame, config, loss, gru_parameters, seeds, destination, 
                         "complete": len(selected) == len(seeds) * len(folds)})
     reference = {(row["seed"], row["fold"]): row for row in rows if row["candidate"] == "gru"}
     paired = []
-    for mode in MODES[1:]:
+    for mode in candidates:
+        if mode == "gru":
+            continue
         selected = [row for row in rows if row["candidate"] == mode]
         score_delta = [row["score"] - reference[row["seed"], row["fold"]]["score"] for row in selected]
         paired.append({"candidate": mode, "mean_score_delta": float(np.mean(score_delta)),

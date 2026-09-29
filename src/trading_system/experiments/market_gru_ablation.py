@@ -31,35 +31,66 @@ class MarketAblationConfig:
     transformer_width: int = 32
     transformer_heads: int = 4
     transformer_layers: int = 1
+    include_cross_section: bool = False
+    realized_vol_window: int = 20
 
     def __post_init__(self):
         if not self.close_columns or len(set(self.close_columns)) != len(self.close_columns):
             raise ValueError("Choose unique market close columns.")
         if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0
                for value in (self.date_batch_size, self.transformer_width,
-                             self.transformer_heads, self.transformer_layers)):
+                             self.transformer_heads, self.transformer_layers,
+                             self.realized_vol_window)):
             raise ValueError("Batch size and Transformer dimensions must be positive integers.")
         if self.transformer_width % self.transformer_heads:
             raise ValueError("Transformer width must be divisible by head count.")
 
 
-def build_close_market_frame(frame: pd.DataFrame, date_col: str,
-                             close_columns: tuple[str, ...]) -> tuple[pd.DataFrame, dict]:
+def build_close_market_frame(
+    frame: pd.DataFrame,
+    date_col: str,
+    close_columns: tuple[str, ...],
+    *,
+    context_frame: pd.DataFrame | None = None,
+    include_cross_section: bool = False,
+    realized_vol_window: int = 20,
+    price_col: str = "adj_close",
+    ticker_col: str = "ticker",
+) -> tuple[pd.DataFrame, dict]:
     """Derive causal close-session features; never pretend macro releases are close data."""
     allowed = {"market_close", "vix_close", "dxy_close", "oil_close", "gold_close"}
+    if context_frame is not None:
+        allowed.update(column for column in context_frame if column.endswith("_close"))
     if set(close_columns) - allowed:
         raise ValueError(f"Only audited close-series names are allowed: {sorted(set(close_columns) - allowed)}")
-    missing = set(close_columns) - set(frame)
+    available = set(frame) | (set(context_frame) if context_frame is not None else set())
+    missing = set(close_columns) - available
     if missing:
         raise ValueError(f"Market close columns absent from input: {sorted(missing)}")
-    work = frame[[date_col, *close_columns]].copy()
+    local_columns = tuple(column for column in close_columns if column in frame)
+    work = frame[[date_col, *local_columns]].copy()
     work[date_col] = pd.to_datetime(work[date_col], utc=True).dt.normalize()
     grouped = work.groupby(date_col, sort=True)
-    conflicts = grouped[list(close_columns)].nunique(dropna=True).gt(1)
-    if conflicts.any().any():
-        bad = conflicts.stack().loc[lambda values: values].index[0]
-        raise ValueError(f"Conflicting global market value at {bad[0]} for {bad[1]}.")
-    daily = grouped[list(close_columns)].first().reset_index()
+    if local_columns:
+        conflicts = grouped[list(local_columns)].nunique(dropna=True).gt(1)
+        if conflicts.any().any():
+            bad = conflicts.stack().loc[lambda values: values].index[0]
+            raise ValueError(f"Conflicting global market value at {bad[0]} for {bad[1]}.")
+        daily = grouped[list(local_columns)].first().reset_index()
+    else:
+        daily = pd.DataFrame({date_col: sorted(work[date_col].unique())})
+    external_columns = tuple(column for column in close_columns if column not in frame)
+    if external_columns:
+        if context_frame is None or date_col not in context_frame or "source_end" not in context_frame:
+            raise ValueError("External close context requires date and source_end columns.")
+        external = context_frame[[date_col, *external_columns, "source_end"]].copy()
+        external[date_col] = pd.to_datetime(external[date_col], utc=True).dt.normalize()
+        if external[date_col].duplicated().any():
+            raise ValueError("External close context requires one row per session.")
+        source_end = pd.to_datetime(external["source_end"], utc=True, errors="raise")
+        if (source_end >= external[date_col] + pd.Timedelta(days=1)).any():
+            raise ValueError("External close context uses future information.")
+        daily = daily.merge(external.drop(columns="source_end"), on=date_col, how="left")
     features = {}
     for column in close_columns:
         series = pd.to_numeric(daily[column], errors="coerce")
@@ -69,11 +100,45 @@ def build_close_market_frame(frame: pd.DataFrame, date_col: str,
             features["vix_level"] = series
         features[f"{column}_ret_1"] = series.pct_change(fill_method=None)
     result = pd.DataFrame({date_col: daily[date_col], **features})
+    if include_cross_section:
+        required = {date_col, ticker_col, price_col}
+        if required - set(frame):
+            raise ValueError(f"Cross-sectional market features need {sorted(required)}.")
+        prices = frame[[date_col, ticker_col, price_col]].copy()
+        prices[date_col] = pd.to_datetime(prices[date_col], utc=True).dt.normalize()
+        if prices.duplicated([date_col, ticker_col]).any():
+            raise ValueError("Cross-sectional market features require unique stock rows.")
+        panel = prices.pivot(index=date_col, columns=ticker_col, values=price_col).sort_index()
+        stock_returns = panel.pct_change(fill_method=None)
+        cross = pd.DataFrame({
+            date_col: stock_returns.index,
+            "breadth_positive": stock_returns.gt(0).mean(axis=1),
+            "equal_weight_return": stock_returns.mean(axis=1),
+            "return_dispersion": stock_returns.std(axis=1, ddof=0),
+            "mean_abs_return": stock_returns.abs().mean(axis=1),
+        }).reset_index(drop=True)
+        result = result.merge(cross, on=date_col, how="left")
+        features.update({name: result[name] for name in (
+            "breadth_positive", "equal_weight_return", "return_dispersion",
+            "mean_abs_return",
+        )})
+        broad = "spy_close_ret_1" if "spy_close_ret_1" in result else (
+            "market_close_ret_1" if "market_close_ret_1" in result else None
+        )
+        if broad is not None:
+            name = f"broad_realized_vol_{realized_vol_window}"
+            result[name] = result[broad].rolling(
+                realized_vol_window, min_periods=realized_vol_window
+            ).std(ddof=0)
+            features[name] = result[name]
     # This is a conservative session-end bound, not a vendor publication timestamp.
     # Predictions use close-J data only for execution on J+1 or later.
     result["source_end"] = daily[date_col] + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
     columns = tuple(features)
     report = {"rows": len(result), "features": columns,
+              "close_columns": close_columns,
+              "external_context": context_frame is not None,
+              "cross_sectional_features": include_cross_section,
               "feature_coverage": {name: float(result[name].notna().mean()) for name in columns},
               "source_end_policy": "close-J assumed available for delayed execution; synthetic session-end upper bound"}
     return result, report
@@ -114,7 +179,8 @@ def run_market_gru_ablation(frame, config, loss, gru_parameters, seeds, destinat
                             ablation=MarketAblationConfig(), n_splits=3,
                             initial_train_fraction=.5, inner_val_fraction=.2,
                             gap_bars=5, embargo_bars=0, dataset_path=None,
-                            resume=False):
+                            market_context: pd.DataFrame | None = None,
+                            market_context_path=None, resume=False):
     import torch
 
     if config.universe != "multi" or config.evaluation_mode != "static" or config.execution_delay < 1:
@@ -130,7 +196,14 @@ def run_market_gru_ablation(frame, config, loss, gru_parameters, seeds, destinat
     if resume and not target.is_dir():
         raise FileNotFoundError(f"Cannot resume missing market ablation: {target}")
     work = _align_position_calendar(_filter_universe(frame, config), config)
-    market_raw, market_audit = build_close_market_frame(work, config.date_col, ablation.close_columns)
+    market_raw, market_audit = build_close_market_frame(
+        work, config.date_col, ablation.close_columns,
+        context_frame=market_context,
+        include_cross_section=ablation.include_cross_section,
+        realized_vol_window=ablation.realized_vol_window,
+        price_col=config.price_col,
+        ticker_col=config.group_col,
+    )
     market_columns = tuple(market_audit["features"])
     folds, final_split = expanding_calendar_folds(
         work, n_splits=n_splits, initial_train_fraction=initial_train_fraction,
@@ -151,6 +224,8 @@ def run_market_gru_ablation(frame, config, loss, gru_parameters, seeds, destinat
         "seeds": list(seeds), "n_splits": n_splits,
         "dataset_sha256": hash_dataframe(work),
         "dataset_path": str(Path(dataset_path).resolve()) if dataset_path else None,
+        "market_context_path": str(Path(market_context_path).resolve()) if market_context_path else None,
+        "market_context_sha256": hash_dataframe(market_context) if market_context is not None else None,
         "market_audit": market_audit,
         "survivor_bias_warning": current_universe_warning(dataset_path),
         "final_split": asdict(final_split), "final_holdout_opened": False,
