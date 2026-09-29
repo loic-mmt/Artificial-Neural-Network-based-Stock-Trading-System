@@ -24,11 +24,15 @@ dependencies = [
     "scikit-learn",
     "ipython",
     "tqdm",
+    "python-dotenv",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 neural = ["torch>=2"]
+sentiment = [
+    "news-sentiment-feature-engineering[news] @ git+https://github.com/loic-mmt/news-sentiment-feature-engineering.git@15424a2c9fd086f4af1740a22c4a9cd032981e40",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
