@@ -55,4 +55,5 @@ set -euo pipefail
   --seeds 1,7,19 \
   --device auto \
   --output-dir artifacts/comparisons/us-relational-market/01-combined-025 \
-  --fail-fast
+  --fail-fast \
+  "$@"
