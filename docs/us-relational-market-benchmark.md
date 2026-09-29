@@ -38,7 +38,14 @@ Les graphes utilisent uniquement les 252 séances connues jusqu'à J. Ils sont r
 
 Tous les candidats partagent les mêmes actions, dates, labels triple barrier, coûts, folds, seeds, features sélectionnées sur train et objectif combiné PnL/Sharpe de poids 0,25. Le holdout final reste scellé. Le run complet contient 8 candidats multipliés par 3 seeds et 3 folds, soit 72 entraînements.
 
-Préparer ou actualiser les ETF et la sélection :
+Télécharger et nettoyer les 143 actions depuis un clone Git, sans dépendre du
+dossier local `MT5/` :
+
+```bash
+.venv/bin/python scripts/download_us_benchmark_data.py
+```
+
+Préparer ou actualiser les ETF :
 
 ```bash
 .venv/bin/python scripts/download_us_market_context.py --overwrite

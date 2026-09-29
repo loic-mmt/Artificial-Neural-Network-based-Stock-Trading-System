@@ -30,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=DEFAULT_CONTEXT_DATA)
     parser.add_argument("--ticker-selection-output", type=Path, default=DEFAULT_SELECTION)
     parser.add_argument("--start", default="2005-01-03")
+    parser.add_argument(
+        "--refresh-ticker-selection",
+        action="store_true",
+        help="Recompute the tracked selection from the local stock dataset.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -56,13 +61,16 @@ def main(argv: list[str] | None = None) -> int:
     temporary = destination.with_name(f".{destination.name}.tmp")
     context.to_parquet(temporary, index=False)
     temporary.replace(destination)
-    selected = complete_ticker_selection(stocks, start=first_session, end=last_session)
-    selection = write_ticker_selection(
-        args.ticker_selection_output, selected, start=first_session.date().isoformat(),
-        source=args.stock_data,
-    )
     print(f"context={destination} rows={len(context)} start={context.date.min().date()} end={context.date.max().date()}")
-    print(f"selection={selection} tickers={len(selected)}")
+    if args.refresh_ticker_selection:
+        selected = complete_ticker_selection(stocks, start=first_session, end=last_session)
+        selection = write_ticker_selection(
+            args.ticker_selection_output, selected,
+            start=first_session.date().isoformat(), source=args.stock_data,
+        )
+        print(f"selection={selection} tickers={len(selected)}")
+    else:
+        print(f"selection={args.ticker_selection_output} preserved")
     return 0
 
 
