@@ -327,14 +327,19 @@ def download_history(
     start: str,
     end: str | None,
     batch_size: int,
+    dataset_label: str = "CAC40",
+    threads: bool = True,
+    download_retries: int = 1,
 ) -> Any:
+    if download_retries <= 0:
+        raise ValueError("download_retries must be positive.")
     batches = chunked(constituents["ticker"].tolist(), batch_size)
     company_by_ticker = dict(zip(constituents["ticker"], constituents["company"]))
     frames = []
 
     for batch_index, batch in enumerate(batches, start=1):
         batch_label = ", ".join(batch)
-        print(f"[{batch_index}/{len(batches)}] Telechargement CAC40: {batch_label}")
+        print(f"[{batch_index}/{len(batches)}] Telechargement {dataset_label}: {batch_label}")
 
         raw_data = yfinance_module.download(
             tickers=batch,
@@ -345,19 +350,50 @@ def download_history(
             actions=True,
             progress=False,
             group_by="ticker",
-            threads=True,
+            threads=threads,
         )
 
+        missing_from_batch = []
         for ticker in batch:
             frame = extract_ticker_frame(raw_data, ticker, pandas_module)
             if frame.empty:
-                print(f"  - Aucun resultat pour {ticker}")
+                missing_from_batch.append(ticker)
                 continue
 
             frames.append(normalize_frame(frame, ticker, company_by_ticker[ticker]))
 
+        for ticker in missing_from_batch:
+            recovered = False
+            for attempt in range(1, download_retries + 1):
+                print(
+                    f"  - Reprise {ticker} ({attempt}/{download_retries}, sans threads)",
+                    flush=True,
+                )
+                raw_retry = yfinance_module.download(
+                    tickers=ticker,
+                    start=start,
+                    end=end,
+                    interval="1d",
+                    auto_adjust=False,
+                    actions=True,
+                    progress=False,
+                    group_by="ticker",
+                    threads=False,
+                )
+                frame = extract_ticker_frame(raw_retry, ticker, pandas_module)
+                if not frame.empty:
+                    frames.append(
+                        normalize_frame(frame, ticker, company_by_ticker[ticker])
+                    )
+                    recovered = True
+                    break
+                if attempt < download_retries:
+                    time.sleep(min(2 ** (attempt - 1), 10))
+            if not recovered:
+                print(f"  - Aucun resultat pour {ticker}")
+
     if not frames:
-        raise SystemExit("Aucune donnee CAC40 n'a ete telechargee.")
+        raise SystemExit(f"Aucune donnee {dataset_label} n'a ete telechargee.")
 
     dataset = pandas_module.concat(frames, ignore_index=True)
     dataset["date"] = pandas_module.to_datetime(dataset["date"], errors="coerce")
@@ -410,10 +446,15 @@ def download_yahoo_macro_series(
     yfinance_module: Any,
     start: str,
     end: str | None,
+    market_ticker: str = "^FCHI",
 ) -> Any:
     merged = None
 
-    for ticker, target_col in YAHOO_MACRO_TICKERS.items():
+    macro_tickers = {
+        (market_ticker if target_col == "market_close" else ticker): target_col
+        for ticker, target_col in YAHOO_MACRO_TICKERS.items()
+    }
+    for ticker, target_col in macro_tickers.items():
         print(f"[macro-yahoo] Telechargement {ticker} -> {target_col}")
         frame = _download_single_yahoo_close_series(
             pandas_module=pandas_module,
@@ -706,6 +747,7 @@ def _download_oecd_finmark_series(
     end_inclusive: str,
     timeout: int,
     retries: int,
+    reference_area: str = "FRA",
 ) -> Any:
     # OECD can return HTTP 404 instead of an empty CSV when the requested start
     # month has no published observation yet, especially for IRLT. Query a few
@@ -713,7 +755,7 @@ def _download_oecd_finmark_series(
     # the CAC40 trading calendar and filters back to the requested window.
     start_period = _shift_month_period(start, -3)
     end_period = end_inclusive[:7]
-    path = f"@DF_FINMARK,4.0/FRA.M.{measure}.PA....."
+    path = f"@DF_FINMARK,4.0/{reference_area}.M.{measure}.PA....."
     query = urlencode(
         {
             "startPeriod": start_period,
@@ -722,8 +764,8 @@ def _download_oecd_finmark_series(
         }
     )
     url = f"https://sdmx.oecd.org/public/rest/data/OECD.SDD.STES,DSD_STES{path}?{query}"
-    label = f"OECD {measure}"
-    print(f"[macro-oecd] Telechargement {measure} -> {target_col}")
+    label = f"OECD {reference_area} {measure}"
+    print(f"[macro-oecd] Telechargement {reference_area} {measure} -> {target_col}")
     frame = _read_csv_url_with_retries(
         pandas_module=pandas_module,
         url=url,
@@ -743,7 +785,7 @@ def _download_oecd_finmark_series(
     if "MEASURE" in frame.columns:
         frame = frame[frame["MEASURE"].astype(str).eq(measure)].copy()
     if "REF_AREA" in frame.columns:
-        frame = frame[frame["REF_AREA"].astype(str).eq("FRA")].copy()
+        frame = frame[frame["REF_AREA"].astype(str).eq(reference_area)].copy()
     if "FREQ" in frame.columns:
         frame = frame[frame["FREQ"].astype(str).eq("M")].copy()
 
@@ -766,6 +808,7 @@ def download_oecd_rate_series(
     end_inclusive: str,
     timeout: int,
     retries: int,
+    reference_area: str = "FRA",
 ) -> Any:
     merged = None
 
@@ -778,6 +821,7 @@ def download_oecd_rate_series(
             end_inclusive=end_inclusive,
             timeout=timeout,
             retries=retries,
+            reference_area=reference_area,
         )
 
         if merged is None:
@@ -798,6 +842,7 @@ def download_rate_macro_series(
     end_inclusive: str,
     timeout: int,
     retries: int,
+    reference_area: str = "FRA",
 ) -> Any:
     treasury = download_treasury_yield_series(
         pandas_module=pandas_module,
@@ -812,6 +857,7 @@ def download_rate_macro_series(
         end_inclusive=end_inclusive,
         timeout=timeout,
         retries=retries,
+        reference_area=reference_area,
     )
     return (
         treasury.merge(oecd, on="date", how="outer")
