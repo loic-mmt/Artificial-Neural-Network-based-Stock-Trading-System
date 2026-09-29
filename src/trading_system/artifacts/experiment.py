@@ -147,6 +147,7 @@ def build_experiment_manifest(
         "purging": result.bundle.purging_state,
         "feature_sources": frame.attrs.get("feature_sources"),
         "feature_selection": result.bundle.feature_selector.state_dict() if result.bundle.feature_selector else None,
+        "feature_fill_values": {name: float(value) for name, value in result.bundle.feature_fill_values.items()},
         "overfitting_feature_selection": (
             result.bundle.overfitting_selector.state_dict()
             if result.bundle.overfitting_selector else None
