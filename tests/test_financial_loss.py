@@ -6,7 +6,11 @@ import pytest
 
 from trading_system.training.financial_loss import FinancialLossConfig, ReturnPanel, probabilities_to_positions
 from trading_system.evaluation.position_gate import GateSearchConfig, PositionGate, fit_position_gate
-from trading_system.training.position_trainer import fit_position_model, predict_positions
+from trading_system.training.position_trainer import (
+    fit_position_model,
+    predict_positions,
+    predict_probabilities,
+)
 from trading_system.models.factory import create_default_model_registry
 from trading_system.models.specs import ModelBuildContext, ModelSelection
 from trading_system.experiments.config import ExperimentConfig
@@ -150,6 +154,21 @@ def test_probability_decoder():
     p = np.array([[.2, .3, .5], [1., 0., 0.]])
     np.testing.assert_allclose(probabilities_to_positions(p, "long_short"), [.3, -1])
     np.testing.assert_allclose(probabilities_to_positions(p, "long_only"), [.5, 0])
+
+
+def test_probability_prediction_preserves_batches_and_three_class_contract():
+    class Model:
+        class Config:
+            batch_size = 2
+
+        config = Config()
+
+        def predict_proba(self, values):
+            return np.tile([0.2, 0.3, 0.5], (len(values), 1))
+
+    result = predict_probabilities(Model(), np.zeros((5, 2, 1)))
+    assert result.shape == (5, 3)
+    np.testing.assert_allclose(result, np.tile([0.2, 0.3, 0.5], (5, 1)))
 
 
 def test_position_gate_search_uses_validation_returns_and_preserves_raw_signal():

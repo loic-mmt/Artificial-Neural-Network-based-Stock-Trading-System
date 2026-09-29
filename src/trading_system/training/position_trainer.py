@@ -15,6 +15,19 @@ from trading_system.models.manual_ann.manual_nn import dropout_mask, softmax
 from .financial_loss import position_coefficients, probabilities_to_positions
 
 
+def predict_probabilities(model, values):
+    """Predict Sell/Hold/Buy probabilities in bounded batches."""
+
+    result = np.empty((len(values), 3), dtype=np.float64)
+    for start in range(0, len(values), model.config.batch_size):
+        end = min(start + model.config.batch_size, len(values))
+        batch = np.asarray(model.predict_proba(values[start:end]), dtype=np.float64)
+        if batch.shape != (end - start, 3):
+            raise ValueError("Position models must return (N, 3) probabilities.")
+        result[start:end] = batch
+    return result
+
+
 def predict_positions(model, values, position_mode):
     result = np.empty(len(values), dtype=np.float64)
     for start in range(0, len(values), model.config.batch_size):
