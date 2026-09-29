@@ -60,9 +60,10 @@ class ReturnPanel:
     """
 
     def __init__(self, frame, *, price_col="adj_close", date_col="date",
-                 group_col=None, execution_delay=1):
-        if isinstance(execution_delay, bool) or not isinstance(execution_delay, int) or execution_delay < 1:
-            raise ValueError("Position experiments require execution_delay >= 1.")
+                 group_col=None, execution_delay=1, allow_same_session=False):
+        if (isinstance(execution_delay, bool) or not isinstance(execution_delay, int) or
+            execution_delay < (0 if allow_same_session else 1)):
+            raise ValueError("Position experiments require execution_delay >= 1 unless same-session mode is explicit.")
         work = frame.reset_index(drop=True).copy()
         work[date_col] = pd.to_datetime(work[date_col], utc=True, errors="raise")
         if work[date_col].isna().any():
