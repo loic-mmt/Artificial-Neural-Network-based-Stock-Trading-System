@@ -53,7 +53,8 @@ def build_parser():
     return parser
 
 
-def main(argv=None):
+def prepare_graph_run(argv=None):
+    """Resolve one frozen graph run without training or creating output files."""
     args = build_parser().parse_args(argv)
     if args.models != ["gru"]:
         raise ValueError("Graph ablation requires exactly --models gru.")
@@ -129,22 +130,26 @@ def main(argv=None):
         market_gate_temperature=args.market_gate_temperature,
     )
     target = args.output_dir or comparisons_dir() / ("gnn-graphs-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
-    return run_graph_ablation(
-        frame, config, losses[0], args.model_parameter_sets["gru"][0], args.seeds,
-        target, ablation=ablation, n_splits=args.cv_folds,
+    return dict(
+        frame=frame, config=config, loss=losses[0],
+        gru_parameters=args.model_parameter_sets["gru"][0], seeds=args.seeds,
+        destination=target, ablation=ablation, n_splits=args.cv_folds,
         initial_train_fraction=args.cv_initial_train_fraction,
         inner_val_fraction=args.cv_inner_val_fraction,
         gap_bars=args.cv_gap_bars, embargo_bars=args.cv_embargo_bars,
-        dataset_path=args.data,
-        graph_context=context,
+        dataset_path=args.data, graph_context=context,
         graph_context_path=args.market_context_data,
         sector_context_columns=US_SECTOR_CONTEXT_COLUMNS,
-        market_frame=market_frame,
-        market_columns=market_columns,
+        market_frame=market_frame, market_columns=market_columns,
         market_audit=market_audit,
         market_context_path=args.market_context_data,
-        resume=args.resume,
     )
 
 
-__all__ = ["build_parser", "main"]
+def main(argv=None):
+    inputs = prepare_graph_run(argv)
+    args = build_parser().parse_args(argv)
+    return run_graph_ablation(**inputs, resume=args.resume)
+
+
+__all__ = ["build_parser", "prepare_graph_run", "main"]

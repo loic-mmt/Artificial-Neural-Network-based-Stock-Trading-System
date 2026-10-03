@@ -539,8 +539,8 @@ def build_triple_barrier_label_result(frame, config, context):
     known_events = event_mask & labeled["_label_known"]
     touch_counts = labeled.loc[known_events, "barrier_touch"].value_counts()
     event_durations = (
-        pd.to_datetime(labeled.loc[known_events, "label_end_date"])
-        - pd.to_datetime(labeled.loc[known_events, context.date_col])
+        pd.to_datetime(labeled.loc[known_events, "label_end_date"], utc=True)
+        - pd.to_datetime(labeled.loc[known_events, context.date_col], utc=True)
     ).dt.days
     return LabelResult(
         frame=labeled,

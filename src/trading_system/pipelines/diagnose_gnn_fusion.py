@@ -52,6 +52,10 @@ def run_fusion_diagnostic(information_dir, run_dir, output_dir, *,
             or information.get("hash_mismatch_override")):
         raise ValueError("Information replay must match the benchmark data exactly.")
     predictions = pd.read_parquet(information_dir / "predictions.parquet")
+    # P0 replay exports inner as well as outer predictions. This descriptive
+    # diagnostic has always evaluated outer folds only.
+    if "partition" in predictions:
+        predictions = predictions.loc[predictions.partition.eq("outer")].copy()
     required = {"date", "ticker", "adj_close", "position", "candidate", "fold", "seed"}
     if required - set(predictions):
         raise ValueError(f"Missing prediction columns: {sorted(required - set(predictions))}")
