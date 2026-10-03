@@ -239,4 +239,19 @@ supplied. Omit these flags to retain the previous workflow. See
 This repository contains my personal implementation inspired by the paper  
 [An Artificial Neural Network-based Stock Trading System Using Technical Analysis and Big Data Framework](https://arxiv.org/abs/1712.09592).
 
-This is not an official reproduction of the original paper, but an independent implementation with my own design choices, code structure, and experiments.
+For the subsequent experiments, I also used and adapted methods from the research papers :
+- [An Attention-Based Autoencoder Model with Gated Recurrent Unit for Stock Price Movement Prediction](https://doi.org/10.1007/s44196-026-01250-x)
+- [Portfolio Optimization Using Deep Learning with Risk Aversion Utility Function](https://dx.doi.org/10.1016/j.frl.2025.106761)
+- [FusionLSTM-CNF: a confidence-calibrated multi-modal late fusion framework for robust stock movement prediction under uncertainty](https://doi.org/10.1038/s41598-026-43381-3)
+- [GAS-Norm: Score-Driven Adaptive Normalization for Non-Stationary Time Series Forecasting in Deep Learning](https://doi.org/10.1145/3627673.3679822)
+- [STOCK PRICE PREDICTION USING A HYBRID LSTM-GNN MODEL: INTEGRATING TIME-SERIES AND GRAPH-BASED ANALYSIS](https://doi.org/10.48550/arXiv.2502.15813)
+- [MASTER: Market-Guided Stock Transformer for Stock Price Forecasting](https://doi.org/10.48550/arXiv.2312.15235)
+- [MCI-GRU: Stock Prediction Model Based on Multi-Head Cross-Attention and Improved GRU](https://doi.org/10.48550/arXiv.2410.20679)
+- [Optimal trading with a trailing stop](https://doi.org/10.48550/arXiv.1701.03960)
+- [A Fair Benchmark of Deep Models for Non-Stationary Stock Price Forecasting: RevTransLSTM-AR as a Complexity Probe (Article)](https://doi.org/10.1016/j.asoc.2026.116006)
+[RevTransLSTM-AR (Github repository)](https://github.com/twcch/RevTransLSTM-AR)
+- [StockMixer: A Simple Yet Strong MLP-Based Architecture for Stock Price Forecasting (Article)](https://www.google.com/url?sa=t&source=web&rct=j&opi=89978449&url=https://ojs.aaai.org/index.php/AAAI/article/view/28681/29322&ved=2ahUKEwjFreOKhJ6XAxViUaQEHR6XDocQFnoECA8QAQ&usg=AOvVaw3H-hDKo9GYaeDfaAaQ8MGk)
+[StockMixer (Github repository)](https://github.com/SJTU-DMTai/StockMixer)
+
+
+This is not an official reproduction of the original papers, but an independent implementation with my own design choices, code structure, and experiments.
