@@ -1,6 +1,12 @@
 # Advanced GRU improvement candidates
 
-Benchmark decisions and frozen protocol: [benchmark summary](benchmark-summary.md).
+Je conserve ici les hypothèses et le plan de recherche, y compris le point de
+départ historique. Les passages « current baseline » ne remplacent pas les
+décisions prises ensuite dans les benchmarks. Pour l'état au 3 octobre 2026,
+je prends le [résumé général](../benchmark-summary.md) et les fiches de résultats.
+
+Benchmark decisions and frozen protocol: [benchmark summary](../benchmark-summary.md).
+Results of this GRU optimization series: [GRU benchmark journal](../benchmarks/gru-optim/README.md).
 
 ## Scope
 
@@ -9,14 +15,14 @@ normalization, multimodal fusion, uncertainty, and cross-asset modeling. Generic
 tuning such as learning rate, batch size, hidden width, dropout, or epoch count is
 outside scope, except when required to compare an architectural change fairly.
 
-The local evidence base uses the Markdown versions in [`docs/papers`](papers/).
+The local evidence base uses the Markdown versions in [`docs/papers`](../papers/).
 For RevTransLSTM-AR, whose paper is unavailable, the checked-in source code and
 README are used only to verify implementation behavior.
 
 ## Current baseline and unused capacity
 
 The default configuration in
-[`gru.py`](../src/trading_system/models/neural/gru.py) uses the final hidden state
+[`gru.py`](../../src/trading_system/models/neural/gru.py) uses the final hidden state
 to remain compatible with the historical baseline. The implementation now also
 supports mean pooling, flattening, additive attention, and final-state plus
 attention pooling over the full GRU output sequence.
@@ -56,15 +62,15 @@ cannot explicitly reweight dates inside the context window.
 
 | Source | Relevant evidence | Transfer limit |
 |---|---|---|
-| [RevTransLSTM-AR source](papers/RevTransLSTM-AR/models/revtranslstm_ar/RevTransLSTM-AR.py) | Verifiable implementation combines per-instance RevIN, a Transformer memory, autoregressive LSTM decoding, cross-attention, and learned latent prediction feedback. The repository also supplies isolated ablation implementations and a simpler [RevIN-GRU classifier](papers/RevTransLSTM-AR/models/revin-GRU.py). | Paper text and result tables are unavailable, so no performance conclusion is accepted. Main model is multi-step price regression, not three-class classification. Its training loop also evaluates test loss every epoch, so it is not a strict untouched-test reference protocol. |
-| [GAS-Norm](papers/GAS-Norm/GAS-Norm.md) | Online, score-driven estimates of time-varying mean and variance improve 21 of 25 reported forecasting configurations, and 13 of 16 configurations in the paper's broader model comparison. | Experiments concern probabilistic regression forecasting, not three-class movement classification. Output denormalization does not transfer directly to logits. |
-| [MASTER](papers/MASTER/MASTER.md) | Market-guided feature gating, intra-stock attention, inter-stock attention, then temporal attention. Reported gains support conditioning features on market state and modeling synchronized cross-sections. | Uses regression, date-synchronized stock batches, and transformer blocks. It is not a drop-in GRU head. |
-| [MCI-GRU](papers/MCI-GRU/MCI-GRU.md) | Combines a modified GRU cell, a stock graph, and latent-market cross-attention. Ablations support combining temporal and relational representations. | Full model changes several components together. Reset-gate formulation is difficult to isolate and appears underspecified for a single key/value per timestep. Reproduction risk is high. |
-| [FusionLSTM-CNF](papers/FusionLSTM-CNF/FusionLSTM-CNF.md) | Separate technical, sentiment, and correlation branches; uncertainty-weighted late fusion; MC dropout; confidence-filtered trading. Reported full-model ablation improves accuracy, F1, AUC, Sharpe, and ECE over fusion without confidence. | Binary next-day movement setup differs from our three-class triple-barrier task. Learned variance and reported thresholds require independent reproduction. |
-| [Attention-Based Autoencoder](papers/Attention-Based-Autoencoder/Attention-Based-Autoencoder.md) | Denoising before the downstream trader improves several profit and risk metrics; expanding-window evaluation and transaction costs are included. | AGRUA reshapes each feature vector to one timestep before its GRU. Its GRU is a gated feature transform, not evidence for temporal GRU denoising. Top Sharpe is shared by simpler denoisers. |
-| [StockMixer](papers/StockMixer/StockMixer.md) | Indicator mixing, causal multi-scale time mixing, then low-rank stock-to-market-to-stock mixing. Its ablation ranks time, stock, then indicator mixing by impact. `LSTM + Stock Mixing` is competitive with the paper's stronger relational baseline. | Predicts next-day returns with a regression plus ranking loss on a fixed, synchronized universe. Stock-axis weights depend on universe size and do not directly support missing or changing constituents. |
-| [LSTM-GNN](papers/LSTM-GNN/LSTM-GNN.md) | Two degree-normalized graph-convolution layers aggregate weighted neighbours, then relational and temporal embeddings are concatenated before prediction. The hybrid reports 10.6% lower MSE than its standalone LSTM. | Only ten selected stocks, normalized-price regression, no trading metrics, no GNN-only or edge-construction ablation, and no clear proof that graph estimation is fold-causal. The paper also acknowledges that its expanding-window setup lacks a separate validation set. |
-| [CARA utility](papers/CARA/CARA.md) | Additive risk-averse utility has an unbiased mini-batch gradient, remains interpretable for negative PnL, and exposes risk aversion through `gamma`. The paper also learns deviations from a baseline portfolio. | The paper outputs cross-sectional portfolio weights, assumes zero investment and unit gross leverage, and omits transaction costs. Our Sharpe implementation already uses the exact full chronological portfolio, so its mini-batch bias critique does not apply directly. |
+| [RevTransLSTM-AR source](../papers/RevTransLSTM-AR/models/revtranslstm_ar/RevTransLSTM-AR.py) | Verifiable implementation combines per-instance RevIN, a Transformer memory, autoregressive LSTM decoding, cross-attention, and learned latent prediction feedback. The repository also supplies isolated ablation implementations and a simpler [RevIN-GRU classifier](../papers/RevTransLSTM-AR/models/revin-GRU.py). | Paper text and result tables are unavailable, so no performance conclusion is accepted. Main model is multi-step price regression, not three-class classification. Its training loop also evaluates test loss every epoch, so it is not a strict untouched-test reference protocol. |
+| [GAS-Norm](../papers/GAS-Norm/GAS-Norm.md) | Online, score-driven estimates of time-varying mean and variance improve 21 of 25 reported forecasting configurations, and 13 of 16 configurations in the paper's broader model comparison. | Experiments concern probabilistic regression forecasting, not three-class movement classification. Output denormalization does not transfer directly to logits. |
+| [MASTER](../papers/MASTER/MASTER.md) | Market-guided feature gating, intra-stock attention, inter-stock attention, then temporal attention. Reported gains support conditioning features on market state and modeling synchronized cross-sections. | Uses regression, date-synchronized stock batches, and transformer blocks. It is not a drop-in GRU head. |
+| [MCI-GRU](../papers/MCI-GRU/MCI-GRU.md) | Combines a modified GRU cell, a stock graph, and latent-market cross-attention. Ablations support combining temporal and relational representations. | Full model changes several components together. Reset-gate formulation is difficult to isolate and appears underspecified for a single key/value per timestep. Reproduction risk is high. |
+| [FusionLSTM-CNF](../papers/FusionLSTM-CNF/FusionLSTM-CNF.md) | Separate technical, sentiment, and correlation branches; uncertainty-weighted late fusion; MC dropout; confidence-filtered trading. Reported full-model ablation improves accuracy, F1, AUC, Sharpe, and ECE over fusion without confidence. | Binary next-day movement setup differs from our three-class triple-barrier task. Learned variance and reported thresholds require independent reproduction. |
+| [Attention-Based Autoencoder](../papers/Attention-Based-Autoencoder/Attention-Based-Autoencoder.md) | Denoising before the downstream trader improves several profit and risk metrics; expanding-window evaluation and transaction costs are included. | AGRUA reshapes each feature vector to one timestep before its GRU. Its GRU is a gated feature transform, not evidence for temporal GRU denoising. Top Sharpe is shared by simpler denoisers. |
+| [StockMixer](../papers/StockMixer/StockMixer.md) | Indicator mixing, causal multi-scale time mixing, then low-rank stock-to-market-to-stock mixing. Its ablation ranks time, stock, then indicator mixing by impact. `LSTM + Stock Mixing` is competitive with the paper's stronger relational baseline. | Predicts next-day returns with a regression plus ranking loss on a fixed, synchronized universe. Stock-axis weights depend on universe size and do not directly support missing or changing constituents. |
+| [LSTM-GNN](../papers/LSTM-GNN/LSTM-GNN.md) | Two degree-normalized graph-convolution layers aggregate weighted neighbours, then relational and temporal embeddings are concatenated before prediction. The hybrid reports 10.6% lower MSE than its standalone LSTM. | Only ten selected stocks, normalized-price regression, no trading metrics, no GNN-only or edge-construction ablation, and no clear proof that graph estimation is fold-causal. The paper also acknowledges that its expanding-window setup lacks a separate validation set. |
+| [CARA utility](../papers/CARA/CARA.md) | Additive risk-averse utility has an unbiased mini-batch gradient, remains interpretable for negative PnL, and exposes risk aversion through `gamma`. The paper also learns deviations from a baseline portfolio. | The paper outputs cross-sectional portfolio weights, assumes zero investment and unit gross leverage, and omits transaction costs. Our Sharpe implementation already uses the exact full chronological portfolio, so its mini-batch bias critique does not apply directly. |
 
 ## Prioritized experiments
 
@@ -74,7 +80,7 @@ headline performance.
 | Priority | Experiment | Minimal comparison | Decision signal |
 |---|---|---|---|
 | 1 | Temporal pooling over all GRU outputs | `last`, `mean`, `attention`, `last + attention` | Better out-of-sample trading metrics across seeds without worse calibration or excessive turnover |
-| 1 | Calibrated confidence and abstention to Hold | raw softmax, temperature scaling, calibrated trade threshold | Better net PnL or Sharpe after costs at acceptable coverage |
+| 1 | Selective trading, then separate class calibration | raw financial position, validation-selected signal gate; cross-entropy temperature scaling separately | Better net PnL or Sharpe after costs at acceptable coverage, without mistaking signal size for confidence |
 | 1 | Market-conditioned feature gating | no gate, static learned gate, market-conditioned gate | Stable gain beyond simply concatenating market features |
 | 2 | Causal adaptive normalization | train-fitted global, rolling causal, RevIN-like, GAS-inspired | Robustness across regimes and context lengths without erasing volatility signal |
 | 2 | Nonlinear normalized head | Linear, LayerNorm + Linear, LayerNorm + small MLP | Gain survives equal parameter-budget control |
@@ -138,12 +144,22 @@ A1: masked mean pooling                parameter-free control
 A2: flatten all hidden states           source-derived parameter-heavy control
 A3: additive attention                 learned temporal weighting
 A4: final state + additive attention   preserves recency summary
-A5: A4 + LayerNorm + small MLP         richer classification head
+A5: A4 + LayerNorm + small MLP         secondary head control
+A6: A3 + LayerNorm + small MLP         preferred next head experiment
 ```
 
 Implementation status: A0 through A4 are available through
-`GRUConfig.temporal_pooling`. A5 and the parameter-matched MLP control remain to
-be implemented.
+`GRUConfig.temporal_pooling`. The head is configured independently through
+`GRUConfig.head_type`: `linear` (default), `layernorm_linear`, `mlp`, or
+`layernorm_mlp`. Thus A5 and A6 are both available without changing the pooling
+implementation. The temporal-pooling comparison favored A3 over A4 at context
+length 60, so test A6 before A5. `head_hidden_size` defaults to half the pooled
+embedding width and `head_dropout` defaults to zero.
+
+The shared GRU module now exposes `encode(sequences)` before the classification
+head and extension hooks for input adaptation and the head. Future GRU variants
+can reuse its temporal pooling and training interface without changing the
+baseline GRU or its saved-state keys.
 
 Keep encoder depth, hidden size, loss, labels, preprocessing, folds, and decision
 policy fixed. Also compare a parameter-matched MLP control so a gain is not
@@ -169,12 +185,31 @@ Attention maps are diagnostics, not causal explanations.
 ### Hypothesis
 
 Positive F1 can coexist with negative PnL because classification quality does not
-encode trade selectivity, costs, or confidence calibration. A calibrated policy
-can map uncertain Buy and Sell outputs to Hold.
+encode trade selectivity or costs. The current Sharpe objective decodes class
+softmax values into a continuous position, `q = p(Buy) - p(Sell)`. This loss
+optimizes the position path, not class-probability calibration. Different
+probability vectors can produce the same `q`, so `max(p)` is not a validated
+confidence measure for this model.
 
-### First implementation
+### First implementation: Sharpe signal-strength gate
 
-Fit one temperature on validation logits only:
+Keep the trained GRU, financial loss, and probability-to-position decoder fixed.
+On each fold's inner validation period, compare the raw position against gates
+that map `|q| < tau` to zero. Candidate thresholds are quantiles of inner
+validation `|q|`, plus `tau = 0` as an unchanged control. Select by the same
+predeclared financial score as the outer CV, with a minimum signal-coverage
+constraint; prefer less filtering on ties. Apply the frozen threshold to that
+fold's untouched outer period. Do not call `|q|` calibrated confidence.
+
+Implementation: `--position-gate-quantiles 0.2,0.4,0.6,0.8` on
+`run_loss_comparison.py` with `--cv-folds` and `--losses sharpe`. The report
+stores paired raw and gated outer metrics plus the inner threshold search;
+the saved model artifact stores the selected gate. The default pipeline is
+unchanged when this flag is absent. Leave the final holdout sealed.
+
+### Separate experiment: class calibration
+
+For a cross-entropy classifier, fit one temperature on validation logits only:
 
 $$
 p(y \mid x) = \operatorname{softmax}(\ell(x) / T), \qquad T > 0
@@ -187,22 +222,22 @@ predicted class != Hold
 max calibrated probability >= tau
 ```
 
-Choose `T` and `tau` on validation data inside each walk-forward fold. Never fit
+Choose `T` and any trading threshold inside each walk-forward fold. Never fit
 them on final test data. Compare:
 
 ```text
 C0: raw argmax
 C1: temperature scaling + argmax
-C2: temperature scaling + one global threshold
-C3: temperature scaling + separate Buy/Sell thresholds
+C2: temperature scaling + one global confidence threshold
+C3: temperature scaling + separate Buy/Sell confidence thresholds
 ```
 
 ### Measurements
 
-- negative log-likelihood and Brier score;
-- expected calibration error with bin definition recorded;
-- reliability diagram;
-- coverage, trade count, turnover, and exposure;
+- Sharpe gate: signal coverage, turnover, exposure, net PnL, Sharpe and drawdown;
+- class calibration: negative log-likelihood, Brier score, expected calibration
+  error with bin definition recorded, and reliability diagram;
+- confidence-policy coverage, trade count, turnover, and exposure;
 - net PnL, Sharpe, Sortino, and maximum drawdown after costs;
 - selective risk as confidence threshold changes.
 
@@ -213,9 +248,11 @@ guaranteed probability of correctness.
 ### Link to FusionLSTM-CNF
 
 The paper reports better results from confidence-aware fusion and from trading
-only high-confidence predictions. The transferable first test is calibration plus
-abstention. Reproducing its full learned variance, MC dropout, and fusion loss in
-one step would prevent useful attribution.
+only on low-uncertainty predictions. Its filter uses MC-dropout and learned
+variance, not `max(p)` from a Sharpe-trained position model. The simple `|q|`
+gate is a financial signal-strength control, not a reproduction of that
+uncertainty mechanism. Reproducing its variance head, MC dropout, and fusion
+loss in one step would prevent useful attribution.
 
 ## 3. Market-conditioned feature gating
 
@@ -274,6 +311,20 @@ N2: rolling causal mean and variance
 N3: RevIN-like per-sequence normalization
 N4: GAS-inspired online mean and variance filter
 ```
+
+The first executable ladder is configured in
+[`configs/benchmark/gru_normalization_ladder.json`](../../configs/benchmark/gru_normalization_ladder.json).
+It keeps the existing train-fitted `SequenceStandardizer` for every candidate,
+then applies an optional GRU input normalizer to the observed 60-step context.
+`N1` and `N2` use prefix and trailing-window statistics respectively; both
+restart at the beginning of each input context. `N4` is a fixed-rate Gaussian
+score update, not a fitted reproduction of GAS-Norm. All three are causal with
+respect to the decision, but are **window-local**, not persistent per-asset
+filters across splits. A full-history stateful GAS experiment remains separate.
+The first benchmark normalizes all selected features; feature-family ablations
+are still needed before promoting a winner, because indicators and flags can
+lose meaning under per-window normalization. No inverse transform is applied to
+classification logits.
 
 ### Exact RevIN candidate from source
 
@@ -366,6 +417,13 @@ Required controls:
 - parameter-matched two-layer MLP without temporal attention;
 - identical early stopping and loss.
 
+For the next experiment, keep `temporal_pooling="attention"` and vary only
+`head_type` among `linear`, `layernorm_linear`, `mlp`, and `layernorm_mlp`.
+Repeat the head controls with `temporal_pooling="last"` to check whether a gain
+comes from the head rather than an interaction with attention. The small MLP
+uses `Linear(d, d / 2) -> GELU -> Dropout -> Linear(d / 2, 3)`; override the
+intermediate width with `head_hidden_size` when matching parameter budgets.
+
 This experiment determines whether apparent gains from larger architectures come
 from better sequence modeling or merely a stronger output head.
 
@@ -375,11 +433,18 @@ Use separate encoders only for modalities with distinct sampling, noise, or
 missingness patterns. Plausible branches:
 
 ```text
-technical and price sequence -> GRU_tech -> logits_tech, representation_tech
-market and sector sequence   -> GRU_mkt  -> logits_mkt,  representation_mkt
-sentiment sequence           -> GRU_sent -> logits_sent, representation_sent
-cross-asset features         -> GRU_corr -> logits_corr, representation_corr
+technical and price sequence by ticker -> GRU -> logits_temporal, representation_temporal
+macro/micro/VIX sequence by session -> market Transformer -> market state (optional market logits)
+stock/market node features + causal graph -> GNN -> logits_graph, representation_graph
+publication-dated sentiment scores -> optional sentiment encoder -> logits_sent, representation_sent
 ```
+
+The multimodal implementation routes the Transformer only to market-state
+features, independently of the stock-sequence GRU. The legacy 3D benchmark
+Transformer remains a stock-sequence comparator, not this new branch. The GNN
+is a separate relational model, not a graph layer over GRU outputs. Sentiment
+scores come from an external library through the historical point-in-time
+source contract; this repository does not run FinBERT.
 
 Start with late fusion of branch logits:
 
@@ -392,7 +457,8 @@ $$
 Experiment ladder:
 
 ```text
-F0: all features concatenated before one GRU
+F0: each branch alone
+F0b: early-concatenation GRU only where input modalities align
 F1: separate branches, equal-weight logit average
 F2: separate branches, learned static weights
 F3: separate branches, confidence-conditioned weights
@@ -400,7 +466,9 @@ F3: separate branches, confidence-conditioned weights
 
 For `F3`, prefer calibrated branch probabilities or validation reliability as
 confidence inputs before adding learned heteroscedastic variance. Record branch
-weight distributions and behavior when one modality is absent.
+weight distributions and behavior when one modality is absent. Normalize weights
+over available branches only. Keep calibration, fusion weighting, and
+confidence-based abstention as separate ablation axes.
 
 Every branch must earn inclusion through single-branch and leave-one-branch-out
 ablations. FinBERT outputs, DCC-GARCH spillovers, and specific feature counts from
@@ -416,7 +484,11 @@ needs all relevant assets aligned at the same prediction timestamp:
 ```
 
 The current per-sequence interface is insufficient if unrelated samples are mixed
-in one batch. Required work precedes model code:
+in one batch. The shared GRU encoder serves GRU variants only. The planned GNN
+branch uses separate stock/market node features, not GRU embeddings. Neither
+branch currently supplies date-grouped batches, an asset mask, or causal graph
+edges. The multimodal implementation plan is in [next_steps.md](next_steps.md). Required
+work precedes model code:
 
 1. build date-grouped batches and an asset mask;
 2. define missing-asset behavior;
@@ -427,21 +499,22 @@ in one batch. Required work precedes model code:
 Incremental comparison:
 
 ```text
-X0: independent asset GRUs
-X1: causal market or sector pooled context
-X2: low-rank stock-to-market-to-stock mixing
-X3: correlation-graph convolution on GRU embeddings
-X4: learned inter-asset attention on synchronized dates
-X5: sparse graph attention using causal relations
+X0: independent per-asset GRU baseline
+X1: independent GNN, identity graph (node-MLP control)
+X2: independent GNN, sector graph
+X3: independent GNN, train-fold correlation graph
+X4: independent GNN, rolling causal correlation graph
+X5: late fusion of GRU and GNN branch outputs
 ```
 
-Use sector pooling as a cheap falsification test. If `X1` adds no stable value,
-full graph infrastructure has weaker justification. For learned attention, inspect
-complexity in asset count and use masks for absent or newly listed securities.
+Compare `X3` and `X4` against identity and sector graphs before claiming that
+learned relations add value. For learned attention, inspect complexity in asset
+count and use masks for absent or newly listed securities.
 
-### StockMixer bridge
+### Optional StockMixer hybrid comparator
 
-StockMixer offers a cheaper `X2` than pairwise attention or graph message passing.
+StockMixer offers a separate GRU-based hybrid comparator to pairwise attention
+or graph message passing. It is not the independent GNN branch in `X1`-`X5`.
 Given date-aligned GRU representations
 
 $$
@@ -508,21 +581,23 @@ hybrid. Its time block mixes causal triangular MLPs across multi-scale pooled
 windows. The reported ablation makes time mixing its most important component,
 but replacing the GRU would answer a different question from improving the GRU.
 
-### GRU-GCN bridge
+### Independent GNN branch and late fusion
 
-The LSTM-GNN paper uses two branches: an LSTM produces a temporal embedding, a
-two-layer GCN produces a relational embedding, then both are concatenated before
-the prediction head. Its GCN uses degree-normalized weighted neighbour aggregation.
+The LSTM-GNN paper uses separate inputs: price sequences for its temporal LSTM
+and stock-specific node attributes plus a graph for its GNN. It fuses the two
+resulting embeddings only after branch encoding. Our classification adaptation
+keeps this separation: the GNN does not consume GRU embeddings.
 
-The most direct adaptation is to use GRU embeddings themselves as GCN node
-features. For prediction date `t`:
+For prediction date `t`, let `S_t` contain point-in-time stock/market node
+features, `X_{t-L+1:t}` contain per-stock temporal sequences, and `A_t` be a
+causal adjacency. The branches compute independently:
 
 $$
-H_t = \operatorname{GRU}(X_{t-L+1:t})
-\in \mathbb{R}^{N \times d}.
+H_t = \operatorname{GRU}(X_{t-L+1:t}), \qquad
+G_t^{(0)} = \phi(S_t).
 $$
 
-Build a causal adjacency `A_t`, add self-loops, then normalize it:
+Add self-loops to the graph and normalize it:
 
 $$
 \widetilde{A}_t = A_t + I,
@@ -530,27 +605,25 @@ $$
 \widehat{A}_t = D_t^{-1/2}\widetilde{A}_tD_t^{-1/2}.
 $$
 
-One graph-convolution layer becomes
+One graph-convolution layer in the independent GNN becomes
 
 $$
 G_t^{(l+1)} =
-\sigma\!\left(\widehat{A}_tG_t^{(l)}W^{(l)}\right),
-\qquad
-G_t^{(0)} = H_t.
+\sigma\!\left(\widehat{A}_tG_t^{(l)}W^{(l)}\right).
 $$
 
-Fuse original and relational representations with a residual path:
+Each branch receives its own three-class head. Later experiments fuse branch
+logits or representations, with the same branch availability mask:
 
 ```text
-per-asset causal windows -> shared GRU -> H_t
-historical returns through t -> causal graph A_t
-(H_t, A_t) -> one or two GCN layers -> G_t
-concat(H_t, G_t) -> LayerNorm -> shared classifier
+per-asset causal windows -> GRU -> H_t -> logits_gru
+stock/market node features + causal graph A_t -> GNN -> G_t -> logits_gnn
+(logits_gru, logits_gnn, availability mask) -> optional late fusion
 ```
 
-Keeping `H_t` in the fusion prevents graph smoothing from erasing stock-specific
-information. One GCN layer aggregates immediate neighbours. Two layers also reach
-neighbours-of-neighbours but increase over-smoothing risk. Start with one.
+Benchmark GRU-only and GNN-only before their fusion. One GCN layer aggregates
+immediate neighbours. Two layers also reach neighbours-of-neighbours but
+increase over-smoothing risk. Start with one.
 
 ### Graph construction
 
@@ -596,18 +669,19 @@ dataset would leak validation and test structure.
 ### Required GCN ablation
 
 ```text
-G0: shared GRU, no cross-asset module
-G1: GRU + identity-graph GCN
-G2: GRU + fixed sector graph GCN
-G3: GRU + training-fold Pearson graph GCN
-G4: GRU + rolling causal Pearson graph GCN
+G0: GRU-only on the same eligible ticker/date rows
+G1: GNN-only with identity graph (node-MLP control)
+G2: GNN-only with fixed sector graph
+G3: GNN-only with training-fold Pearson graph
+G4: GNN-only with rolling causal Pearson graph
 G5: G4 with separate positive and negative channels
 ```
 
-`G1` controls for extra nonlinear layers and parameters. Add a randomly permuted
-graph as a sanity check, not as a model candidate. If the true graph does not beat
-identity, sector, and permuted controls, relational structure has not earned its
-complexity.
+`G1` controls for graph-branch nonlinear layers and parameters. Add a randomly
+permuted graph as a sanity check, not as a model candidate. If the true graph
+does not beat identity, sector, and permuted controls, relational structure has
+not earned its complexity. Test GRU+GNN late fusion only after these standalone
+comparisons.
 
 Track:
 
@@ -656,6 +730,11 @@ It therefore supports gated nonlinear feature transformation inside a denoiser,
 not long-range temporal denoising. Its results also do not show universal Sharpe
 dominance over simpler denoisers.
 
+Implementation: benchmark 13 compares raw post-open features, a frozen pointwise
+DAE, and a frozen feature-attention DAE before the unchanged GRU. Discrete inputs
+bypass reconstruction. See [denoising-post-open.md](denoising-post-open.md) for
+the train-only protocol, limitations, and command.
+
 ## 9. MCI-GRU-style custom recurrent cell
 
 MCI-GRU replaces the reset gate with an attention-derived quantity using previous
@@ -680,6 +759,12 @@ M2: custom attention-reset cell
 
 `M1` is mandatory. Without it, framework and kernel differences are confounded
 with the proposed gate.
+
+Benchmark 14 implements native/manual PyTorch-equivalent controls and an
+explicitly adapted channel-attention reset. The singleton-key ambiguity is not
+treated as resolved by the paper. See
+[attention-reset-post-open.md](attention-reset-post-open.md) for equations,
+limits, and the post-open command.
 
 ## 10. CARA utility objective
 
@@ -734,12 +819,35 @@ L0: cross-entropy with unchanged discrete policy
 L1: direct net-PnL objective, gamma = 0
 L2: exact full-path regularized Sharpe
 L3: CARA on net returns, several validation-selected gamma values
+L4: fixed-scale mixture of PnL and Sharpe, validation-selected weight
 ```
 
-`L1`, `L2`, and `L3` must share the exact position decoder and cost model. Select
-`gamma` on validation utility or a predefined risk-aware validation score, then
-evaluate one frozen choice on final test. Report the complete return-risk frontier,
-not only the best Sharpe point.
+`L0` to `L2` have already been trained in earlier benchmarks. In particular,
+`L1` is exactly `L3` at `gamma = 0`; verify this by unit test rather than
+training a duplicate. The 60/ATR PnL control in
+[`01-temporal-pooling`](../../artifacts/comparisons/gru-optim/01-temporal-pooling/context-60-atr/report.json)
+has a different CV data fingerprint and execution device from the current
+Sharpe control. Reuse it as historical context, not as a strictly paired
+control. The current Sharpe control is reproduced exactly in the head and
+normalization benchmarks; do not retrain it merely to run CARA.
+
+The first new benchmark trains only positive `gamma` CARA and interior-weight
+combined candidates. `L1` to `L4` share the position decoder and net return path,
+including costs. With a predeclared daily-return scale `s = 1e-4`, the combined
+loss is
+
+$$
+L_{\mathrm{combined}} = (1-\lambda)L_{\mathrm{Sharpe}}
+  + \lambda\left(-\frac{\overline{R}}{s}\right),
+\qquad 0 < \lambda < 1.
+$$
+
+The fixed scale makes the weight interpretable; it must not be fitted on outer
+folds or the final holdout. At `lambda = 0` the loss is exactly Sharpe, and at
+`lambda = 1` it is PnL up to a positive constant. Both endpoints are unit-test
+controls, not benchmark candidates. Select `gamma` and `lambda` with the frozen
+outer-CV selection metric, then evaluate at most one frozen choice on final test.
+Report the complete return-risk frontier, not only the best Sharpe point.
 
 Numerical safeguards:
 
@@ -929,22 +1037,24 @@ and result is not driven by one fold or one seed
 0. freeze baseline, folds, costs, seeds, and context-length comparison
 1. temporal pooling ablation
 2. LayerNorm and MLP head controls
-3. temperature scaling and abstention
-4. static versus market-conditioned feature gating
-5. causal normalization ladder
-6. CARA utility against net PnL and exact full-path Sharpe
-7. modality-specific late fusion
-8. causal sector pooling
-9. StockMixer low-rank market bottleneck
-10. GCN on GRU embeddings with static, then rolling causal graph
-11. learned inter-asset attention or graph attention
-12. denoising stage
-13. custom MCI-GRU cell
-14. multi-horizon auxiliary decoder, only if simpler GRU changes plateau
+3. Sharpe signal-strength gate; class temperature scaling as a separate experiment
+4. causal normalization ladder
+5. CARA utility against net PnL and exact full-path Sharpe
+6. date-aligned multimodal contract and independent GNN input features
+7. GNN-only graph controls: identity, sector, static, rolling causal
+8. market-guided gating, disabled/static/conditioned, independent of fusion
+9. GRU-only, GNN-only, then equal/static/confidence-aware late fusion
+10. independent market Transformer on macro/micro/VIX inputs, with context-only and predictive ablations
+11. post-open execution pilot and opening-gap control
+12. optional StockMixer GRU hybrid and learned inter-asset attention controls
+13. denoising stage
+14. custom MCI-GRU cell
+15. multi-horizon auxiliary decoder, only if simpler changes plateau
 ```
 
 This order favors cheap, attributable tests before changes requiring new data
-contracts or custom recurrent kernels.
+contracts or custom recurrent kernels. The active multimodal plan and its
+independent switches are tracked in [next_steps.md](next_steps.md).
 
 ## Idea not validated from the local source corpus
 

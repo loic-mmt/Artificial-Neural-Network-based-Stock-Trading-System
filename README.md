@@ -2,6 +2,8 @@
 
 ## Layout
 
+Documentation: [index](docs/README.md), [benchmark conclusions](docs/benchmark-summary.md), [package](docs/src/README.md), [plans](docs/plan/README.md).
+
 - `src/trading_system/data/`: loading, chronological splits, context windows, scaling
 - `src/trading_system/features/`: technical and full-market feature builders
 - `src/trading_system/labels/`: shared label schema, breakout, forward-return, and oracle labels
@@ -10,6 +12,7 @@
 - `src/trading_system/experiments/`: model-neutral static, walk-forward, and search runners
 - `src/trading_system/pipelines/`: thin CLI/configuration wrappers
 - `src/trading_system/backtest/`: positions, timing, fees, benchmarks, and advanced backtests
+- `src/trading_system/trading/`: optional post-prediction OHLC rules and portfolio replay; [API and CLI](docs/src/trading-module.md)
 - `scripts/`: runnable entrypoints
 - `data/processed/`: local market datasets
 - `data/derived/`: generated labels and derived tables
@@ -90,7 +93,7 @@ python scripts/run_model_comparison.py \
   --overfitting-control
 ```
 
-See [docs/overfitting-control.md](docs/overfitting-control.md) for thresholds,
+See [docs/src/overfitting-control.md](docs/src/overfitting-control.md) for thresholds,
 saved fields, and walk-forward usage.
 
 The controlled breakout baseline can be configured without changing a preset:
@@ -190,28 +193,28 @@ and Bollinger width are not numerically equivalent: first compare fixed settings
 then tune each estimator on validation only. Wider barriers are not a guarantee
 of better learning or out-of-sample P&L.
 
-See [restructuring plan](docs/restructuring-plan.md) for ownership rules and migration record.
+See [repository structure](docs/src/repo-structure.md) for package ownership and dependency direction.
 
 Optional fractional-differentiation feature: append `--fracdiff` to model
 comparison, walk-forward, or walk-forward grid search. Order selection uses
 training history only; `--fracdiff-order 0.5` chooses a fixed order instead.
-Disabled by default. See [FracDiff configuration and diagnostics](docs/fracdiff.md).
+Disabled by default. See [FracDiff configuration and diagnostics](docs/src/fracdiff.md).
 
 Optional event sample weighting with Triple Barrier: append
 `--sample-weighting net_return` (also `volatility` or `uniqueness`). Applies to
 Manual ANN and the shared PyTorch trainer; disabled by default. See
-[sample weighting and validation status](docs/sample-weighting.md).
+[sample weighting and validation status](docs/src/sample-weighting.md).
 
 Direct net-P&L/Sharpe position training is available for static loss comparison,
 single-ticker walk-forward and walk-forward grid search. Cross-entropy remains
 the default. Use `--loss-objective pnl|sharpe`; financial grid objectives include
-`net_return` and `regularized_sharpe`. See [financial losses](docs/financial-loss.md).
+`net_return` and `regularized_sharpe`. See [financial losses](docs/src/financial-loss.md).
 
 Expanded inputs: `--feature-set expanded`, optionally
 `--feature-groups technical,market,sector` for family ablations. Includes dated
 fundamental ratios, local news/earnings sentiment, market context and sector-surge
 signals, with train-only coverage selection. Historical sources are not bundled;
-undated Yahoo firm snapshots are excluded. See [feature expansion](docs/feature-expansion.md)
+undated Yahoo firm snapshots are excluded. See [feature expansion](docs/src/feature-expansion.md)
 and `scripts/enrich_feature_data.py --help`.
 
 ## Optional financial objectives
@@ -221,7 +224,7 @@ Optional position-objective comparison: `scripts/run_loss_comparison.py` support
 validation-only selection by default. All five architectures are supported.
 The previous cross-entropy trainer and discrete backtest remain available unchanged;
 the new report also compares every loss using the same continuous position decoder.
-See [financial loss definitions, comparison and final-test protocol](docs/financial-loss.md).
+See [financial loss definitions, comparison and final-test protocol](docs/src/financial-loss.md).
 
 ## Optional purged cross-validation
 
@@ -229,7 +232,7 @@ Optional nested purged cross-validation: add `--cv-folds 3 --cv-gap-bars 5` to
 `scripts/run_model_comparison.py` or `scripts/run_loss_comparison.py`. Selection
 uses all outer folds/seeds; final test stays sealed unless `--cv-final-test` is
 supplied. Omit these flags to retain the previous workflow. See
-[purging, embargo semantics and comparison protocol](docs/purged-cv.md).
+[purging, embargo semantics and comparison protocol](docs/src/purged-cv.md).
 
 ## Inspiration
 

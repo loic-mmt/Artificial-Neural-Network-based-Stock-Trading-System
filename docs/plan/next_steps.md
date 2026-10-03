@@ -21,7 +21,7 @@ Pour le Transformer, `market_frame` fournit une ligne par séance et un ordre te
 
 La librairie FinBERT externe est maintenant raccordée par un export Parquet et
 un manifeste vérifiés, sans corpus historique sur le Mac. Voir
-`docs/news-sentiment-integration.md`. `source_available` vaut vrai seulement
+`docs/src/news-sentiment-integration.md`. `source_available` vaut vrai seulement
 pour une fenêtre explicitement `covered`. Si cette fenêtre contient zéro news,
 `available_at` peut être manquant : le journal de couverture validé par la
 librairie, pas un faux horodatage d'article, justifie alors le masque vrai.
@@ -73,8 +73,8 @@ poids sont renormalisés seulement sur les branches disponibles. Le mode
 ajustées **sur validation uniquement** avant le test ; aucun ajustement ni
 politique d'abstention ne sont encore automatisés. Chaque branche, gate et
 fusion peut être désactivé séparément. Cette implémentation reprend les idées
-de séparation de [FusionLSTM-CNF](papers/FusionLSTM-CNF/FusionLSTM-CNF.md)
-et de gate conditionné par le marché de [MASTER](papers/MASTER/MASTER.md),
+de séparation de [FusionLSTM-CNF](../papers/FusionLSTM-CNF/FusionLSTM-CNF.md)
+et de gate conditionné par le marché de [MASTER](../papers/MASTER/MASTER.md),
 sans reprendre leurs revendications de performance.
 
 Exemple d'ablation côté API, une fois `sample` construit avec les groupes de
@@ -194,8 +194,8 @@ drawdown excessif ou un simple effet d'exposition ne suffit pas.
 
 ## Extension US relationnelle et état de marché
 
-Le prochain benchmark est préparé dans
-[`us-relational-market-benchmark.md`](us-relational-market-benchmark.md). Il
+Le benchmark US a été exécuté. Son protocole et ses résultats sont dans
+[`us-relational-market-benchmark.md`](../benchmarks/us-relational-market-benchmark.md). Il
 utilise 143 actions au calendrier complet depuis 2005 et 14 ETF de contexte non
 tradables. Les nouveaux graphes `rolling_topk` et `rolling_residual_topk`
 évitent les nœuds isolés du seuil Pearson fixe. La variante résiduelle retire
@@ -207,3 +207,7 @@ module les features du GRU ou du GNN avec le gate de marché. Ses logits ne sont
 pas fusionnés et il ne vote pas. Chaque axe reste désactivable indépendamment
 via `--graph-candidates`, `--market-close-columns`, `--graph-neighbors` et
 `--graph-rebalance-bars`. Le sentiment reste hors protocole.
+
+Les décisions suivantes viennent du [contrôle d'exposition](../benchmarks/us-exposure-comparison.md).
+Le [plan d'interaction features/gate](us-feature-gate-interaction.md) est prêt
+mais n'a pas encore de résultat local documenté.
