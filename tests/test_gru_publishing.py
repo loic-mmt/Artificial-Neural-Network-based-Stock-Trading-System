@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_system.publishing.gru import backtest_days, read_market_data, read_universe
+from trading_system.publishing.gru import _predict_latest_rows, backtest_days, read_market_data, read_universe
 
 
 def test_data_is_limited_to_configured_universe() -> None:
@@ -27,3 +27,29 @@ def test_backtest_waits_one_bar_and_charges_turnover() -> None:
     assert days[0]["return_pct"] == 0.0
     assert days[1]["return_pct"] == pytest.approx(9.95)
     assert days[2]["return_pct"] == pytest.approx(10.0)
+
+
+def test_daily_publisher_infers_one_latest_window_per_ticker(monkeypatch) -> None:
+    monkeypatch.setattr("trading_system.publishing.gru._features", lambda frame, columns, fill: frame)
+    frame = pd.DataFrame({
+        "ticker": ["AAPL"] * 3 + ["MSFT"] * 3,
+        "date": list(pd.date_range("2026-01-05", periods=3)) * 2,
+        "company": ["Apple"] * 3 + ["Microsoft"] * 3,
+        "adj_close": [10, 11, 12, 20, 21, 22],
+        "foo": [1, 2, 3, 4, 5, 6],
+    })
+    class Scaler:
+        def transform(self, windows):
+            return windows
+    class Model:
+        def __init__(self):
+            self.shapes = []
+        def predict_proba(self, windows):
+            self.shapes.append(windows.shape)
+            return np.array([[0.1, 0.3, 0.6]])
+    model = Model()
+    latest = _predict_latest_rows(frame, model, Scaler(), ("foo",), 2, {})
+    assert model.shapes == [(1, 2, 1), (1, 2, 1)]
+    assert set(latest["ticker"]) == {"AAPL", "MSFT"}
+    assert set(pd.to_datetime(latest["date"]).dt.date.astype(str)) == {"2026-01-07"}
+    assert set(latest["label_id"]) == {2}

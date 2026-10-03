@@ -32,7 +32,7 @@ LABELS = ("sell", "hold", "buy")
 
 def read_universe(path: Path = UNIVERSE_PATH) -> tuple[str, ...]:
     rows = json.loads(path.read_text(encoding="utf-8"))["tickers"]
-    tickers = tuple(row["ticker"] for row in rows)
+    tickers = tuple(row if isinstance(row, str) else row["ticker"] for row in rows)
     if not tickers or len(set(tickers)) != len(tickers):
         raise ValueError("Invalid benchmark universe")
     return tickers
@@ -90,6 +90,23 @@ def _predict_rows(frame: pd.DataFrame, model, scaler: SequenceStandardizer, colu
     return pd.concat(parts, ignore_index=True)
 
 
+def _predict_latest_rows(frame: pd.DataFrame, model, scaler: SequenceStandardizer, columns: tuple[str, ...], context_len: int, fill: dict[str, float]) -> pd.DataFrame:
+    """Build one sequence per ticker for daily publication."""
+    featured = _features(frame, columns, fill)
+    parts = []
+    for ticker, group in featured.groupby("ticker", sort=False):
+        recent = group.sort_values("date").tail(context_len).reset_index(drop=True)
+        windows, indices = build_sequence_features(recent, columns, context_len, return_indices=True)
+        if len(windows) != 1:
+            raise ValueError(f"Insufficient GRU history for {ticker}")
+        probabilities = align_probability_columns(model, model.predict_proba(scaler.transform(windows)))
+        row = recent.iloc[indices][["date", "ticker", "company", "adj_close"]].copy().reset_index(drop=True)
+        row[["sell", "hold", "buy"]] = probabilities
+        row["label_id"] = probabilities.argmax(axis=1)
+        parts.append(row)
+    return pd.concat(parts, ignore_index=True)
+
+
 def backtest_days(predictions: pd.DataFrame, test_starts: dict[str, str], *, cost_bps: float = 5.0) -> list[dict[str, float | str]]:
     """Equal initial capital per ticker, next-bar execution, fee per turnover."""
     if cost_bps < 0:
@@ -119,7 +136,7 @@ def backtest_days(predictions: pd.DataFrame, test_starts: dict[str, str], *, cos
     return [{"date": day.date().isoformat(), "return_pct": float(value)} for day, value in returns.items()]
 
 
-def build_snapshots(predictions: pd.DataFrame, universe: tuple[str, ...], test_starts: dict[str, str], *, cost_bps: float = 5.0) -> tuple[dict, dict]:
+def build_signal_snapshot(predictions: pd.DataFrame, universe: tuple[str, ...], *, market: str = "EURONEXT PARIS") -> dict:
     latest = predictions.sort_values("date").groupby("ticker", sort=False).tail(1).set_index("ticker")
     if set(latest.index) != set(universe):
         raise ValueError("Predictions do not cover full universe")
@@ -128,12 +145,19 @@ def build_snapshots(predictions: pd.DataFrame, universe: tuple[str, ...], test_s
         row = latest.loc[ticker]
         probabilities = {label: float(row[label]) for label in LABELS}
         label = LABELS[int(row["label_id"])]
-        rows.append({"ticker": ticker, "name": str(row["company"]), "market": "EURONEXT PARIS",
+        rows.append({"ticker": ticker, "name": str(row["company"]), "market": market,
                      "signal": label, "probabilities": probabilities,
                      "as_of": pd.Timestamp(row["date"]).date().isoformat()})
+    if len({row["as_of"] for row in rows}) != 1:
+        raise ValueError("The complete universe must have one common latest market date")
     latest_date = min(pd.Timestamp(row["date"]) for _, row in latest.iterrows())
     generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     signals = {"generated_at": generated_at, "data_as_of": latest_date.date().isoformat(), "signals": rows}
+    return signals
+
+
+def build_snapshots(predictions: pd.DataFrame, universe: tuple[str, ...], test_starts: dict[str, str], *, cost_bps: float = 5.0, market: str = "EURONEXT PARIS") -> tuple[dict, dict]:
+    signals = build_signal_snapshot(predictions, universe, market=market)
     days = backtest_days(predictions, test_starts, cost_bps=cost_bps)
     performance = {"start_date": days[0]["date"], "end_date": days[-1]["date"], "days": days,
                    "methodology": "Out-of-sample, equal initial capital per asset, long or cash, one-bar execution delay, turnover cost in basis points",
@@ -141,21 +165,21 @@ def build_snapshots(predictions: pd.DataFrame, universe: tuple[str, ...], test_s
     return signals, performance
 
 
-def train(frame: pd.DataFrame, artifact_dir: Path, *, epochs: int = 12, device: str = "cpu") -> tuple[object, SequenceStandardizer, tuple[str, ...], int, dict[str, float], dict[str, str]]:
+def train(frame: pd.DataFrame, artifact_dir: Path, *, epochs: int = 12, device: str = "cpu", data_path: Path = DATA_PATH) -> tuple[object, SequenceStandardizer, tuple[str, ...], int, dict[str, float], dict[str, str]]:
     result = run_experiment(frame, default_config(epochs=epochs, device=device))
-    save_experiment_artifact(artifact_dir, frame, result, dataset_path=DATA_PATH)
+    save_experiment_artifact(artifact_dir, frame, result, dataset_path=data_path)
     starts = {ticker: pd.Timestamp(group["date"].min()).isoformat() for ticker, group in result.aligned_test_frame.groupby("ticker")}
     bundle = result.bundle
     return bundle.estimator, bundle.scaler, bundle.feature_columns, bundle.context_len, bundle.feature_fill_values.to_dict(), starts
 
 
-def load(frame: pd.DataFrame, artifact_dir: Path) -> tuple[object, SequenceStandardizer, tuple[str, ...], int, dict[str, float], dict[str, str]]:
+def load(frame: pd.DataFrame, artifact_dir: Path, *, data_path: Path = DATA_PATH, universe_path: Path = UNIVERSE_PATH) -> tuple[object, SequenceStandardizer, tuple[str, ...], int, dict[str, float], dict[str, str]]:
     manifest, model_state, scaler_state, _ = load_model_artifact(artifact_dir)
     if manifest.model_name != "gru" or tuple(manifest.class_names) != ("Sell", "Hold", "Buy"):
         raise ValueError("Artifact is not a Sell/Hold/Buy GRU")
     metadata = manifest.experiment_parameters
     dataset = metadata["dataset"]
-    if Path(dataset["path"]).resolve() != DATA_PATH.resolve() or set(dataset["tickers"]) != set(read_universe()):
+    if Path(dataset["path"]).resolve() != data_path.resolve() or set(dataset["tickers"]) != set(read_universe(universe_path)):
         raise ValueError("Artifact was trained on a different dataset or universe")
     original_end = pd.Timestamp(dataset["date_range"]["end"]).tz_localize(None)
     original = frame.loc[pd.to_datetime(frame["date"]).dt.tz_localize(None) <= original_end].reset_index(drop=True)
@@ -177,9 +201,12 @@ def load(frame: pd.DataFrame, artifact_dir: Path) -> tuple[object, SequenceStand
     return model, scaler, manifest.feature_columns, manifest.context_len, fill, starts
 
 
-def generate(artifact_dir: Path, *, epochs: int = 12, device: str = "cpu", train_first: bool = False, cost_bps: float = 5.0) -> tuple[dict, dict]:
-    universe = read_universe()
-    frame = read_market_data(universe=universe)
-    state = train(frame, artifact_dir, epochs=epochs, device=device) if train_first else load(frame, artifact_dir)
-    predictions = _predict_rows(frame, *state[:5])
-    return build_snapshots(predictions, universe, state[5], cost_bps=cost_bps)
+def generate(artifact_dir: Path, *, epochs: int = 12, device: str = "cpu", train_first: bool = False, cost_bps: float = 5.0, data_path: Path = DATA_PATH, universe_path: Path = UNIVERSE_PATH, market: str = "EURONEXT PARIS", include_backtest: bool = True) -> tuple[dict, dict | None]:
+    universe = read_universe(universe_path)
+    frame = read_market_data(data_path, universe=universe)
+    state = train(frame, artifact_dir, epochs=epochs, device=device, data_path=data_path) if train_first else load(frame, artifact_dir, data_path=data_path, universe_path=universe_path)
+    if include_backtest:
+        predictions = _predict_rows(frame, *state[:5])
+        return build_snapshots(predictions, universe, state[5], cost_bps=cost_bps, market=market)
+    predictions = _predict_latest_rows(frame, *state[:5])
+    return build_signal_snapshot(predictions, universe, market=market), None
