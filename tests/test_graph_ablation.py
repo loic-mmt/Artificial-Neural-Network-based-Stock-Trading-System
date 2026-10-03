@@ -99,7 +99,7 @@ def test_graph_ablation_supports_topk_residuals_and_market_transformer_gate(tmp_
         graph_rebalance_bars=3,
         gnn_hidden_size=4,
         date_batch_size=16,
-        candidates=("gru", "rolling_topk_market", "rolling_residual_topk_market"),
+        candidates=("gru", "rolling_topk_market", "rolling_residual_topk_market", "identity", "identity_market"),
         market_transformer_width=8,
         market_transformer_heads=2,
     )
@@ -118,8 +118,13 @@ def test_graph_ablation_supports_topk_residuals_and_market_transformer_gate(tmp_
         market_frame=market,
         market_columns=("spy_return",),
     )
-    assert len(report["folds"]) == 6
+    assert len(report["folds"]) == 10
     assert {row["candidate"] for row in report["summary"]} == set(ablation.candidates)
     residual = next(row for row in report["folds"]
                     if row["candidate"] == "rolling_residual_topk_market")
     assert residual["graph_outer"]["mean_isolated"] == 0
+    for row in report["folds"]:
+        if row["candidate"] in ("identity", "identity_market"):
+            for partition in ("train", "inner", "outer"):
+                assert row[f"graph_{partition}"]["mean_density"] == 0
+                assert row[f"graph_{partition}"]["mean_isolated"] == 3

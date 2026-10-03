@@ -131,7 +131,7 @@ def expand_stage(config: dict[str, Any], stage: str, *, graph_choice: str | None
     graph = graph_choice
     if stage == "features":
         runs = [StudyRun(f"features-{cap}", stage, cap, 1, 1,
-                         ("gru", "gru_market", graph, graph + "_market", "identity"))
+                         ("gru", "gru_market", graph, graph + "_market", "identity", "identity_market"))
                 for cap in config.get("feature_caps", [32, 64])]
     else:
         if feature_choice is None:
@@ -533,6 +533,8 @@ def compare_study(destination: str | Path, *, exposure_comparison: bool = False)
                     dimension, base_candidate = "market_gate", plain
                 elif "identity" in candidates and not any(name.startswith("gru") or name.endswith("_market") for name in candidates):
                     dimension, base_candidate = "graph", "identity"
+                elif "identity_market" in candidates and all(name.endswith("_market") and not name.startswith("gru") for name in candidates):
+                    dimension, base_candidate = "graph_market", "identity_market"
                 elif "gru" in candidates and not any(name.endswith("_market") for name in candidates):
                     dimension, base_candidate = "branch", "gru"
                 elif "gru_market" in candidates and all(name.endswith("_market") for name in candidates):

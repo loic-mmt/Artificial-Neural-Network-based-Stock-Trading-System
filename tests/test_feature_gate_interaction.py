@@ -21,7 +21,7 @@ from trading_system.experiments.multimodal_study import _planned_feature_preproc
 from trading_system.training.financial_loss import FinancialLossConfig, ReturnPanel
 
 
-CANDIDATES = ("gru", "gru_market", "rolling_topk", "rolling_topk_market", "identity")
+CANDIDATES = ("gru", "gru_market", "rolling_topk", "rolling_topk_market", "identity", "identity_market")
 
 
 def _write(path, value):
@@ -43,7 +43,11 @@ def _seal(root, row):
 
 
 def _fixture(tmp_path, *, high_columns=("f1", "f2", "f3"), high_scaler_delta=0., seeds=(1,),
-             score_override=None, missing=None):
+             score_override=None, missing=None, graph_choice="rolling_topk", legacy=False,
+             amplitude_override=None):
+    candidates = tuple(name.replace("rolling_topk", graph_choice) for name in CANDIDATES)
+    if legacy:
+        candidates = candidates[:-1]
     study = tmp_path / "study"
     dates = pd.date_range("2020-01-01", periods=18, freq="B", tz="UTC")
     sessions = {"train": [day.isoformat() for day in dates[:5]],
@@ -77,6 +81,7 @@ def _fixture(tmp_path, *, high_columns=("f1", "f2", "f3"), high_scaler_delta=0.,
                  "fracdiff": None, "purging": {"train": 0, "inner": 0}}
         metadata = {"schema_version": 2, "final_holdout_opened": False, "dataset_sha256": "a" * 64,
                     "graph_context_sha256": "b" * 64, "market_context_sha256": "c" * 64,
+                    "sector_context_columns": ["sector_context"],
                     "market_columns": ["m1"], "calendar": {"tickers": ["A", "B"],
                         "sessions": [day.isoformat() for day in dates], "sha256": stable_digest(dates.tolist())},
                     "config": {"overfitting_control": {"max_features": cap}, "initial_capital": 10000.,
@@ -87,11 +92,11 @@ def _fixture(tmp_path, *, high_columns=("f1", "f2", "f3"), high_scaler_delta=0.,
                     "cv_folds": [{"fold": 0, "split": split, "end": dates[15].isoformat()}],
                     "final_split": {"validation_start": dates[8].isoformat(), "test_start": dates[16].isoformat()},
                     "provenance": {"source_sha256": "d" * 64, "runtime": {"packages": {"numpy": "test"}}},
-                    "ablation": {**asdict(GraphAblationConfig(candidates=CANDIDATES)), "candidates": list(CANDIDATES)},
+                    "ablation": {**asdict(GraphAblationConfig(candidates=candidates)), "candidates": list(candidates)},
                     "n_splits": 1, "seeds": list(seeds)}
         _write(root / "metadata.json", metadata)
         tasks, rows = [], []
-        for candidate in CANDIDATES:
+        for candidate in candidates:
             for seed in seeds:
                 state = {**deepcopy(stock), "market_columns": ["m1"] if candidate.endswith("_market") else [],
                          "market_scaler": {"mean": [[0.]], "scale": [[1.]]} if candidate.endswith("_market") else None}
@@ -113,7 +118,9 @@ def _fixture(tmp_path, *, high_columns=("f1", "f2", "f3"), high_scaler_delta=0.,
                 spec["graph"] = None if mode in ("gru", "identity") else {
                     "mode": mode, "lookback": ablation["graph_lookback"], "threshold": ablation["graph_threshold"],
                     "weight_mode": ablation["graph_weight_mode"], "neighbors": ablation["graph_neighbors"],
-                    "rebalance_bars": ablation["graph_rebalance_bars"], "context_sha256": None, "sector_context_columns": None}
+                    "rebalance_bars": ablation["graph_rebalance_bars"],
+                    "context_sha256": metadata["graph_context_sha256"] if mode == "rolling_residual_topk" else None,
+                    "sector_context_columns": metadata["sector_context_columns"] if mode == "rolling_residual_topk" else None}
                 spec.update(shared_graph_warmup=ablation["graph_lookback"], date_batch_size=ablation["date_batch_size"],
                             market_context_sha256=metadata["market_context_sha256"] if gated else None)
                 signature = training_signature(spec)
@@ -128,8 +135,8 @@ def _fixture(tmp_path, *, high_columns=("f1", "f2", "f3"), high_scaler_delta=0.,
                               "market_scaler_scale": np.array([[1.]]),
                               "mode": candidate, "fold": 0, "seed": seed, "model_state": {}}
                 torch.save(checkpoint, root / f"{stem}.pt")
-                number = CANDIDATES.index(candidate)
-                amplitude = .10 + number * .065 + (cap == 64) * .025
+                number = candidates.index(candidate)
+                amplitude = (amplitude_override or {}).get((cap, candidate), .10 + number * .065 + (cap == 64) * .025)
                 wave = np.array([1., .7, -.5, 1., .3, -.8, .5, .9])
                 position = np.repeat(amplitude * wave, 2) * np.tile([1., -.7], 8)
                 financial = panel.metrics(position, loss, 10000.)
@@ -159,7 +166,7 @@ def _fixture(tmp_path, *, high_columns=("f1", "f2", "f3"), high_scaler_delta=0.,
                      "tasks": [{key: value for key, value in task.items() if key != "spec"} for task in tasks],
                      "feature_preprocessing": _planned_feature_preprocessing(tasks)})
     _write(study / "study.json", {"schema_version": 1, "final_holdout_opened": False,
-                                  "stages": {"features": {"plan": {"stage": "features", "graph_choice": "rolling_topk", "runs": runs}}}})
+                                  "stages": {"features": {"plan": {"stage": "features", "graph_choice": graph_choice, "runs": runs}}}})
     return study, prices, loss
 
 
@@ -196,11 +203,14 @@ def _mutate_checkpoint(study, transform, *, candidate="gru_market", resign=False
 
 
 def test_signed_score_formula_simple_effects_and_aggregates(tmp_path):
-    scores = {(32, "gru"): 1., (64, "gru"): 3., (32, "gru_market"): 0., (64, "gru_market"): 2.5}
+    scores = {(32, branch): 1. for branch in ("gru", "identity")}
+    scores.update({(64, branch): 3. for branch in ("gru", "identity")})
+    scores.update({(32, branch + "_market"): 0. for branch in ("gru", "identity")})
+    scores.update({(64, branch + "_market"): 2.5 for branch in ("gru", "identity")})
     study, _, _ = _fixture(tmp_path, seeds=(1, 2), score_override=scores)
     result = interaction.build_feature_interaction_report(study)
     assert result["complete"], result["unavailable"]
-    assert len(result["rows"]) == 4
+    assert len(result["rows"]) == 6
     gru = next(row for row in result["rows"] if row["branch"] == "gru")
     assert gru["score_interaction"] == .5
     assert gru["gain_high_plain"]["score"] == 2
@@ -210,16 +220,24 @@ def test_signed_score_formula_simple_effects_and_aggregates(tmp_path):
     assert aggregate["mean_interaction"]["regularized_sharpe"] == .5
     assert aggregate["mean_gate_gain_high"]["score"] == -.5
     assert aggregate["paired_count"] == 2 and len(aggregate["by_seed"]) == 2
+    identity = next(row for row in result["rows"] if row["branch"] == "identity")
+    assert identity["score_interaction"] == .5
+    assert identity["gate_gain_high"]["score"] == -.5  # positive interaction need not mean gate wins
+    identity_aggregate = next(row for row in result["aggregates"] if row["branch"] == "identity")
+    assert identity_aggregate["mean_gate_gain_high"]["score"] == -.5
+    assert identity_aggregate["paired_count"] == 2 and identity_aggregate["complete"]
     assert result["selected"] is None and result["final_holdout_opened"] is False
     assert result["feature_audit"][0]["actual_high_count"] == 3  # requested cap need not be reached
 
 
-def test_exposure_all_ten_plus_one_controls_recompute_costs(tmp_path):
-    study, prices, loss = _fixture(tmp_path)
+def test_exposure_all_twelve_plus_one_controls_recompute_costs(tmp_path):
+    # Make the new gated identity control set the common target, proving it
+    # participates in normalization rather than merely appearing in the rows.
+    study, prices, loss = _fixture(tmp_path, amplitude_override={(64, "identity_market"): .04})
     result = interaction.build_feature_interaction_report(study, exposure_comparison=True)
     assert result["complete"], result["unavailable"]
-    assert len(result["exposure"]["rows"]) == 33
-    assert len(result["exposure"]["interaction_rows"]) == len(result["rows"]) == 6
+    assert len(result["exposure"]["rows"]) == 39
+    assert len(result["exposure"]["interaction_rows"]) == len(result["rows"]) == 9
     assert len([row for row in result["exposure"]["rows"] if row["candidate"] == "buy_hold"]) == 3
     positions = {}
     for cap in (32, 64):
@@ -228,13 +246,23 @@ def test_exposure_all_ten_plus_one_controls_recompute_costs(tmp_path):
             positions[f"features-{cap}/{row['candidate']}"] = pd.read_parquet(root / row["prediction_artifacts"]["outer"]).position.to_numpy()
     positions["buy_hold"] = np.ones(len(prices))
     panel = ReturnPanel(prices, group_col="ticker", execution_delay=1)
-    adjusted, info = normalize_positions(panel, positions, "daily_min")
-    for row in result["exposure"]["rows"]:
-        if row["method"] == "daily_min":
+    for method in ("mean_min", "daily_min"):
+        adjusted, info = normalize_positions(panel, positions, method)
+        assert np.max(info["scales"]["features-32/gru"]) == pytest.approx(.4)
+        for row in [item for item in result["exposure"]["rows"] if item["method"] == method]:
             expected, _ = _metrics(panel, adjusted[row["variant_id"]], loss, 10000.)
             assert row["metrics"]["cost_return_sum"] == pytest.approx(expected["cost_return_sum"])
+            assert row["metrics"]["turnover"] == pytest.approx(expected["turnover"])
             assert row["metrics"]["mean_abs_position"] == pytest.approx(info["target_mean_exposure"])
     assert any("ex post" in note for note in result["notes"])
+    for method in interaction.METHODS:
+        method_rows = [row for row in result["exposure"]["rows"] if row["method"] == method]
+        values = {(row["feature_cap"], row["candidate"]): row["metrics"] for row in method_rows}
+        graph = next(row for row in result["exposure"]["interaction_rows"]
+                     if row["method"] == method and row["branch"] == "rolling_topk")
+        for label, cap in (("low", 32), ("high", 64)):
+            assert graph[f"relation_gain_gate_{label}"]["net_return"] == pytest.approx(
+                values[cap, "rolling_topk_market"]["net_return"] - values[cap, "identity_market"]["net_return"])
 
 
 def test_missing_identity_keeps_raw_pairs_but_blocks_exposure_subset(tmp_path):
@@ -242,7 +270,52 @@ def test_missing_identity_keeps_raw_pairs_but_blocks_exposure_subset(tmp_path):
     result = interaction.build_feature_interaction_report(study, exposure_comparison=True)
     assert not result["complete"] and len(result["rows"]) == 2
     assert result["exposure"]["rows"] == []
-    assert any("all ten" in item["reason"] for item in result["unavailable"])
+    assert any("all twelve" in item["reason"] for item in result["unavailable"])
+
+
+@pytest.mark.parametrize("exposure_comparison", [False, True])
+def test_legacy_five_candidate_plan_remains_explicitly_incomplete(tmp_path, exposure_comparison):
+    study, _, _ = _fixture(tmp_path, legacy=True)
+    result = interaction.build_feature_interaction_report(study, exposure_comparison=exposure_comparison)
+    assert not result["complete"]
+    assert {row["branch"] for row in result["rows"]} == {"gru", "rolling_topk"}
+    assert len(result["rows"]) == 2
+    assert result["exposure"]["rows"] == []
+    missing = [item for item in result["unavailable"] if item.get("candidate") == "identity_market"]
+    assert {item["feature_cap"] for item in missing} == {32, 64}
+    assert all("Legacy" in item["reason"] for item in missing)
+    assert all(not any(key.startswith("relation_") for key in row) for row in result["rows"])
+
+
+def test_missing_identity_market_keeps_other_raw_pairs_and_blocks_exposure(tmp_path):
+    study, _, _ = _fixture(tmp_path, missing=(64, "identity_market", 1))
+    result = interaction.build_feature_interaction_report(study, exposure_comparison=True)
+    assert not result["complete"]
+    assert {row["branch"] for row in result["rows"]} == {"gru", "rolling_topk"}
+    assert result["exposure"]["rows"] == []
+    assert any(item.get("candidate") == "identity_market" and item.get("feature_cap") == 64
+               for item in result["unavailable"])
+
+
+def test_matched_residual_identity_controls_and_aggregates(tmp_path):
+    scores = {(32, "identity"): 1., (64, "identity"): 2.,
+              (32, "identity_market"): 3., (64, "identity_market"): 5.,
+              (32, "rolling_residual_topk"): 2., (64, "rolling_residual_topk"): 4.,
+              (32, "rolling_residual_topk_market"): 6., (64, "rolling_residual_topk_market"): 9.}
+    study, _, _ = _fixture(tmp_path, graph_choice="rolling_residual_topk", seeds=(1, 2), score_override=scores)
+    result = interaction.build_feature_interaction_report(study)
+    assert result["complete"], result["unavailable"]
+    graph = next(row for row in result["rows"] if row["branch"] == "rolling_residual_topk")
+    assert graph["relation_gain_plain_low"]["score"] == 1.
+    assert graph["relation_gain_plain_high"]["score"] == 2.
+    assert graph["relation_gain_gate_low"]["score"] == 3.
+    assert graph["relation_gain_gate_high"]["score"] == 4.
+    assert graph["relation_gate_interaction_low"]["score"] == 2.
+    assert graph["relation_gate_interaction_high"]["score"] == 2.
+    aggregate = next(row for row in result["aggregates"] if row["branch"] == "rolling_residual_topk")
+    assert aggregate["mean_relation_gain_gate_high"]["score"] == pytest.approx(4.)
+    assert aggregate["mean_relation_gate_interaction_low"]["score"] == pytest.approx(2.)
+    assert aggregate["by_seed"][0]["mean_relation_gain_gate_high"]["score"] == 4.
 
 
 @pytest.mark.parametrize("change,reason", [

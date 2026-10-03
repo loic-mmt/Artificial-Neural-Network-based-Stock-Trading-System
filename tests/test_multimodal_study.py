@@ -81,7 +81,7 @@ def _source(path, tasks, *, cap=32, score=1.0):
 
 def test_expansion_matches_predeclared_small_grids():
     for stage, caps, depths, candidates in (
-        ("features", [32, 64], [1, 1], 5),
+        ("features", [32, 64], [1, 1], 6),
         ("gnn-depth", [64, 64], [1, 2], 4),
         ("market-depth", [64, 64], [1, 1], 3),
     ):
@@ -91,6 +91,8 @@ def test_expansion_matches_predeclared_small_grids():
         assert [run.gnn_layers for run in runs] == depths
         assert all(len(run.candidates) == candidates for run in runs)
         assert all("sector_market" in run.candidates for run in runs)
+        assert all(len(set(run.candidates)) == candidates for run in runs)
+        assert all(("identity_market" in run.candidates) == (stage == "features") for run in runs)
     runs, _ = expand_stage(_config(), "market-depth", graph_choice="sector", feature_choice=64)
     assert [run.market_layers for run in runs] == [1, 2]
 
@@ -114,7 +116,7 @@ def test_missing_dependencies_block_without_loading_or_training(tmp_path, stage,
 
 def test_dry_plan_counts_signatures_without_storing_big_specs_or_writing(tmp_path):
     plan = _plan(tmp_path)
-    assert plan["counts"]["new_trainings"] == 90
+    assert plan["counts"]["new_trainings"] == 108
     assert plan["counts"]["calibrations"] == 0
     assert all(run["command"][0] == sys.executable for run in plan["runs"])
     assert all("spec" not in task for run in plan["runs"] for task in run["tasks"])
@@ -132,13 +134,28 @@ def test_verified_reference_imports_matching_cap_and_corrupt_row_does_not_hide_v
     source = tmp_path / "reference"
     _source(source, plan["runs"][0]["tasks"])
     reused = _plan(tmp_path, reference_runs=[source])
-    assert reused["counts"]["reused_trainings"] == 45
-    assert reused["counts"]["new_trainings"] == 45
+    assert reused["counts"]["reused_trainings"] == 54
+    assert reused["counts"]["new_trainings"] == 54
     (source / "checkpoint-0.pt").write_bytes(b"corrupt")
     index, incompatible = verified_task_index([source])
-    assert len(index) == 44
+    assert len(index) == 53
     assert plan["runs"][0]["tasks"][0]["signature"] not in index
     assert any("integrity" in item["reason"] for item in incompatible)
+
+
+def test_reference_without_identity_market_reuses_only_verified_existing_tasks(tmp_path):
+    plan = _plan(tmp_path)
+    source = tmp_path / "previous-grid"
+    tasks = [task for task in plan["runs"][0]["tasks"] if task["candidate"] != "identity_market"]
+    _source(source, tasks)
+    updated = _plan(tmp_path, reference_runs=[source])
+    assert updated["counts"]["requested_tasks"] == 108
+    assert updated["counts"]["reused_trainings"] == 45
+    assert updated["counts"]["new_trainings"] == 63
+    controls = [task for run in updated["runs"] for task in run["tasks"]
+                if task["candidate"] == "identity_market"]
+    assert len(controls) == 18
+    assert all(task["state"] == "new" for task in controls)
 
 
 def test_legacy_status_alone_is_never_reused(tmp_path):
@@ -172,13 +189,33 @@ def test_interruption_leaves_atomic_resumable_study_and_refuses_protocol_or_sign
         execute_study(changed, prepare=_prepare, runner=runner, resume=True)
 
 
+def test_resume_refuses_silent_expansion_of_previous_five_candidate_grid(tmp_path):
+    plan = _plan(tmp_path)
+    target = tmp_path / "study"
+    previous = json.loads(json.dumps(plan))
+    for run in previous["runs"]:
+        run["tasks"] = [task for task in run["tasks"] if task["candidate"] != "identity_market"]
+    # Create a real interrupted state so its identity follows the execution contract.
+    def interrupt(**kwargs):
+        raise RuntimeError("intentional interruption")
+    with pytest.raises(RuntimeError, match="intentional"):
+        execute_study(plan, prepare=_prepare, runner=interrupt)
+    state = json.loads((target / "study.json").read_text())
+    state["stages"]["features"]["plan"] = previous
+    atomic_write_json(target / "study.json", state)
+    def forbidden(**kwargs):
+        pytest.fail("A different grid must not resume training.")
+    with pytest.raises(ValueError, match="effective data"):
+        execute_study(plan, prepare=_prepare, runner=forbidden, resume=True)
+
+
 def test_reports_pending_and_empty_without_winning_claims(tmp_path):
     plan = _plan(tmp_path)
     target = tmp_path / "study"
     target.mkdir()
     atomic_write_json(target / "study.json", {"stages": {"features": {"plan": plan}}})
     report = compare_study(target)
-    assert len(report["variants"]) == 10
+    assert len(report["variants"]) == 12
     assert not report["complete"]
     assert all(row["completed"] == 0 and row["mean_score"] is None for row in report["variants"])
     assert not report["paired_deltas"] and report["selected"] is None
@@ -214,12 +251,21 @@ def test_paired_report_uses_immutable_metrics_retains_losses_and_marks_missing_p
     report = compare_study(target)
     feature_pairs = [row for row in report["paired_deltas"] if row["dimension"] == "feature_cap"]
     assert not report["complete"] and report["selected"] is None
-    assert len(feature_pairs) == 44
+    assert len(feature_pairs) == 53
     assert all(row["score_delta"] == -1 for row in feature_pairs)
     assert sum(not row["complete_pair"] for row in feature_pairs) == 8
     assert {row["fold"] for row in feature_pairs} == {0, 1, 2}
     assert {row["seed"] for row in feature_pairs} == {1, 7, 19}
-    assert {row["dimension"] for row in report["paired_deltas"]} == {"feature_cap", "market_gate", "graph", "branch"}
+    assert {row["dimension"] for row in report["paired_deltas"]} == {
+        "feature_cap", "market_gate", "graph", "graph_market", "branch"}
+    gate_controls = [row for row in report["paired_deltas"]
+                     if row["dimension"] == "market_gate" and row["baseline"].endswith("/identity")]
+    assert len(gate_controls) == 17
+    assert all(row["variant"].endswith("/identity_market") for row in gate_controls)
+    relational_controls = [row for row in report["paired_deltas"] if row["dimension"] == "graph_market"]
+    assert len(relational_controls) == 17
+    assert all(row["baseline"].endswith("/identity_market")
+               and row["variant"].endswith("/rolling_topk_market") for row in relational_controls)
     assert report["variants"][0]["mean_abs_position"] == .2
     assert report["variants"][0]["mean_parameter_count"] == 100
     assert len(report["paired_aggregates"][0]["by_fold"]) == 3
@@ -261,7 +307,7 @@ def test_resume_progress_counts_local_completion_even_when_reference_is_preferre
     resumed = _plan(tmp_path, reference_runs=[reference])
     assert all(task["reuse_source"] == str(reference) for run in resumed["runs"] for task in run["tasks"])
     execute_study(resumed, prepare=_prepare, runner=runner, resume=True)
-    assert initial_values == [0, 90]
+    assert initial_values == [0, 108]
 
 
 def test_report_refuses_signed_tasks_from_different_effective_protocol(tmp_path):
@@ -397,18 +443,20 @@ def test_tiny_real_cli_dryrun_execute_resume_and_paired_exports(tmp_path, monkey
     monkeypatch.setattr(graph, "_fit", lambda *a, **k: pytest.fail("Dry-run trained a model"))
     dry = main([*argv, "--dry-run"])
     printed = capsys.readouterr().out
-    assert dry["counts"]["new_trainings"] == 20
+    assert dry["counts"]["new_trainings"] == 24
     assert '"task_specs"' not in printed and '"provenance"' not in printed
     assert not output.exists()
     monkeypatch.setattr(graph, "_fit", original_fit)
     result = main(argv)
     assert len(result["reports"]) == 2
-    assert all(len(report["folds"]) == 10 for report in result["reports"])
+    assert all(len(report["folds"]) == 12 for report in result["reports"])
     if compare_exposure:
         assert result["comparison"]["complete"]
         assert result["comparison"]["feature_interaction"]["exposure"]["complete"]
-        assert len(result["comparison"]["feature_interaction"]["rows"]) == 12
-        assert len(result["comparison"]["feature_interaction"]["exposure"]["interaction_rows"]) == 12
+        assert len(result["comparison"]["feature_interaction"]["rows"]) == 18
+        assert len(result["comparison"]["feature_interaction"]["exposure"]["interaction_rows"]) == 18
+        assert {row["branch"] for row in result["comparison"]["feature_interaction"]["rows"]} == {
+            "gru", "sector", "identity"}
     monkeypatch.setattr(graph, "_fit", lambda *a, **k: pytest.fail("Resume retrained completed tasks"))
     main([*argv, "--resume"])
     report_dir = output / "reports" / "reanalysis" if compare_exposure else output / "reports"

@@ -28,13 +28,17 @@ from trading_system.training.financial_loss import FinancialLossConfig, ReturnPa
 
 METRICS = ("regularized_sharpe", "net_sharpe", "net_return", "net_pnl", "max_drawdown",
            "mean_abs_position", "turnover", "cost_return_sum")
+SIMPLE_EFFECTS = ("gain_high_plain", "gain_high_gate", "gate_gain_low", "gate_gain_high")
+RELATION_EFFECTS = tuple(f"relation_{effect}_{cap}" for effect in (
+    "gain_plain", "gain_gate", "gate_interaction") for cap in ("low", "high"))
 FEATURE_DIRECTORY = "02-features"
 NOTES = [
     "Primary result is the raw signed outer score; no automatic feature or gate promotion.",
     "Interaction = (high gate - low gate) - (high plain - low plain). A positive interaction does not imply that the gate wins or that the higher cap is better.",
     "Actual retained feature counts, not requested caps, define the effective capacity intervention.",
     "mean_min is descriptive ex post whole-outer-fold mean matching; daily_min changes the common sizing path. Neither is a deployable sizing rule.",
-    "All ten variants and one buy-and-hold share each exposure target. Gross matching does not equalize net exposure, beta or volatility.",
+    "All twelve variants and one buy-and-hold share each exposure target. Gross matching does not equalize net exposure, beta or volatility.",
+    "Identity cap × gate interactions control for the gated GNN architecture without cross-stock edges. Matched relation gains compare graph versus identity at the same cap and gate state; relation gate interaction subtracts the identity gate gain from the graph gate gain.",
     "Turnover and costs are recomputed from normalized positions. Returns are fractions; PnL is in initial-capital units per fold/seed, averaged rather than multiplied or compounded across overlapping runs.",
 ]
 
@@ -285,10 +289,19 @@ def _interaction(values, branch, caps, fold, seed, method):
         return {name: left[name] - right[name] if left[name] is not None and right[name] is not None else None
                 for name in (*METRICS, "score")}
     plain, gate = subtract(hp, lp), subtract(hg, lg)
-    return {"method": method, "branch": branch, "fold": fold, "seed": seed,
-            "low_cap": caps[0], "high_cap": caps[1], "gain_high_plain": plain,
-            "gain_high_gate": gate, "gate_gain_low": subtract(lg, lp), "gate_gain_high": subtract(hg, hp),
-            "interaction": subtract(gate, plain), "score_interaction": subtract(gate, plain)["score"]}
+    result = {"method": method, "branch": branch, "fold": fold, "seed": seed,
+              "low_cap": caps[0], "high_cap": caps[1], "gain_high_plain": plain,
+              "gain_high_gate": gate, "gate_gain_low": subtract(lg, lp), "gate_gain_high": subtract(hg, hp),
+              "interaction": subtract(gate, plain), "score_interaction": subtract(gate, plain)["score"]}
+    if branch not in {"gru", "identity"} and all(
+            (cap, candidate) in values for cap in caps for candidate in ("identity", "identity_market")):
+        for label, cap, graph_plain, graph_gate in (("low", caps[0], lp, lg), ("high", caps[1], hp, hg)):
+            relation_plain = subtract(graph_plain, values[cap, "identity"])
+            relation_gate = subtract(graph_gate, values[cap, "identity_market"])
+            result[f"relation_gain_plain_{label}"] = relation_plain
+            result[f"relation_gain_gate_{label}"] = relation_gate
+            result[f"relation_gate_interaction_{label}"] = subtract(relation_gate, relation_plain)
+    return result
 
 
 def _aggregates(rows, expected):
@@ -305,7 +318,11 @@ def _aggregates(rows, expected):
                 stds[name] = statistics.pstdev(numbers) if numbers else None
                 counts[name] = len(numbers)
             effects = {}
-            for effect in ("gain_high_plain", "gain_high_gate", "gate_gain_low", "gate_gain_high"):
+            for effect in (*SIMPLE_EFFECTS, *RELATION_EFFECTS):
+                # An absent identity gate must not invent an edge-attribution
+                # control or silently aggregate a different subset of pairs.
+                if not all(effect in item for item in group):
+                    continue
                 effects[f"mean_{effect}"] = {
                     name: statistics.fmean([item[effect][name] for item in group if item[effect][name] is not None])
                     if any(item[effect][name] is not None for item in group) else None for name in (*METRICS, "score")}
@@ -326,7 +343,7 @@ def _exposure(cells, caps, candidates, keys, metadata, unavailable):
     for fold, seed in sorted(keys):
         if any((cap, candidate, fold, seed) not in cells for cap in caps for candidate in candidates):
             unavailable.append({"kind": "missing", "fold": fold, "seed": seed,
-                                "reason": "Exposure normalization needs all ten verified variants, never a subset."})
+                                "reason": "Exposure normalization needs all twelve verified variants, including identity_market at both caps, never a subset."})
             continue
         frames, names, aliases, labels = [], [], {}, None
         for cap in caps:
@@ -390,7 +407,7 @@ def _exposure(cells, caps, candidates, keys, metadata, unavailable):
                 check = common.mean(axis=1) if method == "mean_min" else common
                 if not np.allclose(check, check[0], atol=1e-12, rtol=1e-10):
                     raise ValueError("Normalized executed gross exposures do not match.")
-            for branch in ("gru", candidates[2]):
+            for branch in ("gru", candidates[2], "identity"):
                 comparisons.append(_interaction(values, branch, caps, fold, seed, method))
     aggregates = []
     for method in METHODS:
@@ -424,7 +441,7 @@ def build_feature_interaction_report(study_dir, *, exposure_comparison=False):
         graph = plan["graph_choice"]
         if graph not in {"sector", "rolling_topk", "rolling_residual_topk"}:
             raise ValueError("Graph choice must be explicit and supported.")
-        candidates = ("gru", "gru_market", graph, graph + "_market", "identity")
+        candidates = ("gru", "gru_market", graph, graph + "_market", "identity", "identity_market")
         keys, protocol = None, None
         for run in runs:
             cap = run["feature_cap"]
@@ -435,23 +452,25 @@ def build_feature_interaction_report(study_dir, *, exposure_comparison=False):
             if protocol is not None and protocol != current:
                 raise ValueError("Feature caps differ beyond max_features (data/CV/loss/architecture/runtime drift).")
             protocol = current
+            declared_candidates = tuple(planned_metadata["ablation"]["candidates"])
+            if declared_candidates not in (candidates, candidates[:-1]):
+                raise ValueError("Feature-stage plan requires the six-candidate grid or its legacy five-candidate grid.")
             expected = {}
             for task in run["tasks"]:
                 key = task["candidate"], *_ids(task["fold"], task["seed"])
-                if key in expected or key[0] not in candidates:
+                if key in expected or key[0] not in declared_candidates:
                     raise ValueError("Duplicate or unexpected task in feature-stage plan.")
                 expected[key] = task
             grid = {(fold, seed) for _, fold, seed in expected}
-            if not grid or set(expected) != {(candidate, fold, seed) for candidate in candidates for fold, seed in grid}:
-                raise ValueError("Each cap requires the same complete five-candidate fold/seed grid.")
+            if not grid or set(expected) != {(candidate, fold, seed) for candidate in declared_candidates for fold, seed in grid}:
+                raise ValueError("Each cap requires its complete declared candidate fold/seed grid.")
             declared_seeds = planned_metadata["seeds"]
             declared_folds = [item["fold"] for item in planned_metadata["cv_folds"]]
             if (len(set(declared_seeds)) != len(declared_seeds)
                     or any(isinstance(value, bool) or not isinstance(value, int) for value in declared_seeds)
                     or len(declared_folds) != planned_metadata["n_splits"]
                     or set(declared_folds) != set(range(planned_metadata["n_splits"]))
-                    or grid != {(fold, seed) for fold in declared_folds for seed in declared_seeds}
-                    or tuple(planned_metadata["ablation"]["candidates"]) != candidates):
+                    or grid != {(fold, seed) for fold in declared_folds for seed in declared_seeds}):
                 raise ValueError("Planned task grid differs from all declared CV folds, seeds or candidates.")
             if keys is not None and keys != grid:
                 raise ValueError("Feature caps declare different fold/seed grids.")
@@ -478,6 +497,11 @@ def build_feature_interaction_report(study_dir, *, exposure_comparison=False):
                 if (cap, *key) not in cells:
                     result["unavailable"].append({"kind": "missing", "feature_cap": cap,
                         "candidate": key[0], "fold": key[1], "seed": key[2], "reason": "Signed completed task is unavailable."})
+            if declared_candidates != candidates:
+                for fold, seed in sorted(grid):
+                    result["unavailable"].append({"kind": "missing", "feature_cap": cap,
+                        "candidate": "identity_market", "fold": fold, "seed": seed,
+                        "reason": "Legacy five-candidate feature plan has no identity_market task; the expanded control grid is incomplete."})
         result["feature_audit"] = _feature_audits(cells, caps, keys)
         if any(row.get("comparable") and not row["actual_growth"] for row in result["feature_audit"]):
             result["notes"].append("At least one fold retained identical feature counts: the requested caps do not produce an effective capacity increase there.")
@@ -486,14 +510,14 @@ def build_feature_interaction_report(study_dir, *, exposure_comparison=False):
             values = {(cap, candidate): {**{name: cell["row"]["outer_metrics"][name] for name in METRICS},
                                          "score": cell["row"]["score"]}
                       for (cap, candidate, f, s), cell in cells.items() if (f, s) == (fold, seed)}
-            for branch in ("gru", graph):
+            for branch in ("gru", graph, "identity"):
                 if fold in comparable and all((cap, candidate) in values for cap in caps for candidate in (branch, branch + "_market")):
                     result["rows"].append(_interaction(values, branch, caps, fold, seed, "raw"))
         raw_complete = len(cells) == 2 * len(candidates) * len(keys) and len(comparable) == len({f for f, _ in keys})
         if exposure_comparison:
             exposure_rows, comparisons, summary = _exposure(cells, caps, candidates, keys, metadata_by_cap[caps[0]], result["unavailable"])
             result["exposure"].update(rows=exposure_rows, aggregates=summary, interaction_rows=comparisons,
-                complete=len(exposure_rows) == len(METHODS) * 11 * len(keys))
+                complete=len(exposure_rows) == len(METHODS) * (len(caps) * len(candidates) + 1) * len(keys))
             # Raw remains the immutable signed score, not a numerically close
             # reconstructed score. Reconstructed raw is retained in exposure.
             result["rows"].extend(row for row in comparisons if row["method"] != "raw")
