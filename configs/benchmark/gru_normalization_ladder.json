@@ -1,0 +1,10 @@
+{
+  "gru": [
+    {"hidden_size": 32, "num_layers": 1, "weight_decay": 0.00001, "early_stopping_patience": 15, "temporal_pooling": "attention"},
+    {"hidden_size": 32, "num_layers": 1, "weight_decay": 0.00001, "early_stopping_patience": 15, "temporal_pooling": "attention", "input_normalization": "expanding"},
+    {"hidden_size": 32, "num_layers": 1, "weight_decay": 0.00001, "early_stopping_patience": 15, "temporal_pooling": "attention", "input_normalization": "rolling", "normalization_window": 20},
+    {"hidden_size": 32, "num_layers": 1, "weight_decay": 0.00001, "early_stopping_patience": 15, "temporal_pooling": "attention", "input_normalization": "revin"},
+    {"hidden_size": 32, "num_layers": 1, "weight_decay": 0.00001, "early_stopping_patience": 15, "temporal_pooling": "attention", "input_normalization": "revin_side"},
+    {"hidden_size": 32, "num_layers": 1, "weight_decay": 0.00001, "early_stopping_patience": 15, "temporal_pooling": "attention", "input_normalization": "gas", "normalization_rate": 0.1}
+  ]
+}
