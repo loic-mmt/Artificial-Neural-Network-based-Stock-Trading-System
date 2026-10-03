@@ -1,0 +1,22 @@
+{
+  "enabled": true,
+  "execution": "next_open",
+  "signal_timing": "after_open",
+  "price_basis": "split_adjusted",
+  "initial_capital": 10000.0,
+  "fees_bps": 5.0,
+  "slippage_bps": 2.0,
+  "stop_loss_pct": 0.05,
+  "take_profit_pct": 0.10,
+  "trailing_stop_pct": 0.04,
+  "trailing_activation_pct": 0.03,
+  "break_even_activation_pct": 0.03,
+  "break_even_offset_pct": 0.001,
+  "max_holding_bars": 20,
+  "reentry": "new_signal",
+  "no_trade_band": 0.001,
+  "max_asset_weight": 0.20,
+  "max_gross_exposure": 1.0,
+  "max_net_exposure": 1.0,
+  "event_policy": "none"
+}

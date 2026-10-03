@@ -38,6 +38,7 @@ def event(timestamp="2020-01-02T12:00:00Z", **values):
     {"stop_loss_pct": .02, "stop_loss_atr": 1}, {"trailing_stop_pct": 0},
     {"fees_bps": float("nan")}, {"initial_capital": -1},
     {"execution": "open_proxy"}, {"event_policy": "magical"},
+    {"allocation_mode": "magical"}, {"target_gross_exposure": 0},
     {"atr_window": True}, {"break_even_activation_pct": .02, "break_even_offset_pct": .03},
 ])
 def test_invalid_config(invalid):
@@ -312,6 +313,74 @@ def test_portfolio_capital_once_and_limits_after_fees():
     assert r.metrics["net_pnl"] == pytest.approx(-r.metrics["fees"] - r.metrics["slippage_cost"])
 
 
+def test_equal_active_excludes_flats_and_resizes_when_active_set_changes():
+    tickers = list("ABCDEFGH")
+    market = pd.concat([bars(count=4, ticker=ticker) for ticker in tickers], ignore_index=True)
+    targets = market[["date", "ticker"]].copy()
+    by_date = {
+        market.date.unique()[0]: [1, 1, 1, -1, -1, -1, 0, 0],
+        market.date.unique()[1]: [1, 1, 1, -1, -1, -1, 1, 0],
+        market.date.unique()[2]: [1, 1, 1, -1, -1, 0, 0, 0],
+        market.date.unique()[3]: [0] * 8,
+    }
+    targets["target_position"] = [
+        by_date[date][tickers.index(ticker)]
+        for date, ticker in zip(targets.date, targets.ticker)
+    ]
+    result = run_trading_backtest(
+        market,
+        targets,
+        cfg(allocation_mode="equal_active", target_gross_exposure=.96),
+    )
+    decisions = result.decisions.set_index(["date", "ticker"])
+    first = pd.Timestamp("2020-01-02", tz="UTC")
+    second = pd.Timestamp("2020-01-03", tz="UTC")
+    np.testing.assert_allclose(
+        decisions.loc[first].requested_weight.to_numpy(),
+        [.16, .16, .16, -.16, -.16, -.16, 0, 0],
+    )
+    np.testing.assert_allclose(
+        decisions.loc[second].requested_weight.to_numpy(),
+        [*((.96 / 7) * np.array([1, 1, 1, -1, -1, -1, 1])), 0],
+    )
+    second_orders = result.orders[result.orders.date.eq(second)]
+    assert set(second_orders.reason) == {"resize_reduce", "signal_entry"}
+    assert second_orders.loc[second_orders.ticker.eq("G"), "quantity_after"].iloc[0] > 0
+
+
+def test_equal_active_target_is_capped_without_forcing_infeasible_exposure():
+    tickers = list("ABCDEFGH")
+    market = pd.concat([bars(count=3, ticker=ticker) for ticker in tickers], ignore_index=True)
+    directions = dict(zip(tickers, [1, 1, 1, -1, -1, -1, 0, 0]))
+    targets = market[["date", "ticker"]].copy()
+    targets["target_position"] = targets.ticker.map(directions)
+    result = run_trading_backtest(
+        market,
+        targets,
+        cfg(
+            allocation_mode="equal_active",
+            target_gross_exposure=.96,
+            max_asset_weight=.10,
+        ),
+    )
+    action = result.decisions[result.decisions.date.eq(pd.Timestamp("2020-01-02", tz="UTC"))]
+    assert action.requested_weight.abs().sum() == pytest.approx(.96)
+    assert action.target_weight.abs().sum() == pytest.approx(.60)
+    assert action.actual_weight.abs().sum() == pytest.approx(.60)
+
+
+def test_fixed_universe_remains_the_default_allocation():
+    tickers = list("ABCDEFGH")
+    market = pd.concat([bars(count=3, ticker=ticker) for ticker in tickers], ignore_index=True)
+    directions = dict(zip(tickers, [1, 1, 1, -1, -1, -1, 0, 0]))
+    targets = market[["date", "ticker"]].copy()
+    targets["target_position"] = targets.ticker.map(directions)
+    result = run_trading_backtest(market, targets, cfg())
+    action = result.decisions[result.decisions.date.eq(pd.Timestamp("2020-01-02", tz="UTC"))]
+    assert action.requested_weight.abs().sum() == pytest.approx(6 / 8)
+    assert action.requested_weight.abs().max() == pytest.approx(1 / 8)
+
+
 def test_risk_limits_override_turnover_buffer():
     b = bars([100, 100, 100, 100], [100, 80, 80, 80])
     r = run_trading_backtest(b, [-1] * 4, cfg(max_asset_weight=.25, no_trade_band=.5))
@@ -498,9 +567,17 @@ def test_cli_separates_groups_writes_hashes_and_guards_holdout(tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"take_profit_pct": .05, "fees_bps": 0}))
     output = tmp_path / "replay"
-    main(["--signals", str(signal_path), "--trading-config", str(config_path), "--output-dir", str(output)])
+    main([
+        "--signals", str(signal_path),
+        "--trading-config", str(config_path),
+        "--allocation-mode", "equal_active",
+        "--target-gross-exposure", ".98",
+        "--output-dir", str(output),
+    ])
     report = json.loads((output / "report.json").read_text())
     assert len(report["comparisons"]) == 2
+    assert report["config"]["allocation_mode"] == "equal_active"
+    assert report["config"]["target_gross_exposure"] == .98
     assert not report["final_holdout_opened"]
     assert len(report["inputs_sha256"]["signals"]) == 64
     assert (output / "group-001" / "with_rules" / "orders.parquet").exists()

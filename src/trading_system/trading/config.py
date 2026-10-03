@@ -19,6 +19,8 @@ class TradingConfig:
     session_close: str = "17:30"
     price_basis: str = "split_adjusted"
     position_mode: str = "long_short"
+    allocation_mode: str = "fixed_universe"
+    target_gross_exposure: float = 1.0
     initial_capital: float = 10_000.0
     fees_bps: float = 5.0
     slippage_bps: float = 0.0
@@ -64,6 +66,7 @@ class TradingConfig:
             "bar_mode": {"daily", "intraday"},
             "price_basis": {"raw", "split_adjusted"},
             "position_mode": {"long_only", "long_short"},
+            "allocation_mode": {"fixed_universe", "equal_active"},
             "reentry": {"new_signal", "cooldown", "next_bar"},
             "event_policy": {"none", "block_increases", "reduce", "flat"},
         }
@@ -86,7 +89,7 @@ class TradingConfig:
         if self.volatility_window < 2:
             raise ValueError("volatility_window must be >= 2.")
         for name in (
-            "initial_capital", "max_gross_exposure", "max_net_exposure",
+            "initial_capital", "target_gross_exposure", "max_gross_exposure", "max_net_exposure",
             "volatility_scale_cap", "stop_loss_atr", "take_profit_atr", "trailing_stop_atr",
             "max_asset_weight", "max_sector_weight", "volatility_target",
         ):

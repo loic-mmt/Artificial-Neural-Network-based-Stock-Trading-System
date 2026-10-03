@@ -132,12 +132,22 @@ def main(argv=None):
     parser.add_argument("--ou-history", type=Path, help="Price history; only rows before each group's first prediction reach the OU fit.")
     parser.add_argument("--execution", choices=("next_open", "next_close", "open_proxy"))
     parser.add_argument("--signal-timing", choices=("after_open", "after_close"))
+    parser.add_argument(
+        "--allocation-mode",
+        choices=("fixed_universe", "equal_active"),
+        help="Override allocation: fixed q/N slots or equal weights across active targets.",
+    )
+    parser.add_argument(
+        "--target-gross-exposure",
+        type=float,
+        help="Gross exposure requested by equal_active before risk caps, for example 0.98.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--final-test-start", default="2022-05-10")
     parser.add_argument("--allow-final-test", action="store_true")
     args = parser.parse_args(argv)
     values = json.loads(args.trading_config.read_text())
-    for name in ("execution", "signal_timing"):
+    for name in ("execution", "signal_timing", "allocation_mode", "target_gross_exposure"):
         if getattr(args, name) is not None:
             values[name] = getattr(args, name)
     config = TradingConfig(**values)

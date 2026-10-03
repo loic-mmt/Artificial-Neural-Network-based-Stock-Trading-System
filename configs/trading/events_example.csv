@@ -1,0 +1,4 @@
+event_id,event_type,timestamp,known_at,scope,scope_value
+synthetic-global,ECB,2020-01-02T12:00:00Z,2019-12-01T00:00:00Z,global,
+synthetic-ticker,earnings,2020-01-03T20:00:00Z,2019-12-15T00:00:00Z,ticker,A
+synthetic-sector,BoA_earnings,2020-01-06T12:00:00Z,2019-12-15T00:00:00Z,sector,bank

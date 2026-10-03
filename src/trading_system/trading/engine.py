@@ -78,6 +78,39 @@ def _distance(config, prefix, price, atr):
     return price * percent if percent is not None else (atr * multiple if multiple is not None else None)
 
 
+def _allocation_weights(raw_targets, adjusted_targets, config):
+    """Convert post-rule targets into portfolio weights.
+
+    ``fixed_universe`` preserves the historical q / N contract.  In
+    ``equal_active`` mode, every non-flat target receives the same base
+    absolute weight and flat targets reserve no per-asset cash slot.  Optional
+    risk rules may only reduce that base weight, leaving the difference in
+    cash rather than redistributing a deliberately reduced position.
+    """
+
+    raw = np.asarray(raw_targets, dtype=float)
+    adjusted = np.asarray(adjusted_targets, dtype=float)
+    if raw.shape != adjusted.shape or raw.ndim != 1 or not np.isfinite(adjusted).all():
+        raise ValueError("Allocation targets must be aligned finite vectors.")
+    if config.allocation_mode == "fixed_universe":
+        return adjusted / len(adjusted)
+    active = np.abs(adjusted) >= EPS
+    weights = np.zeros_like(adjusted)
+    count = int(active.sum())
+    if count == 0:
+        return weights
+    base = config.target_gross_exposure / count
+    # Model conviction magnitude is intentionally ignored by equal sizing.
+    # Magnitude reductions introduced by optional risk/event rules survive.
+    denominator = np.abs(raw[active])
+    modifier = np.divide(
+        np.abs(adjusted[active]), denominator,
+        out=np.ones_like(denominator), where=denominator >= EPS,
+    )
+    weights[active] = np.sign(adjusted[active]) * base * np.clip(modifier, 0.0, 1.0)
+    return weights
+
+
 class _Replay:
     def __init__(self, bars, targets, config, events, history=None):
         self.config = config
@@ -308,7 +341,7 @@ class _Replay:
         if equity <= 0:
             raise ValueError("Portfolio became insolvent; leveraged losses cannot be clipped to zero.")
         current = np.array([self.state.positions[t].quantity * prices[t] / equity for t in self.tickers])
-        raw, proposed, reasons, event_ids = [], [], [], []
+        raw, adjusted, reasons, event_ids = [], [], [], []
         atrs = {}
         for ticker in self.tickers:
             pos, row = self.state.positions[ticker], rows[ticker]
@@ -356,7 +389,7 @@ class _Replay:
                             old_weight = current[self.tickers.index(ticker)]
                             if _sign(q) != _sign(old_weight):
                                 q = 0.
-                            else:
+                            elif cfg.allocation_mode == "fixed_universe":
                                 q = _sign(q) * min(abs(q), abs(old_weight) * len(self.tickers))
                 if q and _sign(pos.quantity) != _sign(q) and cfg.needs_atr and atrs[ticker] is None:
                     q = 0.
@@ -384,9 +417,17 @@ class _Replay:
             if bar == len(self.actions) - 1 and phase == "close":
                 q = 0.
                 why.append("terminal_no_entry")
-            proposed.append(q / len(self.tickers))
+            adjusted.append(q)
             reasons.append(why)
             event_ids.append(ids)
+        proposed = _allocation_weights(raw, adjusted, cfg)
+        if cfg.allocation_mode == "equal_active":
+            for i, why in enumerate(reasons):
+                if "event_block_increases" in why:
+                    if _sign(proposed[i]) != _sign(current[i]):
+                        proposed[i] = 0.
+                    else:
+                        proposed[i] = _sign(proposed[i]) * min(abs(proposed[i]), abs(current[i]))
         weights = self.capped_weights(np.array(proposed), rows)
         hard_violation = not np.allclose(current, self.capped_weights(current, rows), atol=EPS, rtol=0)
         for i in range(len(weights)):

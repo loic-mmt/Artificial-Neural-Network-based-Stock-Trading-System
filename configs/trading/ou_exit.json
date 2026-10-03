@@ -1,0 +1,20 @@
+{
+  "enabled": true,
+  "execution": "next_open",
+  "signal_timing": "after_open",
+  "price_basis": "split_adjusted",
+  "fees_bps": 5,
+  "slippage_bps": 2,
+  "trailing_stop_pct": 0.04,
+  "trailing_activation_pct": 0,
+  "reentry": "next_bar",
+  "ou": {
+    "mode": "exit",
+    "window": 252,
+    "refit_every": 21,
+    "discount_rate": 0.05,
+    "adf_pvalue": 0.05,
+    "max_half_life_fraction": 0.25,
+    "stability_sigma": 2
+  }
+}
