@@ -56,8 +56,13 @@ def build_close_market_frame(
     realized_vol_window: int = 20,
     price_col: str = "adj_close",
     ticker_col: str = "ticker",
+    feature_prefix: str = "",
 ) -> tuple[pd.DataFrame, dict]:
-    """Derive causal close-session features; never pretend macro releases are close data."""
+    """Derive causal close-session features with an optional input namespace.
+
+    A prefix distinguishes Transformer context columns from stock features
+    with the same source/name, without changing values or availability dates.
+    """
     allowed = {"market_close", "vix_close", "dxy_close", "oil_close", "gold_close"}
     if context_frame is not None:
         allowed.update(column for column in context_frame if column.endswith("_close"))
@@ -134,13 +139,18 @@ def build_close_market_frame(
     # This is a conservative session-end bound, not a vendor publication timestamp.
     # Predictions use close-J data only for execution on J+1 or later.
     result["source_end"] = daily[date_col] + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
-    columns = tuple(features)
+    source_columns = tuple(features)
+    names = {name: f"{feature_prefix}{name}" for name in source_columns}
+    result = result.rename(columns=names)
+    columns = tuple(names.values())
     report = {"rows": len(result), "features": columns,
               "close_columns": close_columns,
               "external_context": context_frame is not None,
               "cross_sectional_features": include_cross_section,
               "feature_coverage": {name: float(result[name].notna().mean()) for name in columns},
               "source_end_policy": "close-J assumed available for delayed execution; synthetic session-end upper bound"}
+    if feature_prefix:
+        report["source_features"] = {names[name]: name for name in source_columns}
     return result, report
 
 
@@ -203,6 +213,7 @@ def run_market_gru_ablation(frame, config, loss, gru_parameters, seeds, destinat
         realized_vol_window=ablation.realized_vol_window,
         price_col=config.price_col,
         ticker_col=config.group_col,
+        feature_prefix="market_context__",
     )
     market_columns = tuple(market_audit["features"])
     folds, final_split = expanding_calendar_folds(

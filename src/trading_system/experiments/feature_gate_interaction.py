@@ -492,7 +492,7 @@ def build_feature_interaction_report(study_dir, *, exposure_comparison=False):
                 observed[key] = row
                 if row.get("status") != "ok":
                     continue
-                cells[cap, *key] = _signed_cell(row, root, expected[key], metadata, cap, audits.get(key[1]))
+                cells[(cap, *key)] = _signed_cell(row, root, expected[key], metadata, cap, audits.get(key[1]))
             for key in expected:
                 if (cap, *key) not in cells:
                     result["unavailable"].append({"kind": "missing", "feature_cap": cap,

@@ -31,6 +31,8 @@ CV figée : 3 folds, fractions initiale0,5/interne0,2, gap5, embargo0, seeds1/7/
 
 Les features marché des actions et le contexte ETF/VIX du Transformer sont deux entrées distinctes. Le Transformer pondère les features de la branche ; il ne produit pas un vote de trading ajouté au GRU/GNN.
 
+Les colonnes du contexte Transformer portent le préfixe `market_context__`, par exemple `market_context__vix_level`. L'audit `market_audit.source_features` conserve le nom de chaque feature source. Ce renommage préserve les valeurs et les dates de disponibilité ainsi que le pool commun des actions : `vix_level` peut aussi être sélectionné pour le GRU/GNN dans cette grille. Le test mesure donc l'apport de l'encodage et du gate sur ce pool commun, pas l'ajout d'une information VIX jusque-là absente.
+
 ## Lancer sur ce Mac
 
 Utiliser les fichiers PC figés déjà copiés, depuis la racine du dépôt :

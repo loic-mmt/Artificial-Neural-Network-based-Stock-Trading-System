@@ -113,6 +113,7 @@ def prepare_graph_run(argv=None):
             realized_vol_window=args.market_realized_vol_window,
             price_col=config.price_col,
             ticker_col=config.group_col,
+            feature_prefix="market_context__",
         )
         market_columns = tuple(market_audit["features"])
     ablation = GraphAblationConfig(

@@ -408,7 +408,8 @@ def test_tiny_real_cli_dryrun_execute_resume_and_paired_exports(tmp_path, monkey
             close = 80 + number * 20 + index * .12 + np.sin(index / (5 + number))
             records.append(dict(date=day, ticker=ticker, sector="Financial", open=close,
                                 high=close * 1.01, low=close * .99, close=close,
-                                adj_close=close, volume=1000 + index * 10))
+                                adj_close=close, volume=1000 + index * 10,
+                                vix_close=20 + np.sin(index / 7)))
     data_path = tmp_path / "prices.parquet"
     pd.DataFrame(records).to_parquet(data_path, index=False)
     context = pd.DataFrame({"date": dates, **{
@@ -428,7 +429,7 @@ def test_tiny_real_cli_dryrun_execute_resume_and_paired_exports(tmp_path, monkey
         "--models", "gru", "--model-parameter-sets", str(parameters),
         "--losses", "sharpe", "--context-len", "5", "--feature-set", "expanded",
         "--feature-groups", "technical", "--no-external-features", "--overfitting-control",
-        "--market-context-data", str(context_path), "--market-close-columns", "spy_close",
+        "--market-context-data", str(context_path), "--market-close-columns", "vix_close,spy_close",
         "--graph-lookback", "10", "--gnn-hidden-size", "4", "--market-transformer-width", "4",
         "--market-transformer-heads", "1", "--cv-folds", "2", "--cv-gap-bars", "2",
         "--seeds", "1", "--device", "cpu"]
@@ -450,6 +451,8 @@ def test_tiny_real_cli_dryrun_execute_resume_and_paired_exports(tmp_path, monkey
     result = main(argv)
     assert len(result["reports"]) == 2
     assert all(len(report["folds"]) == 12 for report in result["reports"])
+    assert all("market_context__vix_level" in report["metadata"]["market_columns"]
+               for report in result["reports"])
     if compare_exposure:
         assert result["comparison"]["complete"]
         assert result["comparison"]["feature_interaction"]["exposure"]["complete"]

@@ -72,6 +72,42 @@ def test_market_frame_accepts_audited_etfs_and_cross_sectional_state():
         )
 
 
+def test_market_namespace_routes_vix_without_changing_stock_features_or_context():
+    from trading_system.experiments.graph_ablation import _dataset
+
+    frame = _frame()
+    frame["vix_level"] = frame["vix_close"]
+    options = dict(include_cross_section=True, realized_vol_window=5)
+    original, original_audit = build_close_market_frame(
+        frame, "date", ("market_close", "vix_close"), **options,
+    )
+    market, audit = build_close_market_frame(
+        frame, "date", ("market_close", "vix_close"),
+        feature_prefix="market_context__", **options,
+    )
+    names = {name: f"market_context__{name}" for name in original_audit["features"]}
+    pd.testing.assert_frame_equal(market, original.rename(columns=names))
+    assert audit["source_features"] == {new: old for old, new in names.items()}
+    assert audit["feature_coverage"] == {
+        names[name]: coverage for name, coverage in original_audit["feature_coverage"].items()
+    }
+
+    boundary = market.date.iloc[10]
+    history = frame.loc[frame.date < boundary].copy()
+    target = frame.loc[frame.date >= boundary].copy()
+    config = replace(DEFAULT_CONFIG, context_len=5, device="cpu")
+    with pytest.raises(ValueError, match="must be separate"):
+        _dataset(target, history, ("vix_level",), config, (),
+                 market=original, market_columns=original_audit["features"], require_market=True)
+    dataset = _dataset(target, history, ("vix_level",), config, (),
+                       market=market, market_columns=audit["features"], require_market=True)
+    batch = dataset.batch([0])
+    assert batch.temporal_mask.all() and batch.market_sequence_mask.all()
+    index = audit["features"].index("market_context__vix_level")
+    np.testing.assert_allclose(batch.temporal[0, 0, :, 0], batch.market_sequence[0, :, index])
+    np.testing.assert_array_equal(frame["vix_level"], frame["vix_close"])
+
+
 def test_market_ablation_matches_folds_and_resumes(tmp_path):
     frame = _frame()
     config = replace(DEFAULT_CONFIG, context_len=5, device="cpu")
