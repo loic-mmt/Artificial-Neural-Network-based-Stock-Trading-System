@@ -3,7 +3,7 @@
 Invariant : GRU, Transformer de marché, GNN et sentiment sont des branches indépendantes. Le GRU lit les séquences par ticker ; le Transformer lit uniquement une séquence globale macro/micro/volatilité ; le GNN reçoit ses propres features de nœuds et un graphe causal, jamais les embeddings du GRU. La fusion peut fonctionner avec une seule branche prédictive active.
 
 1. Fixer contrat multimodal : échantillons alignés par date/ticker ; séquences par ticker du GRU, séquence globale du Transformer, features de nœuds GNN, graphe causal, sentiment et masques de disponibilité. Chaque branche produit logits Sell/Hold/Buy + représentation. GNN ne consomme jamais sortie GRU.
-2. Construire branches isolées : GRU actuel ; GNN seul sur features boursières/relationnelles ; Transformer dédié à l'état de marché. Sentiment : scores datés importés de la librairie FinBERT externe, sans dépendance FinBERT dans ce repo. Absence de news ≠ sentiment neutre.
+2. Construire branches isolées : GRU actuel ; GNN seul sur features boursières/relationnelles ; Transformer dédié à l'état de marché. Sentiment : scores datés importés de la librairie FinBERT externe, sans chargement de FinBERT pendant l'entraînement ; l'extra optionnel sert uniquement à la préparation séparée des données. Absence de news ≠ sentiment neutre.
 3. Ajouter Market-Guided Gating, activable indépendamment : aucun gate / gate statique / gate guidé par contexte marché disponible au moment de prédiction.
 4. Ajouter fusion modulaire : branche seule → moyenne fixe → poids appris → confidence-aware fusion. Calibration des branches sur validation uniquement ; abstention vers Hold testée séparément de fusion. Pondérations renormalisées sur les seules branches disponibles ; disponibilité de news distincte d'un score neutre.
 5. Benchmarks par ablations, pas produit cartésien géant : mêmes dates/tickers, labels, coûts, folds, seeds, budget de recherche. Comparer aussi GRU avec mêmes features marché pour isoler apport du graphe ; tester chaque branche seule et chaque retrait de branche. Rapporter PnL net, Sharpe, F1, calibration, couverture, temps/VRAM.
@@ -207,6 +207,32 @@ module les features du GRU ou du GNN avec le gate de marché. Ses logits ne sont
 pas fusionnés et il ne vote pas. Chaque axe reste désactivable indépendamment
 via `--graph-candidates`, `--market-close-columns`, `--graph-neighbors` et
 `--graph-rebalance-bars`. Le sentiment reste hors protocole.
+
+Les données structurées London Strategic Edge et les corpus de sentiment à
+récupérer sont fixés dans [l'inventaire de collecte](data-acquisition-lse-sentiment.md).
+
+## Pilote news sentiment, avant les prochains ajouts de données
+
+Le [plan sentiment](news-sentiment-pilot.md) prépare une collecte Alpha Vantage
+bornée à 25 tentatives par jour et sur 24 heures glissantes, avec compteur partagé.
+Le scoring FinBERT reste séparé de l'entraînement. Les exports entreprise et
+macro suivent deux routes distinctes ; aucun contexte global n'est transformé
+en ticker tradable.
+
+Le nouveau runner de comparaison propose GRU seul, activité news sans polarité,
+features news dans le GRU, sentiment seul, puis moyenne masquée GRU/sentiment.
+Le train apprend ses scalers sur les seules observations couvertes ; l'absence
+de sentiment ne rend pas le GRU indisponible. Les runners existants ne changent pas.
+
+Il reste à fournir un corpus et une couverture historiques admissibles avant
+de lancer la comparaison financière. Le petit backfill téléchargé aujourd'hui
+sert à vérifier collecte/scoring/export, pas à prouver un gain sur les dates
+anciennes. Le raccordement du panel macro au Transformer, la calibration et
+la fusion apprise restent des étapes suivantes et doivent être benchmarkés
+séparément.
+Ce document distingue historique et point-in-time, les entrées de chaque branche,
+les sources complémentaires et les contrôles nécessaires avant ingestion.
+Aucune nouvelle source n'est activée automatiquement par cet inventaire.
 
 Les décisions suivantes viennent du [contrôle d'exposition](../benchmarks/us-exposure-comparison.md).
 Le [plan d'interaction features/gate](us-feature-gate-interaction.md) est prêt

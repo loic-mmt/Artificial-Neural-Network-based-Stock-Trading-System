@@ -9,5 +9,6 @@ Le [résumé général](../benchmark-summary.md) sert de point d'entrée. Chaque
 - MT5 : [France](mt5-france.md), [US](mt5-us.md), [décodages](mt5-decoders.md), [réentraînement](mt5-retraining.md), [allocation](mt5-allocation.md), [live](mt5-live.md).
 - Diagnostics : [régime et shorts](market-regime-short-filter.md), [tickers US](us-ticker-diagnostics.md).
 - Trading : [premier replay](trading-initial-replay.md), [sorties](trading-exit-ablation.md), [validation OU](trading-ou-validation.md).
+- Sentiment : [pilote RSS et FinBERT](news-sentiment-rss-pilot.md), validation technique uniquement.
 
 Les numéros learning et GRU sont indépendants. Je ne classe pas ensemble des résultats aux coûts, périodes ou prix d'exécution différents.
