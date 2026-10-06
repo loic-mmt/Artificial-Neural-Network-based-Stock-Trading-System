@@ -12,6 +12,7 @@ Je garde ici le fonctionnement du code. Les performances sont dans [benchmarks](
 - [Purged CV](purged-cv.md).
 - [Contrôle du surapprentissage](overfitting-control.md).
 - [Optimisation mémoire](memory-optimization.md).
+- [Dashboard interactif des benchmarks et backtests](visualization.md).
 
 ## Features et données
 

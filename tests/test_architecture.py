@@ -13,6 +13,7 @@ def test_lower_layers_do_not_import_pipelines():
         "evaluation",
         "backtest",
         "reporting",
+        "visualization",
         "experiments",
         "analysis",
     )

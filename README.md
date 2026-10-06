@@ -13,6 +13,7 @@ Documentation: [index](docs/README.md), [benchmark conclusions](docs/benchmark-s
 - `src/trading_system/pipelines/`: thin CLI/configuration wrappers
 - `src/trading_system/backtest/`: positions, timing, fees, benchmarks, and advanced backtests
 - `src/trading_system/trading/`: optional post-prediction OHLC rules and portfolio replay; [API and CLI](docs/src/trading-module.md)
+- `src/trading_system/visualization/`: interactive explorer for saved benchmarks and backtests; [dashboard](docs/src/visualization.md)
 - `scripts/`: runnable entrypoints
 - `data/processed/`: local market datasets
 - `data/derived/`: generated labels and derived tables
@@ -37,6 +38,26 @@ Run tests with development dependencies:
 python -m pip install -e ".[dev]"
 pytest
 ```
+
+## Interactive dashboard
+
+```bash
+python -m pip install -e ".[visualization]"
+python scripts/run_visualization.py
+```
+
+The Portfolio view combines strategy/Buy & Hold capital and drawdown, window KPIs,
+and asset price charts with sourced buy/sell markers. Target signals remain distinct
+from recorded fills. Compare Runs shows original metrics for up to eight runs;
+the Apple-inspired theme uses the web app's colors. Filter models/seeds/folds and
+export CSV or standalone HTML. The dashboard reads existing artifacts; it does not
+train models or rerun strategies. Metrics-only benchmarks remain usable when dated
+equity paths were not exported.
+
+Use `--artifacts-root PATH` for a single study, `--headless` to suppress browser
+launch, or `--list` to inspect the catalogue without Streamlit. See
+[visualization documentation](docs/src/visualization.md) for supported formats and
+the distinction between recorded metrics and displayed-window statistics.
 
 ## Validation and final test
 

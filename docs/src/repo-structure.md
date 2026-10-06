@@ -23,6 +23,7 @@ Lower layers never import `trading_system.pipelines`.
 | `evaluation` | Classification metrics and probability threshold calibration. |
 | `backtest` | Position decoding, next-bar execution, turnover, fees, benchmarks. |
 | `reporting` | Plots and formatted experiment summaries. |
+| `visualization` | Read-only artifact catalogue, format adapters, Plotly views and optional Streamlit dashboard. |
 | `experiments` | Static/walk-forward runners, leakage-safe search and fair comparison. |
 | `pipelines` | CLI arguments and predefined experiment configurations only. |
 | `artifacts` | Safe NPZ/JSON states, checksums, manifests and compatibility validation. |
