@@ -25,6 +25,10 @@ from trading_system.data.multimodal import build_multimodal_dataset
 from trading_system.data.news_sentiment import (
     SENTIMENT_COLUMNS, SENTIMENT_STATISTICS, SentimentExport,
 )
+from trading_system.data.fnspid_export import (
+    AVAILABILITY_ASSUMPTION, EXPLORATORY_LIMITATIONS, FNSPID_PROTOCOL, FNSPID_SCHEMA,
+    _scored_articles, _sha256,
+)
 from trading_system.models.multimodal_branches import GRUBranch, SentimentBranch
 from trading_system.models.multimodal_system import MaskedLogitFusion
 from trading_system.models.neural.config import GRUConfig
@@ -39,8 +43,14 @@ from .runner import _prepare_splits
 
 
 CANDIDATES = ("gru", "gru_activity", "gru_features", "sentiment", "gru_sentiment_mean")
+POLARITY_CANDIDATES = ("gru", "gru_activity", "gru_features", "gru_features_shuffled", "gru_features_neutralized")
+ALL_CANDIDATES = tuple(dict.fromkeys((*CANDIDATES, *POLARITY_CANDIDATES)))
+POLARITY_STATISTICS = tuple(name for name in SENTIMENT_STATISTICS
+                            if name not in ("confidence_mean", "hours_since_last_news"))
+_FEATURE_CANDIDATES = ("gru_features", "gru_features_shuffled", "gru_features_neutralized")
 _PREFIX = "news_sentiment__"
 _COVERED_COLUMN = _PREFIX + "covered"
+_OBSERVED_COLUMN = _PREFIX + "observed"
 _DATASET_SENTIMENT_COLUMNS = ("_scaled_news_count", *SENTIMENT_COLUMNS[1:])
 
 
@@ -49,11 +59,20 @@ class NewsSentimentAblationConfig:
     candidates: tuple[str, ...] = CANDIDATES
     sentiment_hidden_size: int = 16
     date_batch_size: int = 32
+    news_protocol: str = "pit"
+    shuffle_seed: int = 314159
+    scored_articles_path: str | None = None
 
     def __post_init__(self):
+        if self.news_protocol not in ("pit", FNSPID_PROTOCOL):
+            raise ValueError("news_protocol must be pit or fnspid-exploratory.")
         if (not self.candidates or len(set(self.candidates)) != len(self.candidates)
-                or any(item not in CANDIDATES for item in self.candidates)):
-            raise ValueError(f"Choose unique news candidates from {CANDIDATES}.")
+                or any(item not in ALL_CANDIDATES for item in self.candidates)):
+            raise ValueError(f"Choose unique news candidates from {ALL_CANDIDATES}.")
+        if isinstance(self.shuffle_seed, bool) or not isinstance(self.shuffle_seed, int) or not 0 <= self.shuffle_seed < 2**32:
+            raise ValueError("shuffle_seed must be an integer in [0, 2**32).")
+        if any(item in self.candidates for item in POLARITY_CANDIDATES[3:]) and self.news_protocol != FNSPID_PROTOCOL:
+            raise ValueError("Article polarity controls require the explicit fnspid-exploratory protocol.")
         for name in ("sentiment_hidden_size", "date_batch_size"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -75,9 +94,12 @@ def _align_news(frame, exported, config):
     source["export_row_present"] = True
     source = source.set_index(["date", "ticker"])
     aligned = source.reindex(keys).reset_index()
-    aligned["export_row_present"] = aligned["export_row_present"].fillna(False).astype(bool)
-    aligned["source_available"] = aligned["source_available"].fillna(False).astype(bool)
+    aligned["export_row_present"] = aligned["export_row_present"].eq(True).fillna(False).astype(bool)
+    aligned["source_available"] = aligned["source_available"].eq(True).fillna(False).astype(bool)
     aligned["coverage_status"] = aligned["coverage_status"].fillna("unknown")
+    if exported.protocol == FNSPID_PROTOCOL:
+        aligned["observation_status"] = aligned["observation_status"].fillna("unobserved")
+        aligned["availability_kind"] = aligned["availability_kind"].fillna(AVAILABILITY_ASSUMPTION)
     aligned["available_at"] = pd.to_datetime(aligned["available_at"], utc=True)
     return aligned
 
@@ -88,6 +110,7 @@ class _SentimentScaler:
     scales: tuple[float, ...]
     covered_fit_rows: int
     feature_fit_rows: tuple[int, ...]
+    news_protocol: str = "pit"
 
     @classmethod
     def fit(cls, prepared, exported, config, *, required):
@@ -95,6 +118,8 @@ class _SentimentScaler:
         eligible = prepared.train["_fit_eligible"].to_numpy(dtype=bool)
         covered = aligned.source_available.to_numpy(dtype=bool) & eligible
         if required and not covered.any():
+            if exported.protocol == FNSPID_PROTOCOL:
+                raise ValueError("No observed eligible TRAIN news under the FNSPID publication-delay assumption.")
             raise ValueError("No covered eligible TRAIN news observations; historical backfills collected now "
                              "must remain unavailable. Supply point-in-time coverage, not dummy zeros.")
         means, scales, counts = [], [], []
@@ -109,7 +134,7 @@ class _SentimentScaler:
             means.append(mean)
             scales.append(scale if scale > 0 else 1.)
             counts.append(int(len(values)))
-        return cls(tuple(means), tuple(scales), int(covered.sum()), tuple(counts))
+        return cls(tuple(means), tuple(scales), int(covered.sum()), tuple(counts), exported.protocol)
 
     def transform(self, aligned):
         result = aligned.copy()
@@ -125,36 +150,53 @@ class _SentimentScaler:
         return result
 
     def state_dict(self):
+        exploratory = self.news_protocol == FNSPID_PROTOCOL
         return {"columns": ["news_count", *SENTIMENT_STATISTICS], "mean": self.means,
-                "scale": self.scales, "covered_fit_rows": self.covered_fit_rows,
+                "scale": self.scales, "covered_fit_rows": 0 if exploratory else self.covered_fit_rows,
+                "available_fit_rows": self.covered_fit_rows,
+                "observed_fit_rows": self.covered_fit_rows if exploratory else None,
+                "news_protocol": self.news_protocol,
                 "feature_fit_rows": self.feature_fit_rows,
-                "fit_policy": "covered eligible TRAIN rows only; statistics require presence",
-                "presence_policy": "binary channels unchanged on covered rows; zero when unavailable"}
+                "fit_policy": ("observed eligible TRAIN rows under the publication-delay assumption; statistics require presence"
+                               if exploratory else "covered eligible TRAIN rows only; statistics require presence"),
+                "presence_policy": "binary channels unchanged on available rows; zero when unavailable"}
 
 
-def _temporal_columns(prepared, candidate):
+def _temporal_columns(prepared, candidate, news_protocol="pit"):
+    indicator = _OBSERVED_COLUMN if news_protocol == FNSPID_PROTOCOL else _COVERED_COLUMN
     if candidate == "gru_activity":
-        return (*prepared.columns, _PREFIX + "news_count", _COVERED_COLUMN)
-    if candidate == "gru_features":
-        return (*prepared.columns, *(_PREFIX + name for name in SENTIMENT_COLUMNS), _COVERED_COLUMN)
+        return (*prepared.columns, _PREFIX + "news_count", indicator)
+    if candidate in _FEATURE_CANDIDATES:
+        return (*prepared.columns, *(_PREFIX + name for name in SENTIMENT_COLUMNS), indicator)
     return prepared.columns
 
 
 def _dataset(target, history, prepared, exported, scaler, config, candidate):
-    columns = _temporal_columns(prepared, candidate)
+    columns = _temporal_columns(prepared, candidate, exported.protocol)
     raw_news = _align_news(target, exported, config)
     news = scaler.transform(raw_news)
+
+    def model_features(aligned):
+        # Disable value channels in standardized space, not by claiming that
+        # real articles were neutral. Keep dimensions and all presence masks.
+        if candidate == "gru_features_neutralized":
+            aligned = aligned.copy()
+            aligned.loc[:, list(POLARITY_STATISTICS)] = np.float32(0.)
+        return aligned
+
+    news = model_features(news)
 
     def append(frame, aligned):
         result = frame.copy()
         for name in SENTIMENT_COLUMNS:
             result[_PREFIX + name] = aligned[name].to_numpy(dtype=np.float32)
-        result[_COVERED_COLUMN] = aligned.source_available.to_numpy(dtype=np.float32)
+        indicator = _OBSERVED_COLUMN if exported.protocol == FNSPID_PROTOCOL else _COVERED_COLUMN
+        result[indicator] = aligned.source_available.to_numpy(dtype=np.float32)
         return result
 
-    if candidate in ("gru_activity", "gru_features"):
+    if candidate in ("gru_activity", *_FEATURE_CANDIDATES):
         target = append(target, news)
-        history = append(history, scaler.transform(_align_news(history, exported, config)))
+        history = append(history, model_features(scaler.transform(_align_news(history, exported, config))))
     source = news.drop(columns="export_row_present").rename(
         columns={"date": config.date_col, "ticker": config.group_col})
     # The multimodal contract verifies covered empty windows using RAW count.
@@ -165,6 +207,7 @@ def _dataset(target, history, prepared, exported, scaler, config, candidate):
         target, tickers=prepared.tickers, context_len=config.context_len,
         temporal_columns=columns, node_columns=prepared.columns,
         history_frame=history, sentiment_frame=source, sentiment_columns=_DATASET_SENTIMENT_COLUMNS,
+        sentiment_protocol=exported.protocol,
         date_col=config.date_col, ticker_col=config.group_col,
     )
     for batch in dataset.iter_batches(128):
@@ -261,7 +304,8 @@ def _fit_sentiment(model, train_ds, val_ds, train_panel, val_panel, loss, config
 
 def _coverage(frame, exported, config):
     aligned = _align_news(frame, exported, config)
-    covered = aligned.source_available.to_numpy(dtype=bool)
+    covered = aligned.coverage_status.eq("covered").to_numpy(dtype=bool)
+    observed = aligned.source_available.to_numpy(dtype=bool)
     count = aligned.news_count.to_numpy(dtype=float)
     return {"rows": len(aligned), "covered_rows": int(covered.sum()),
             "covered_fraction": float(covered.mean()),
@@ -270,8 +314,13 @@ def _coverage(frame, exported, config):
             "incomplete_rows": int(aligned.coverage_status.eq("incomplete").sum()),
             "unknown_rows": int(aligned.coverage_status.eq("unknown").sum()),
             "missing_export_rows": int((~aligned.export_row_present).sum()),
+            "signal_available_rows": int(observed.sum()),
+            "observed_rows": int((observed & (count > 0)).sum()),
+            "unobserved_rows": int((~observed).sum()),
+            "news_protocol": exported.protocol,
             "by_ticker": [{"ticker": name, "rows": int(len(part)),
-                           "covered_rows": int(part.source_available.sum())}
+                           "covered_rows": int(part.coverage_status.eq("covered").sum()),
+                           "signal_available_rows": int(part.source_available.sum())}
                           for name, part in aligned.groupby("ticker", sort=True)]}
 
 
@@ -314,6 +363,11 @@ def _export_predictions(model, dataset, frame, path, *, candidate, fold, seed, p
                 "backtest_key": days.map(lambda day: day.isoformat()) + "|" + tickers,
                 "row_position": rows, "available": usable, "news_available": source.source_available.to_numpy(),
                 "coverage_status": source.coverage_status.to_numpy(),
+                "news_protocol": exported.protocol,
+                "observation_status": source.get("observation_status", pd.Series(
+                    np.where(source.news_count.gt(0), "observed", "unobserved"), index=source.index
+                )).to_numpy(),
+                "availability_kind": source.get("availability_kind", pd.Series("audited_point_in_time", index=source.index)).to_numpy(),
                 "export_row_present": source.export_row_present.to_numpy(),
                 "news_count": source.news_count.to_numpy(dtype=float),
                 "available_at": pd.to_datetime(source.available_at, utc=True).reset_index(drop=True),
@@ -344,6 +398,18 @@ def _export_predictions(model, dataset, frame, path, *, candidate, fold, seed, p
 def _context(frame, config, loss, parameters, seeds, exported, ablation, **options):
     if not isinstance(exported, SentimentExport) or tuple(exported.columns) != SENTIMENT_COLUMNS:
         raise TypeError("sentiment_export must be a verified SentimentExport with the 23 standard features.")
+    exploratory = ablation.news_protocol == FNSPID_PROTOCOL
+    if exported.protocol != ablation.news_protocol:
+        raise ValueError("News ablation protocol and verified export disagree; choose the explicit matching protocol.")
+    if exploratory:
+        if (exported.manifest.get("schema_version") != FNSPID_SCHEMA
+                or exported.manifest.get("protocol") != FNSPID_PROTOCOL
+                or exported.manifest.get("point_in_time") is not False
+                or exported.manifest.get("historical_coverage_claim") is not False
+                or exported.manifest.get("availability_kind") != AVAILABILITY_ASSUMPTION):
+            raise ValueError("FNSPID exploratory manifest must declare its assumptions and absent historical coverage.")
+    elif exported.manifest.get("schema_version") != "1.0" or exported.manifest.get("point_in_time") is False:
+        raise ValueError("Strict PIT ablation requires an audited point-in-time export.")
     if loss.objective not in ("sharpe", "combined"):
         raise ValueError("News comparison supports exactly Sharpe or combined financial loss.")
     if config.feature_set == "expanded" and "sentiment" in config.expanded_feature_groups:
@@ -367,7 +433,7 @@ def _context(frame, config, loss, parameters, seeds, exported, ablation, **optio
     source = exported.frame
     if source.duplicated(["date", "ticker"]).any():
         raise ValueError("News export has duplicate decision keys.")
-    if not np.array_equal(source.source_available.to_numpy(dtype=bool), source.coverage_status.eq("covered").to_numpy()):
+    if not exploratory and not np.array_equal(source.source_available.to_numpy(dtype=bool), source.coverage_status.eq("covered").to_numpy()):
         raise ValueError("News export source availability disagrees with coverage.")
     dates = pd.to_datetime(source.date, utc=True, errors="raise")
     if not dates.eq(dates.dt.normalize()).all():
@@ -376,12 +442,17 @@ def _context(frame, config, loss, parameters, seeds, exported, ablation, **optio
     # enforce the causal batch contract on programmatic inputs, during dry-run
     # and before creating any run directory or training a model.
     build_multimodal_dataset(source[["date", "ticker"]], tickers=tuple(sorted(set(source.ticker))),
-        context_len=1, sentiment_frame=source, sentiment_columns=SENTIMENT_COLUMNS)
+        context_len=1, sentiment_frame=source, sentiment_columns=SENTIMENT_COLUMNS,
+        sentiment_protocol=ablation.news_protocol)
     for name in ("graph_context_path", "graph_context_sha256", "sector_context_columns",
                  "market_context_path", "market_context_sha256", "market_columns", "market_audit"):
         metadata.pop(name, None)
     metadata.update(
         protocol="matched_purged_news_sentiment_ablation", ablation=asdict(ablation),
+        news_protocol=ablation.news_protocol, point_in_time=not exploratory,
+        historical_availability_verified=not exploratory,
+        availability_kind=AVAILABILITY_ASSUMPTION if exploratory else "audited_point_in_time",
+        warnings=EXPLORATORY_LIMITATIONS if exploratory else [],
         news_export_sha256=hash_dataframe(source), news_manifest=exported.manifest,
         news_manifest_sha256=stable_digest(exported.manifest), news_columns=list(SENTIMENT_COLUMNS),
         shared_price_warmup=3,
@@ -395,13 +466,85 @@ def _context(frame, config, loss, parameters, seeds, exported, ablation, **optio
                      "Current-universe survivorship and upstream coverage biases remain.",
                      "Fold/seed averages are not independent market paths or a concatenated backtest."],
     )
+    if exploratory:
+        metadata["limitations"] = [*EXPLORATORY_LIMITATIONS,
+            "No macro news forced into company/ticker inputs.",
+            "Mean-logit fusion is not a calibration or confidence claim.",
+            "Fold/seed averages are not independent market paths or a concatenated backtest."]
     return work, config, folds, _nullable_metadata(metadata)
 
 
-def _task_spec(metadata, prepared, scaler, fold, candidate, seed):
+def _control_mode(candidate):
+    return {"gru_features_shuffled": "shuffled", "gru_features_neutralized": "neutralized"}.get(candidate, "original")
+
+
+def _load_control_articles(exported, ablation, *, _study_cache=None):
+    if "gru_features_shuffled" not in ablation.candidates:
+        return None, None
+    if not ablation.scored_articles_path:
+        raise ValueError("Article shuffling requires --news-scored-articles from the verified preparation.")
+    path = Path(ablation.scored_articles_path).expanduser().resolve(strict=True)
+    record = exported.manifest.get("inputs", {}).get("scored", {})
+    digest = _sha256(path)
+    if digest != record.get("sha256"):
+        raise ValueError("Scored article checksum differs from the frozen daily news export.")
+    key = stable_digest({"sha256": digest, "checkpoint": exported.manifest["checkpoint"],
+                         "protocol": exported.protocol})
+    cached = _study_cache.setdefault("control_articles", {}) if _study_cache is not None else None
+    if cached is not None and key in cached:
+        scored = cached[key]
+    else:
+        scored = _scored_articles(path, exported.manifest["checkpoint"])
+        if cached is not None:
+            cached[key] = scored
+    if len(scored) != record.get("rows"):
+        raise ValueError("Scored article count differs from the frozen daily news export.")
+    return scored, {"path": str(path), "sha256": digest, "rows": len(scored)}
+
+
+def _study_prepared_key(metadata, fold, ablation):
+    # Candidate lists and corpus seeds cannot affect price preprocessing. Every
+    # effective data/config/calendar/CV/runtime dependency still participates.
+    # training_signature excludes observed_torch_state, which training changes
+    # itself, while retaining source bytes and numerical runtime settings.
+    return training_signature({
+        "cache_schema_version": 1, "dataset_sha256": metadata["dataset_sha256"],
+        "config": metadata["config"], "loss_config": metadata["loss_config"],
+        "gru_parameters": metadata["gru_parameters"], "calendar": metadata["calendar"],
+        "cv_spec": metadata["cv_spec"], "provenance": metadata["provenance"],
+        "fold": {"fold": fold["fold"], "split": asdict(fold["split"]), "end": fold["end"]},
+        "shared_price_warmup": ablation.graph_lookback,
+    })
+
+
+def _study_news_key(metadata, prepared_key, mode, ablation, controlled):
+    return stable_digest({
+        "cache_schema_version": 1, "prepared_key": prepared_key, "mode": mode,
+        "controlled": controlled, "shuffle_seed": ablation.shuffle_seed if mode == "shuffled" else None,
+        "news_protocol": metadata["news_protocol"],
+        "news_export_sha256": metadata["news_export_sha256"],
+        "news_manifest_sha256": metadata["news_manifest_sha256"],
+        "scored_sha256": metadata["news_manifest"].get("inputs", {}).get("scored", {}).get("sha256"),
+        "checkpoint": metadata["news_manifest"].get("checkpoint"),
+        "include_outer": False,
+    })
+
+
+def _control_info(exported, candidate):
+    return {**exported.manifest.get("polarity_control", {}), "mode": _control_mode(candidate),
+            "export_sha256": hash_dataframe(exported.frame),
+            "neutralized_statistics": list(POLARITY_STATISTICS) if candidate == "gru_features_neutralized" else [],
+            "neutralization_applied": candidate == "gru_features_neutralized",
+            "neutralization_policy": ("zero standardized numeric channels; preserve dimensions, presence, activity, recency and confidence"
+                                      if candidate == "gru_features_neutralized" else None)}
+
+
+def _task_spec(metadata, prepared, scaler, fold, candidate, seed, control=None):
     snapshot = preprocessing_state(prepared)
     snapshot["sentiment_scaler"] = scaler.state_dict()
-    snapshot["effective_temporal_columns"] = list(_temporal_columns(prepared, candidate))
+    snapshot["effective_temporal_columns"] = list(_temporal_columns(prepared, candidate, metadata["news_protocol"]))
+    if control is not None:
+        snapshot["news_control"] = control
     return _nullable_metadata({
         "schema_version": 1, "candidate": candidate, "fold": fold["fold"], "seed": seed,
         "config": metadata["config"], "loss_config": metadata["loss_config"],
@@ -411,7 +554,7 @@ def _task_spec(metadata, prepared, scaler, fold, candidate, seed):
         "news_manifest_sha256": metadata["news_manifest_sha256"], "news_columns": metadata["news_columns"],
         "fold_boundaries": {"split": asdict(fold["split"]), "end": fold["end"]},
         "cv_spec": metadata["cv_spec"], "preprocessing": snapshot,
-        "model": {"candidate": candidate, "temporal_width": len(_temporal_columns(prepared, candidate)),
+        "model": {"candidate": candidate, "temporal_width": len(_temporal_columns(prepared, candidate, metadata["news_protocol"])),
                   "sentiment_width": len(SENTIMENT_COLUMNS),
                   "sentiment_hidden_size": metadata["ablation"]["sentiment_hidden_size"],
                   "fusion": "masked_mean_logits" if candidate == "gru_sentiment_mean" else None},
@@ -425,25 +568,87 @@ def _task_spec(metadata, prepared, scaler, fold, candidate, seed):
 def plan_run_news_sentiment_ablation(frame, config, loss, gru_parameters, seeds, *, sentiment_export,
                                      ablation=NewsSentimentAblationConfig(), n_splits=3,
                                      initial_train_fraction=.5, inner_val_fraction=.2,
-                                     gap_bars=5, embargo_bars=0, dataset_path=None):
-    """Read-only train preprocessing and exact task signatures; no models fit."""
+                                     gap_bars=5, embargo_bars=0, dataset_path=None, _runtime_cache=None,
+                                     _study_cache=None):
+    """Read-only train preprocessing and exact task signatures; no models fit.
+
+    A private study cache may share verified article reads and TRAIN/INNER price
+    preparations, exports and scalers between matched comparison calls. Context,
+    hashes and signatures are revalidated each call; OUTER is never cached here.
+    """
+    if _study_cache is not None and not isinstance(_study_cache, dict):
+        raise TypeError("_study_cache must be a local dictionary or None.")
     work, config, folds, metadata = _context(
         frame, config, loss, gru_parameters, seeds, sentiment_export, ablation,
         n_splits=n_splits, initial_train_fraction=initial_train_fraction,
         inner_val_fraction=inner_val_fraction, gap_bars=gap_bars,
         embargo_bars=embargo_bars, dataset_path=dataset_path,
     )
+    controlled = any(candidate in POLARITY_CANDIDATES[3:] for candidate in ablation.candidates)
+    scored, article_record = _load_control_articles(sentiment_export, ablation, _study_cache=_study_cache)
+    if controlled:
+        metadata["polarity_controls"] = {
+            "schema_version": 1, "shuffle_seed": ablation.shuffle_seed,
+            "scored_articles": article_record,
+            "shuffle": "Joint article probability/score/confidence permutation within ticker and calendar partition, before daily aggregation.",
+            "neutralized_statistics": list(POLARITY_STATISTICS),
+            "neutralization": "Zero standardized numeric channels, not fake neutral articles; identical model width and presence masks.",
+            "preserved": ["calendar", "tickers", "prices", "labels", "news_count", "recency", "availability", "presence_masks"],
+            "limitations": ["Permutation can use a later score within the same partition: a retrospective null control, not a deployable signal.",
+                            "Shuffling also perturbs confidence alignment; neutralization retains confidence information.",
+                            "One frozen permutation seed across model seeds; these are not independent corpus permutations."],
+        }
     tasks = []
+    prepared_folds = {}
+    price_cache = _study_cache.setdefault("price_prepared", {}) if _study_cache is not None else None
+    export_cache = _study_cache.setdefault("prefix_exports", {}) if _study_cache is not None else None
+    scaler_cache = _study_cache.setdefault("prefix_scalers", {}) if _study_cache is not None else None
+    required = any(candidate != "gru" for candidate in ablation.candidates)
     for fold in folds:
-        fold_frame = work.loc[_dates(work, config.date_col) <= pd.Timestamp(fold["end"])].copy()
-        prepared = _prepare(fold_frame, replace(config, purged_split=fold["split"]), ablation)
-        scaler = _SentimentScaler.fit(prepared, sentiment_export, config,
-                                      required=any(candidate != "gru" for candidate in ablation.candidates))
+        prepared_key = _study_prepared_key(metadata, fold, ablation) if price_cache is not None else None
+        if price_cache is not None and prepared_key in price_cache:
+            prepared = price_cache[prepared_key]
+        else:
+            fold_frame = work.loc[_dates(work, config.date_col) <= pd.Timestamp(fold["end"])].copy()
+            prepared = _prepare(fold_frame, replace(config, purged_split=fold["split"]), ablation)
+            if price_cache is not None:
+                price_cache[prepared_key] = prepared
+        modes = dict.fromkeys(_control_mode(candidate) for candidate in ablation.candidates) if controlled else {"original": None}
+        exports, scalers = {}, {}
+        for mode in modes:
+            news_key = _study_news_key(metadata, prepared_key, mode, ablation, controlled) if export_cache is not None else None
+            if controlled and export_cache is not None and news_key in export_cache:
+                exported = export_cache[news_key]
+            elif controlled:
+                from trading_system.data.fnspid_polarity import prepare_fold_news_control
+                exported = prepare_fold_news_control(sentiment_export, scored, fold, mode=mode,
+                            shuffle_seed=ablation.shuffle_seed, include_outer=False)
+                if export_cache is not None:
+                    export_cache[news_key] = exported
+            else:
+                exported = sentiment_export
+                # An uncontrolled input includes the full supplied calendar.
+                # It needs no construction and must not enter a shared prefix
+                # cache containing OUTER rows before a checkpoint is frozen.
+            scaler_key = (news_key, required)
+            if scaler_cache is not None and scaler_key in scaler_cache:
+                scaler = scaler_cache[scaler_key]
+            else:
+                scaler = _SentimentScaler.fit(prepared, exported, config, required=required)
+                if scaler_cache is not None:
+                    scaler_cache[scaler_key] = scaler
+            exports[mode], scalers[mode] = exported, scaler
+        prepared_folds[fold["fold"]] = {"prepared": prepared, "exports": exports, "scalers": scalers}
         for candidate in ablation.candidates:
+            mode = _control_mode(candidate)
+            control = _control_info(exports[mode], candidate) if controlled else None
             for seed in seeds:
-                spec = _task_spec(metadata, prepared, scaler, fold, candidate, seed)
+                spec = _task_spec(metadata, prepared, scalers[mode], fold, candidate, seed, control)
                 tasks.append({"candidate": candidate, "seed": seed, "fold": fold["fold"],
                               "signature": training_signature(spec), "spec": spec})
+    if _runtime_cache is not None:
+        _runtime_cache.update(work=work, config=config, folds=folds, prepared_folds=prepared_folds,
+                              scored=scored, controlled=controlled)
     return {"metadata": metadata, "task_specs": tasks}
 
 
@@ -513,7 +718,7 @@ def run_news_sentiment_ablation(frame, config, loss, gru_parameters, seeds, dest
                                 ablation=NewsSentimentAblationConfig(), n_splits=3,
                                 initial_train_fraction=.5, inner_val_fraction=.2,
                                 gap_bars=5, embargo_bars=0, dataset_path=None,
-                                resume=False, dry_run=False, progress_callback=None):
+                                resume=False, dry_run=False, progress_callback=None, _study_cache=None):
     """Train matched controls; freeze each inner checkpoint before opening outer."""
     import torch
 
@@ -523,16 +728,17 @@ def run_news_sentiment_ablation(frame, config, loss, gru_parameters, seeds, dest
     options = dict(ablation=ablation, n_splits=n_splits, initial_train_fraction=initial_train_fraction,
                    inner_val_fraction=inner_val_fraction, gap_bars=gap_bars,
                    embargo_bars=embargo_bars, dataset_path=dataset_path)
+    runtime = {}
     plan = plan_run_news_sentiment_ablation(frame, config, loss, gru_parameters, seeds,
-                                          sentiment_export=sentiment_export, **options)
+                                          sentiment_export=sentiment_export, _runtime_cache=runtime,
+                                          _study_cache=_study_cache, **options)
     rows = _check_resume(target, plan) if resume else []
     if dry_run:
         return {**plan, "dry_run": True, "completed_tasks": len(rows),
                 "destination": str(target), "final_holdout_opened": False}
-    work, config, folds, metadata = _context(
-        frame, config, loss, gru_parameters, seeds, sentiment_export, ablation,
-        **{key: value for key, value in options.items() if key != "ablation"},
-    )
+    # Use the exact TRAIN preparation that produced the validated signatures;
+    # do not recompute fitted selectors/scalers after planning.
+    work, config, folds, metadata = runtime["work"], runtime["config"], runtime["folds"], plan["metadata"]
     if not resume:
         target.mkdir(parents=True)
         atomic_write_json(target / "metadata.json", metadata)
@@ -540,11 +746,13 @@ def run_news_sentiment_ablation(frame, config, loss, gru_parameters, seeds, dest
     specs = {(item["candidate"], item["seed"], item["fold"]): item for item in plan["task_specs"]}
     training_template = GRUConfig(**gru_parameters)
     for fold in folds:
+        if all((candidate, seed, fold["fold"]) in completed for candidate in ablation.candidates for seed in seeds):
+            continue
         fold_frame = work.loc[_dates(work, config.date_col) <= pd.Timestamp(fold["end"])].copy()
         fold_config = replace(config, purged_split=fold["split"])
-        prepared = _prepare(fold_frame, fold_config, ablation)
-        scaler = _SentimentScaler.fit(prepared, sentiment_export, config,
-                                      required=any(candidate != "gru" for candidate in ablation.candidates))
+        cached = runtime["prepared_folds"][fold["fold"]]
+        prepared = cached["prepared"]
+        outer_prepared, outer_exports = None, {}
         train_panel = ReturnPanel(prepared.train, price_col=config.price_col, date_col=config.date_col,
                                   group_col=config.group_col, execution_delay=config.execution_delay)
         val_panel = ReturnPanel(prepared.validation, price_col=config.price_col, date_col=config.date_col,
@@ -552,10 +760,13 @@ def run_news_sentiment_ablation(frame, config, loss, gru_parameters, seeds, dest
         for candidate in ablation.candidates:
             if all((candidate, seed, fold["fold"]) in completed for seed in seeds):
                 continue
-            train_ds = _dataset(prepared.train, prepared.history_train, prepared, sentiment_export,
+            mode = _control_mode(candidate)
+            exported, scaler = cached["exports"][mode], cached["scalers"][mode]
+            train_ds = _dataset(prepared.train, prepared.history_train, prepared, exported,
                                 scaler, config, candidate)
-            val_ds = _dataset(prepared.validation, prepared.history_validation, prepared, sentiment_export,
+            val_ds = _dataset(prepared.validation, prepared.history_validation, prepared, exported,
                               scaler, config, candidate)
+            outer_ds = None
             for seed in seeds:
                 key = candidate, seed, fold["fold"]
                 if key in completed:
@@ -582,24 +793,42 @@ def run_news_sentiment_ablation(frame, config, loss, gru_parameters, seeds, dest
                 with torch.no_grad():
                     inner_positions, _, _ = _export_predictions(model, val_ds, prepared.validation, inner_path,
                         candidate=candidate, fold=fold["fold"], seed=seed, partition="inner",
-                        exported=sentiment_export, config=config, ablation=ablation, torch=torch)
-                raw_train, raw_val, raw_outer, _, outer_columns = _prepare_splits(
-                    fold_frame, fold_config, include_test=True, fill_values=prepared.fills,
-                    fracdiff_transformer=prepared.fracdiff, feature_selector=prepared.selector,
-                    overfitting_selector=prepared.overfitting_selector, overfitting_supervised=False)
-                if outer_columns != prepared.columns:
-                    raise ValueError("Outer price features differ from the frozen train feature pool.")
-                outer = _complete(raw_outer, config, prepared.tickers)
-                outer_scaled = _scale(outer, prepared.columns, prepared.scaler)
-                history = _scale(pd.concat((raw_train, raw_val), ignore_index=True), prepared.columns, prepared.scaler)
-                outer_ds = _dataset(outer_scaled, history, prepared, sentiment_export, scaler, config, candidate)
-                outer_panel = ReturnPanel(outer, price_col=config.price_col, date_col=config.date_col,
-                                          group_col=config.group_col, execution_delay=config.execution_delay)
+                        exported=exported, config=config, ablation=ablation, torch=torch)
+                # Only after this checkpoint is frozen may evaluation features
+                # be opened. Reuse deterministic outer data across model seeds.
+                if outer_prepared is None:
+                    raw_train, raw_val, raw_outer, _, outer_columns = _prepare_splits(
+                        fold_frame, fold_config, include_test=True, fill_values=prepared.fills,
+                        fracdiff_transformer=prepared.fracdiff, feature_selector=prepared.selector,
+                        overfitting_selector=prepared.overfitting_selector, overfitting_supervised=False)
+                    if outer_columns != prepared.columns:
+                        raise ValueError("Outer price features differ from the frozen train feature pool.")
+                    outer = _complete(raw_outer, config, prepared.tickers)
+                    outer_scaled = _scale(outer, prepared.columns, prepared.scaler)
+                    history = _scale(pd.concat((raw_train, raw_val), ignore_index=True), prepared.columns, prepared.scaler)
+                    outer_panel = ReturnPanel(outer, price_col=config.price_col, date_col=config.date_col,
+                                             group_col=config.group_col, execution_delay=config.execution_delay)
+                    outer_prepared = outer, outer_scaled, history, outer_panel
+                outer, outer_scaled, history, outer_panel = outer_prepared
+                if mode not in outer_exports:
+                    if runtime["controlled"]:
+                        from trading_system.data.fnspid_polarity import prepare_fold_news_control
+                        evaluated = prepare_fold_news_control(sentiment_export, runtime["scored"], fold,
+                            mode=mode, shuffle_seed=ablation.shuffle_seed, include_outer=True)
+                        prefix = evaluated.frame.loc[_dates(evaluated.frame, "date") < pd.Timestamp(fold["split"].test_start)]
+                        if not prefix.reset_index(drop=True).equals(exported.frame.reset_index(drop=True)):
+                            raise ValueError("Outer control construction changed frozen TRAIN/INNER news.")
+                        outer_exports[mode] = evaluated
+                    else:
+                        outer_exports[mode] = sentiment_export
+                outer_export = outer_exports[mode]
+                if outer_ds is None:
+                    outer_ds = _dataset(outer_scaled, history, prepared, outer_export, scaler, config, candidate)
                 outer_path = target / f"{stem}-outer-predictions.parquet"
                 with torch.no_grad():
                     outer_positions, probs, available = _export_predictions(model, outer_ds, outer, outer_path,
                         candidate=candidate, fold=fold["fold"], seed=seed, partition="outer",
-                        exported=sentiment_export, config=config, ablation=ablation, torch=torch)
+                        exported=outer_export, config=config, ablation=ablation, torch=torch)
                 metrics = outer_panel.metrics(outer_positions, loss, config.initial_capital)
                 row = {"candidate": candidate, "fold": fold["fold"], "seed": seed, "status": "ok",
                     "task_signature": signature, "model_artifact": model_path.name,
@@ -610,12 +839,14 @@ def run_news_sentiment_ablation(frame, config, loss, gru_parameters, seeds, dest
                     "coverage": {name: _coverage(part, sentiment_export, config) for name, part in
                                  (("train", prepared.train), ("inner", prepared.validation), ("outer", outer))},
                     "signal_available_rows": int(available.sum()), "feature_columns": prepared.columns,
-                    "effective_temporal_columns": _temporal_columns(prepared, candidate), "sentiment_columns": SENTIMENT_COLUMNS,
+                    "effective_temporal_columns": _temporal_columns(prepared, candidate, ablation.news_protocol), "sentiment_columns": SENTIMENT_COLUMNS,
                     "sentiment_scaler": scaler.state_dict(), "purging": prepared.purging,
                     "train_dates": len(train_ds), "inner_dates": len(val_ds), "outer_dates": len(outer_ds),
                     "prediction_artifacts": {"inner": inner_path.name, "outer": outer_path.name}, "daily_path_artifacts": {},
                     "preprocessing_signature": stable_digest(spec["preprocessing"]),
                     "eligible_sessions": {**spec["eligible_sessions"], "outer": [day.isoformat() for day in _dates(outer, config.date_col).unique().sort_values()]}}
+                if runtime["controlled"]:
+                    row["news_control"] = _control_info(outer_export, candidate)
                 for partition, panel, predicted in (("inner", val_panel, inner_positions), ("outer", outer_panel, outer_positions)):
                     daily_path = target / f"{stem}-{partition}-daily.parquet"
                     daily = _daily_paths(panel, predicted, loss)
@@ -645,11 +876,18 @@ def run_news_sentiment_ablation(frame, config, loss, gru_parameters, seeds, dest
                "score_delta": row["score"] - reference[row["fold"], row["seed"]]["score"],
                "net_return_delta": row["outer_metrics"]["net_return"] - reference[row["fold"], row["seed"]]["outer_metrics"]["net_return"]}
               for row in rows if row["candidate"] != "gru" and (row["fold"], row["seed"]) in reference]
+    features = {(row["fold"], row["seed"]): row for row in rows if row["candidate"] == "gru_features"}
+    paired_controls = [{"candidate": row["candidate"], "reference": "gru_features", "fold": row["fold"], "seed": row["seed"],
+        "score_delta": row["score"] - features[row["fold"], row["seed"]]["score"],
+        "net_return_delta": row["outer_metrics"]["net_return"] - features[row["fold"], row["seed"]]["outer_metrics"]["net_return"]}
+        for row in rows if row["candidate"] in POLARITY_CANDIDATES[3:] and (row["fold"], row["seed"]) in features]
     report = _nullable_metadata({"metadata": metadata, "folds": rows, "summary": summary,
         "paired_vs_gru": paired, "selected": max(summary, key=lambda item: item["mean"])["candidate"],
         "final_test": [], "exposure_controlled": _exposure_report(rows, target, config, loss, ablation)})
+    if runtime["controlled"]:
+        report["paired_vs_original_features"] = paired_controls
     atomic_write_json(target / "report.json", report)
     return report
 
 
-__all__ = ["CANDIDATES", "NewsSentimentAblationConfig", "plan_run_news_sentiment_ablation", "run_news_sentiment_ablation"]
+__all__ = ["CANDIDATES", "ALL_CANDIDATES", "POLARITY_CANDIDATES", "POLARITY_STATISTICS", "NewsSentimentAblationConfig", "plan_run_news_sentiment_ablation", "run_news_sentiment_ablation"]

@@ -292,6 +292,7 @@ def build_multimodal_dataset(
     market_frame: pd.DataFrame | None = None,
     market_context_len: int | None = None,
     sentiment_frame: pd.DataFrame | None = None,
+    sentiment_protocol: str = "pit",
     graphs: Sequence[GraphSnapshot] | None = None,
     date_col: str = "date",
     ticker_col: str = "ticker",
@@ -302,6 +303,8 @@ def build_multimodal_dataset(
 
     if isinstance(context_len, bool) or not isinstance(context_len, int) or context_len <= 0:
         raise ValueError("context_len must be a positive integer.")
+    if sentiment_protocol not in ("pit", "fnspid-exploratory"):
+        raise ValueError("sentiment_protocol must be pit or fnspid-exploratory.")
     names = _columns(tickers, "tickers")
     if not names:
         raise ValueError("tickers must not be empty.")
@@ -488,6 +491,30 @@ def build_multimodal_dataset(
             source["available_at"], utc=True, errors="coerce", format="mixed"
         )
         available = source["source_available"].to_numpy(dtype=bool)
+        exploratory = sentiment_protocol == "fnspid-exploratory"
+        if exploratory:
+            required = {"coverage_status", "observation_status", "availability_kind", "news_count"}
+            if not required.issubset(source):
+                raise ValueError("Exploratory sentiment requires explicit observation and assumption provenance.")
+            if not source["coverage_status"].eq("unknown").all():
+                raise ValueError("FNSPID exploratory sentiment cannot claim historical coverage.")
+            if not source["availability_kind"].eq("publication_plus_delay_assumption").all():
+                raise ValueError("FNSPID exploratory sentiment must identify its availability assumption.")
+            observed = source["observation_status"]
+            counts = pd.to_numeric(source["news_count"], errors="coerce")
+            if (not observed.isin(("observed", "unobserved")).all()
+                    or not np.array_equal(available, observed.eq("observed").to_numpy())
+                    or counts.isna().any() or not np.isfinite(counts.to_numpy(dtype=float)).all()
+                    or (counts.lt(0) | counts.ne(np.floor(counts))).any()
+                    or not np.array_equal(available, counts.gt(0).to_numpy())):
+                raise ValueError("Exploratory observation status, article count and source availability disagree.")
+            if ((available & published.isna().to_numpy())
+                    | (~available & published.notna().to_numpy())).any():
+                raise ValueError("Exploratory sentiment timestamps must identify observed articles only.")
+        elif "availability_kind" in source and source["availability_kind"].eq(
+            "publication_plus_delay_assumption"
+        ).any():
+            raise ValueError("Publication-delay assumptions require explicit fnspid-exploratory protocol.")
         missing_timestamp = available & published.isna().to_numpy()
         if missing_timestamp.any():
             # A fully covered window with no articles is known information,
@@ -504,7 +531,7 @@ def build_multimodal_dataset(
             )
             if (missing_timestamp & ~covered_empty).any():
                 raise ValueError("Available sentiment requires available_at or covered zero-news evidence.")
-        if "coverage_status" in source:
+        if "coverage_status" in source and not exploratory:
             statuses = source["coverage_status"]
             if not statuses.isin(("covered", "incomplete", "unknown")).all():
                 raise ValueError("Invalid sentiment coverage_status.")

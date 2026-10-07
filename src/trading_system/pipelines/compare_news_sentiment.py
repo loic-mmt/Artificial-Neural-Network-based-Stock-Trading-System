@@ -7,8 +7,9 @@ from pathlib import Path
 import sys
 
 from trading_system.data.news_sentiment import load_news_sentiment_export
+from trading_system.data.fnspid_export import FNSPID_PROTOCOL, load_fnspid_sentiment_export
 from trading_system.experiments.news_sentiment_ablation import (
-    CANDIDATES, NewsSentimentAblationConfig, run_news_sentiment_ablation,
+    ALL_CANDIDATES, CANDIDATES, NewsSentimentAblationConfig, run_news_sentiment_ablation,
 )
 from trading_system.paths import comparisons_dir
 from trading_system.pipelines.compare_gnn_graphs import (
@@ -23,8 +24,14 @@ def build_parser():
     parser.set_defaults(graph_candidates="gru", graph_lookback=3)
     parser.add_argument("--news-sentiment-export", type=Path, required=True,
                         help="Offline daily Parquet and same-stem .manifest.json; no collection or text scoring.")
+    parser.add_argument("--news-protocol", choices=("pit", FNSPID_PROTOCOL), default="pit",
+                        help="pit requires historical coverage; fnspid-exploratory explicitly accepts publication-delay assumptions.")
     parser.add_argument("--sentiment-candidates", default=",".join(CANDIDATES),
-                        help="Comma-separated: " + ", ".join(CANDIDATES))
+                        help="Comma-separated: " + ", ".join(ALL_CANDIDATES))
+    parser.add_argument("--news-scored-articles", type=Path,
+                        help="Already-scored FNSPID articles, verified against the daily manifest; no FinBERT inference.")
+    parser.add_argument("--news-shuffle-seed", type=int, default=314159,
+                        help="Frozen corpus-permutation seed, independent of neural training seeds.")
     parser.add_argument("--sentiment-hidden-size", type=int, default=16)
     parser.add_argument("--dry-run", action="store_true",
                         help="Verify export, eligible TRAIN coverage, task signatures and optional resume without writing files.")
@@ -44,10 +51,13 @@ def prepare_news_sentiment_run(argv=None):
     candidates = tuple(item.strip() for item in args.sentiment_candidates.split(",") if item.strip())
     ablation = NewsSentimentAblationConfig(
         candidates=candidates, sentiment_hidden_size=args.sentiment_hidden_size,
-        date_batch_size=args.date_batch_size)
+        date_batch_size=args.date_batch_size, news_protocol=args.news_protocol,
+        shuffle_seed=args.news_shuffle_seed,
+        scored_articles_path=str(args.news_scored_articles.resolve()) if args.news_scored_articles else None)
     # Only pass the original graph parser's options. Its preparation function
     # supplies the shared label, train-only selector and calendar protocol.
-    own_flags = {"--news-sentiment-export", "--sentiment-candidates", "--sentiment-hidden-size"}
+    own_flags = {"--news-sentiment-export", "--sentiment-candidates", "--sentiment-hidden-size", "--news-protocol",
+                 "--news-scored-articles", "--news-shuffle-seed"}
     forwarded, index = [], 0
     while index < len(tokens):
         token = tokens[index]
@@ -64,7 +74,8 @@ def prepare_news_sentiment_run(argv=None):
     if not any(token.split("=", 1)[0] == "--graph-lookback" for token in forwarded):
         forwarded.extend(("--graph-lookback", "3"))
     shared = prepare_graph_run(forwarded)
-    exported = load_news_sentiment_export(args.news_sentiment_export)
+    loader = load_fnspid_sentiment_export if args.news_protocol == FNSPID_PROTOCOL else load_news_sentiment_export
+    exported = loader(args.news_sentiment_export)
     target = args.output_dir or comparisons_dir() / (
         "news-sentiment-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
     return {key: shared[key] for key in (
@@ -78,10 +89,10 @@ def main(argv=None):
     result = run_news_sentiment_ablation(**prepare_news_sentiment_run(argv),
                                           resume=args.resume, dry_run=args.dry_run)
     if args.dry_run:
-        covered = [task["spec"]["preprocessing"]["sentiment_scaler"]["covered_fit_rows"]
+        covered = [task["spec"]["preprocessing"]["sentiment_scaler"]["available_fit_rows"]
                    for task in result["task_specs"]]
         print(f"news_dry_run tasks={len(result['task_specs'])} completed={result['completed_tasks']} "
-              f"minimum_covered_train_rows={min(covered)} final_holdout_opened=False")
+              f"news_protocol={args.news_protocol} minimum_available_train_rows={min(covered)} final_holdout_opened=False")
     return result
 
 

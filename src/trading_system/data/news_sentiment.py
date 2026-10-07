@@ -51,6 +51,7 @@ class SentimentExport:
     frame: pd.DataFrame
     columns: tuple[str, ...]
     manifest: dict[str, Any]
+    protocol: str = "pit"
 
 
 def build_news_decision_points(
