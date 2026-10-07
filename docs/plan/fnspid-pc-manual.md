@@ -8,13 +8,13 @@ Il faut télécharger les news sur le PC, vérifier leur couverture réelle, sco
 
 | Étape | État |
 | --- | --- |
-| Télécharger FNSPID et vérifier les fichiers | Possible maintenant. |
-| Auditer les colonnes, dates et tickers | Possible maintenant. |
-| Télécharger le checkpoint FinBERT immuable | Possible maintenant. |
-| Importer FNSPID et scorer son historique par lots reprenables | Adaptateur spécifique à implémenter. Le scorer du pilote RSS n'est pas un importateur FNSPID. |
+| Télécharger FNSPID et vérifier les fichiers | Les deux CSV sont téléchargés sur le PC, à révision figée et checksums vérifiés. |
+| Auditer les colonnes, dates et tickers | Deux audits locaux existent pour les cinq tickers ; pas une preuve de couverture historique. |
+| Télécharger le checkpoint FinBERT immuable | Checkpoint local téléchargé et checksum vérifié sur le PC. |
+| Importer FNSPID et scorer son historique par lots reprenables | Adaptateur dédié disponible via `scripts/run_fnspid_news_benchmark.py`. Le scorer RSS reste distinct. |
 | Exporter les features depuis un corpus scoré | Disponible pour des données respectant le contrat de disponibilité. |
 | Benchmark PIT strict | Runner disponible ; exige une couverture et une disponibilité historiques prouvées. |
-| Benchmark FNSPID exploratoire sans preuves PIT | Protocole explicite à implémenter, sans détourner les masques du runner strict. |
+| Benchmark FNSPID exploratoire sans preuves PIT | Protocole séparé disponible, opt-in `--news-protocol fnspid-exploratory`. Aucune couverture PIT revendiquée. |
 
 **Le téléchargement ne rend pas FNSPID automatiquement admissible au benchmark strict.** Il ne faut ni antidater `collected_at`, ni inventer `available_at`, ni fabriquer un journal `covered` pour faire passer le dry-run. Les étapes de téléchargement peuvent être effectuées avant cet adaptateur ; les étapes de benchmark restent conditionnelles.
 
@@ -194,11 +194,11 @@ if ($FinbertHash -ne "f31c2036e91c9854bcc35141d16669dd07b9726adfe391d1011bff1de7
 
 Le modèle occupe environ 419 MiB. Il faut utiliser le chargeur local déjà présent pour les métadonnées BERT legacy, sans réécrire les poids. Sa date de publication et ses données d'entraînement devront aussi être auditées si le benchmark revendique une simulation historiquement déployable sur une période antérieure.
 
-## 6. Point d'arrêt : import et politique historique à implémenter
+## 6. Import et politique historique
 
-Après téléchargement et audit, il faut ajouter un importateur FNSPID dans la librairie de sentiment ou un adaptateur mince ici, en conservant le runner strict. Aucune commande `import_fnspid.py` ou option d'exploration n'existe actuellement ; il ne faut pas les supposer disponibles.
+L'adaptateur dédié est maintenant disponible : `fnspid_import`, `fnspid_scoring`, `fnspid_export` et `scripts/run_fnspid_news_benchmark.py`. Il conserve le runner strict par défaut et exige un protocole exploratoire explicite pour FNSPID. Les commandes de la section 10 ne collectent pas de nouvelles news et ne changent pas le checkpoint.
 
-Le travail attendu est le suivant :
+Le contrat de préparation est le suivant :
 
 1. Lecture par chunks, filtre du ticker et de la période choisie, normalisation des noms/changements de ticker, langue et routage explicites.
 2. Titres réels comme première expérience. Exclure les résumés `Lsa`, `Luhn`, `Textrank`, `Lexrank` de cette référence ; ils sont des dérivés, pas nécessairement des résumés publiés à l'époque.
@@ -222,7 +222,7 @@ Livrables à produire, sous des chemins de sortie versionnés :
 | `data/derived/fnspid/prices-matched.parquet` | Même période et même univers pour toutes les variantes. |
 | `data/derived/fnspid/tickers-matched.json` | Univers déterminé par disponibilité, jamais par PnL du test. |
 
-Ces chemins sont des livrables attendus, pas des fichiers déjà créés. Si un journal PIT authentique existe, son export peut utiliser `scripts/export_news_sentiment.py`, décrit dans [l'intégration FinBERT](../src/news-sentiment-integration.md). Sans preuves, le benchmark exploratoire doit attendre son implémentation explicite.
+Ces chemins décrivent les livrables, pas une garantie qu'ils existent. Le lanceur exploratoire les range sous un dossier versionné (`pilot-v1/import`, `pilot-v1/scoring`, puis export/prix/sélection à la racine). Si un journal PIT authentique existe, son export peut utiliser `scripts/export_news_sentiment.py`, décrit dans [l'intégration FinBERT](../src/news-sentiment-integration.md). Ne pas envoyer l'export exploratoire dans le chargeur PIT : son schéma distinct est refusé.
 
 ## 7. Figer la comparaison
 
@@ -376,3 +376,104 @@ Le petit univers ne permet pas de conclure sur les 143 actions. Il faut ensuite 
 - [ ] Sortie complète distincte et holdout final fermé.
 
 Références du dépôt : [plan sentiment](news-sentiment-pilot.md), [intégration](../src/news-sentiment-integration.md), [pilote RSS réel](../benchmarks/news-sentiment-rss-pilot.md).
+
+## 10. Lanceur FNSPID exploratoire sur Windows
+
+Vérification réelle PC du 6 octobre 2026 : 28 606 813 lignes des deux CSV relues, 23 277 associations importées après 1 174 doublons, 8 associations à dates contradictoires exclues, 20 304 titres distincts scorés sur CUDA. L'export contient 4 805 décisions dont 2 175 observées sous l'hypothèse ; aucune fenêtre n'est revendiquée couverte historiquement. Le dry-run prévoit 45 tâches et au moins 394 observations utilisables dans le train d'un fold. Aucun des 45 entraînements financiers n'a été lancé.
+
+Validation du patch : 134 tests ciblés réussis, dont tests synthétiques d'entraînement/reprise, plus trois phrases de contrôle réellement scorées sur le GPU. La suite générale expose deux anciens tests non portables Windows (chemins canoniques et séparateur `PYTHONPATH`) ; le test multi-processus refusé par le sandbox passe hors sandbox. Les signatures refusent normalement une reprise si le code est modifié pendant un test/run.
+
+Défauts figés : `AAPL,JPM,XOM,WMT,JNJ`, prix du 9 mars 2020 au 1er janvier 2024 exclu, titres seuls, délai supposé de publication de 24 heures, fenêtre news de 24 heures, GRU de référence réentraîné sur le même calendrier. Le warmup est consommé à l'intérieur de cette période par le prétraitement existant ; aucune cible extérieure n'est ajoutée.
+
+Les dates sans timezone sont interprétées sous hypothèse UTC ; la langue et les associations `Stock_symbol` ne sont pas certifiées. Les versions de titre ou dates de publication contradictoires sont signalées à l'import et exclues du scoring. Les textes identiques sont scorés une fois, puis routés vers leurs associations. Le checkpoint et les paramètres d'inférence sont identifiés ; les shards terminés reprennent sans nouvelle inférence.
+
+`coverage_status` reste `unknown` partout. Seules les fenêtres contenant un article sous l'hypothèse de délai ont `observation_status=observed` et un signal utilisable. Une fenêtre vide reste masquée, pas « couverte sans news ». JPM/JNJ peuvent donc rester dans le calendrier après juin 2020 : la fusion utilise alors le GRU seul et la branche sentiment seule prend une position FLAT. Le checkpoint moderne, les timestamps et le corpus ne prouvent pas un système historiquement déployable.
+
+Préparer l'import, les scores et l'export (sans entraînement financier) :
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_fnspid_news_benchmark.py --stage prepare --device cuda --resume
+```
+
+Vérifier puis lancer les cinq variantes, trois folds et seeds 1/7/19 (45 entraînements, holdout fermé) :
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_fnspid_news_benchmark.py --stage benchmark --device cuda --resume --dry-run
+.\.venv\Scripts\python.exe scripts\run_fnspid_news_benchmark.py --stage benchmark --device cuda --resume
+```
+
+Le lanceur fait aussi le dry-run avant chaque lancement réel. `--stage smoke` utilise deux variantes, deux folds, seed 42 (4 entraînements, dossier séparé). `--stage all` prépare puis lance la comparaison complète. Les defaults de sortie sont `data/derived/fnspid/pilot-v1` et `artifacts/comparisons/fnspid-news-pilot-full` (ou `-smoke`).
+
+`--resume` vérifie les entrées et reprend les shards de scoring et folds enregistrés ; il ne reprend pas les epochs. Un commit interrompu ou artefact non enregistré reste refusé, sans écrasement. Ne pas changer code/runtime/checkpoint/données/paramètres au milieu d'une reprise. Les reprises d'import achevé revérifient les CSV ; un import interrompu n'est pas repris au milieu du CSV.
+
+Avant toute extension, auditer tous les tickers ajoutés et figer les choix sans consulter les performances externes. Pour tester un autre délai (par exemple 0 ou 48 heures), choisir de nouveaux `--prepared-dir` et `--output-dir` : aucune série existante n'est écrasée ou mélangée. La fenêtre, le délai et la politique d'absence restent identiques entre les variantes d'une comparaison.
+
+## 11. Contrôles de polarité : mélange article et neutralisation
+
+Le stage `polarity` réutilise les prix, articles déjà scorés et export de `pilot-v1` : aucun téléchargement, nouvelle inférence FinBERT ou relecture des gros CSV. Il conserve les cinq tickers et les mêmes partitions que le pilote. Il ne constitue pas encore une validation sur les 143 actions.
+
+Les cinq variantes sont `gru`, `gru_activity`, `gru_features`, `gru_features_shuffled` et `gru_features_neutralized`. Avec trois folds et seeds 1/7/19, cela fait **45 nouveaux entraînements**. Les références originales sont réentraînées avec le même code et les mêmes données ; aucun checkpoint de l'ancien benchmark n'est réutilisé ou modifié.
+
+- **Mélangé** : permuter conjointement probabilités positive/neutre/négative, score et confiance des articles, puis recalculer les agrégats quotidiens. Chaque permutation est isolée par ticker et partition calendrier TRAIN/INNER/OUTER, incluant les jours de warmup utilisés en historique. Un article est rattaché à sa première décision contributrice ; les fenêtres de 24 heures ne se chevauchent pas. Dates, volumes, récence, disponibilité et tous les masques de présence restent identiques et sont vérifiés. La confiance est permutée avec les probabilités pour garder un paquet cohérent : ce contrôle perturbe aussi son alignement temporel.
+- **Neutralisé** : désactiver, après standardisation TRAIN, les neuf statistiques numériques de polarité (`sentiment_mean`, `sentiment_std`, les trois probabilités moyennes, les parts positive/négative, `sentiment_ewm`, `sentiment_momentum`). Conserver compte de news, récence, confiance et tous les indicateurs de présence. Les canaux sont mis à zéro, pas supprimés : même dimension d'entrée, même architecture et même nombre de paramètres que `gru_features`. Il ne s'agit pas de déclarer de vrais articles neutres. L'expérience mesure l'apport de ces neuf statistiques **au-delà de la confiance FinBERT conservée**, pas l'absence totale d'information NLP.
+
+Le seed de permutation (`--shuffle-seed`, défaut `314159`) est indépendant des seeds du modèle et fixé pour toute la comparaison. Un seul seed de corpus ne constitue pas plusieurs tirages indépendants ; les inventaires indiquent articles contribuants, groupes singleton, assignations et vecteurs réellement changés, ainsi que les hashes de chaque partition. Les petits groupes ou scores identiques peuvent produire peu de modifications.
+
+Une permutation peut donner à un article le score d'un article ultérieur **de la même partition** : c'est un contrôle nul rétrospectif, non déployable, pas une nouvelle preuve PIT. Aucune valeur n'est transférée entre TRAIN, INNER et OUTER. Les contrôles OUTER ne sont agrégés qu'après le gel du checkpoint ; les signatures d'entraînement portent uniquement sur le préfixe TRAIN/INNER. Le holdout final reste fermé. Les prétraitements sont réutilisés par fold ; les données d'évaluation par variante sont réutilisées entre seeds.
+
+Vérification sans entraînement :
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_fnspid_news_benchmark.py --stage polarity --device cuda --resume --dry-run
+```
+
+Lancement, dans un **nouveau dossier** `artifacts/comparisons/fnspid-news-polarity-controls` :
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_fnspid_news_benchmark.py --stage polarity --device cuda --resume
+```
+
+Pour un autre tirage, conserver les préparations et choisir un autre seed **et un nouveau dossier de sortie**. `--resume` reprend uniquement les tâches enregistrées de ce contrôle, avec les paramètres/code/runtime inchangés. Il ne permet pas de reprendre l'ancien pilote après une modification du code.
+
+`report.json` ajoute `paired_vs_original_features` pour comparer les contrôles à `gru_features`, en plus du GRU prix et du contrôle d'exposition. Les résultats par tâche conservent `news_control`, ses inventaires et signatures. Comparer les différences appariées par fold, leur stabilité et les coûts ; ne pas traiter les neuf couples fold/seed comme neuf marchés indépendants. Un contrôle proche du modèle original affaiblit la preuve d'un gain de polarité, sans prouver que tout sentiment serait inutile.
+
+## 12. Inventaire des 143 tickers et comparaison avec plusieurs permutations
+
+Cette extension prépare l'audit de tous les tickers du fichier de prix, soit les 143 actions du socle attendu, puis une comparaison sur les seuls tickers admissibles. Les commandes ci-dessous décrivent la procédure ; elles ne constituent pas un compte rendu de scan réel ou d'entraînements exécutés. Le nombre retenu sera déterminé par l'inventaire.
+
+L'inventaire parcourt les CSV locaux par chunks pour produire un import commun dans `data/derived/fnspid/inventory-v1/import/articles.parquet`. Il mesure, par ticker et mois, les lignes brutes, associations dédupliquées, rejets temporels, jours de prix disponibles et décisions avec news observées. `inventory-report.json`, `monthly-inventory.parquet` et `tickers-selected.json` conservent les diagnostics, règles et motifs de rejet. Aucune inférence FinBERT n'est nécessaire à cette étape.
+
+La sélection exige des prix complets sur le calendrier étudié, au moins **60 jours avec news observées** dans le premier TRAIN et au moins **10 % de ses décisions avec news observées**. Les bornes de ce TRAIN suivent le prétraitement et les partitions exacts du pipeline, après warmup et séparation de la validation interne. Le critère news utilise uniquement ce TRAIN, sans scores FinBERT, rendements, PnL, ni observations INNER/OUTER. Les statistiques des autres périodes restent descriptives. La complétude des prix sur toute la période constitue néanmoins un filtre rétrospectif de disponibilité ; elle ne garantit pas un univers sélectionnable à l'époque et n'audite pas le biais de survivance du fichier source.
+
+Créer l'inventaire et figer l'univers :
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_fnspid_news_benchmark.py --stage inventory --resume
+```
+
+La préparation élargie réutilise ce Parquet commun, filtre les tickers retenus et écrit dans `data/derived/fnspid/expanded-v1`. Elle réutilise les scores de `pilot-v1/scoring` après vérification du manifeste complet, de tous les shards et de leur routage final. Le checkpoint, les métadonnées du modèle et du tokenizer, la longueur maximale, la librairie, le runtime, le device résolu et le batch doivent être compatibles à l'identique. Les sources et leurs checksums sont enregistrés dans la signature ; une modification ultérieure refuse la reprise. Seuls les textes absents du cache passent dans FinBERT, puis les scores réutilisés et nouveaux sont réunis dans les shards reprenables. Un corpus entièrement en cache ne charge pas l'analyseur. L'import des gros CSV n'est pas refait par cette préparation.
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_fnspid_news_benchmark.py --stage prepare-expanded --device cuda --resume
+```
+
+Le calendrier, les titres, le délai supposé de 24 heures, la fenêtre news de 24 heures, les prix et les coûts restent communs à toutes les variantes. `coverage_status=unknown` reste partout : une observation selon l'hypothèse de publication n'établit pas une couverture PIT. Les absences restent masquées. Le contrôle neutralisé conserve l'activité, la récence, la confiance FinBERT et les masques, comme en section 11.
+
+Vérifier le plan préparé, puis lancer dans `artifacts/comparisons/fnspid-news-expanded-permutations` :
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_fnspid_news_benchmark.py --stage expanded --device cuda --resume --dry-run
+.\.venv\Scripts\python.exe scripts\run_fnspid_news_benchmark.py --stage expanded --device cuda --resume --permutation-seeds 314159,271828,161803,57721,141421
+```
+
+Les cinq seeds de corpus indiqués sont les valeurs par défaut, indépendantes des seeds modèle **1, 7 et 19**. La référence entraîne `gru`, `gru_activity`, `gru_features` et `gru_features_neutralized` une fois pour chaque couple fold/seed modèle : **36 entraînements** sur trois folds. Chaque permutation ajoute uniquement `gru_features_shuffled`, soit neuf entraînements ; cinq permutations ajoutent 45 entraînements, pour **81 au total**. Les références ne sont pas réentraînées cinq fois.
+
+Pendant une invocation, le prétraitement prix TRAIN/INNER est partagé une fois par fold, les articles scorés sont lus une fois et les exports/scalers TRAIN/INNER sont réutilisés par permutation. Les empreintes et signatures restent vérifiées ; le cache est uniquement en mémoire. Il ne contient pas de données OUTER préparées, qui ne sont ouvertes qu'après sauvegarde d'un checkpoint figé. Les tests CPU vérifient l'identité des signatures et prédictions avec et sans cache.
+
+Chaque permutation respecte les groupes ticker et partitions TRAIN/INNER/OUTER de chaque fold ; probabilités, score et confiance voyagent ensemble. Les dates, volumes et masques restent identiques. Le seed de corpus reste fixe pour les trois seeds modèle. Les inventaires de permutation permettent de vérifier combien d'assignations et de vecteurs ont réellement changé. Ce contrôle reste rétrospectif à l'intérieur d'une partition ; le holdout final demeure fermé.
+
+Comparer les différences appariées à `gru_features` et la stabilité entre permutations et folds. Les seeds modèle ne sont pas des marchés indépendants, et plusieurs permutations ne créent pas de nouvelles périodes de marché. Les comparaisons à exposition brute commune restent des diagnostics descriptifs, sans équivalence complète du risque. Ne pas choisir l'univers, les seuils ou le meilleur seed de corpus à partir des résultats externes.
+
+`--inventory-dir` et `--expanded-prepared-dir` permettent de déplacer les deux préparations ; `--output-dir` déplace les résultats. `--prepared-dir` identifie toujours la préparation pilote utilisée comme source de cache. Conserver ces chemins, les données, le code, le runtime et les seeds au cours d'une reprise. Pour une autre sélection, un autre délai ou une autre liste de permutations, choisir de nouveaux dossiers versionnés.
+
+Le choix automatique du cache est figé dans `prices.manifest.json` lors de la première préparation. `--score-reuse-from CHEMIN` peut désigner explicitement un autre scoring compatible (option répétable) ; `--no-score-cache-reuse` désactive la réutilisation, notamment pour préparer sur CPU avec un cache CUDA incompatible. Ne pas changer ce choix au milieu d'une reprise.

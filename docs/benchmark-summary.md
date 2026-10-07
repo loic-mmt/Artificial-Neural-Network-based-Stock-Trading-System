@@ -1,6 +1,6 @@
 # Résumé des benchmarks
 
-Mise à jour : 3 octobre 2026. Je garde ici les grandes lignes et les décisions. Chaque fiche liée contient les résultats détaillés, le protocole, les limites et les sources.
+Mise à jour : 7 octobre 2026. Je garde ici les grandes lignes et les décisions. Chaque fiche liée contient les résultats détaillés, le protocole, les limites et les sources.
 
 ## Ce que je retiens
 
@@ -10,6 +10,8 @@ Ma référence GRU reste compacte : une couche, hidden size 32, attention tempor
 
 Sur l'US, le GRU reste le contrôle de risque, `identity` le contrôle obligatoire et le GNN résiduel une piste exploratoire. Le gain relationnel n'est pas démontré. Le gate Transformer actuel ne devient pas le réglage par défaut. Je teste ensuite son interaction avec 32/64 features sur un pool commun réentraîné, avec `identity_market` aux deux caps pour contrôler gate et capacité sans relations. Les résultats restent en attente.
 
+Sur FNSPID, l'inventaire des 143 actions retient 53 titres selon la disponibilité du premier TRAIN, sans classement de PnL. Les 81 entraînements et cinq permutations ne démontrent pas d'avantage robuste de la polarité FinBERT. Le neutralisé améliore la moyenne, mais surtout grâce à deux runs seed 7 et à des changements d'exposition. Je ne le retiens pas comme vainqueur validé ; le holdout reste fermé et la disponibilité historique des news n'est pas prouvée.
+
 Pour MT5, décodage et exposition changent fortement les résultats. Le seuil de confiance est le meilleur décodage du test US disponible. Réentraîner toutes les 40 séances gagne la grille brute, avec plus d'exposition que 10 ou 20. Ce n'est pas une fréquence universelle. Je garde l'allocation égale entre actifs non FLAT, sans sizing selon les performances passées.
 
 ## Limites communes
@@ -18,7 +20,7 @@ Les anciennes métriques de classification et les rendements continus nets ne so
 
 Les seeds partagent les dates des folds : neuf résultats ne font pas neuf périodes indépendantes. Les univers sont survivants et les secteurs ne sont pas historiquement point-in-time. Les holdouts CAC40 réservés en 2022 et US réservé en 2023 restent fermés dans les études CV citées. La période MT5 2026 a déjà été examinée et n'est plus un holdout intact.
 
-Exposition brute égale ne signifie pas même exposition nette, beta ou risque. Les opens et stress OHLC sont des simulations, pas des fills MT5 observés. Les news historiques et l'exécution réelle restent à valider.
+Exposition brute égale ne signifie pas même exposition nette, beta ou risque. Les opens et stress OHLC sont des simulations, pas des fills MT5 observés. La disponibilité historique des news et l'exécution réelle restent à valider.
 
 ## Labels et apprentissage
 
@@ -77,6 +79,13 @@ Protocole : [GRU optim](benchmarks/gru-optim/README.md). Numérotation indépend
 | 72 entraînements, 143 actions | Plus de rendement brut GNN, mais plus d'exposition. GRU meilleur Sharpe moyen. | [US](benchmarks/us-relational-market-benchmark.md) |
 | Exposition égale | Le gain de rendement GNN persiste, mais identité fait presque aussi bien. Pas d'alpha relationnel démontré. | [Comparaison](benchmarks/us-exposure-comparison.md) |
 | Interaction features/gate | Prêt, sans résultats locaux. 12 variantes, 108 entraînements maximum ; `identity` et `identity_market` aux caps 32/64, sur le même pool réentraîné. | [Statut](benchmarks/us-feature-gate-interaction.md) |
+
+## Sentiment news
+
+| Benchmark | Conclusion | Détail |
+| --- | --- | --- |
+| Pilote RSS et FinBERT | Collecte, scoring et exports vérifiés sur 409 articles ; validation technique, sans conclusion de PnL. | [RSS](benchmarks/news-sentiment-rss-pilot.md) |
+| FNSPID, 53 actions et cinq permutations | 81 entraînements terminés. Les cinq mélanges dépassent l'original en Sharpe moyen ; avantage du neutralisé fragile, positif seulement sur 4/9 couples. Pas d'apport robuste de polarité démontré. | [FNSPID](benchmarks/news-sentiment-fnspid.md) |
 
 ## MT5 et portefeuille
 

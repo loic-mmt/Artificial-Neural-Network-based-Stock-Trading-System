@@ -101,8 +101,18 @@ Avec cinq variantes, trois seeds et trois folds : 45 entraînements. Le pilote d
 
 Le [manuel FNSPID sur PC Windows](fnspid-pc-manual.md) détaille le téléchargement
 sélectif, l'audit, le checkpoint GPU et le lancement conditionnel du benchmark.
-L'import historique et le protocole exploratoire restent distincts du pilote
-RSS et du benchmark PIT strict ; ils ne sont pas encore implémentés.
+L'import FNSPID, le scoring par shards reprenables et le protocole exploratoire
+explicite sont maintenant disponibles via `scripts/run_fnspid_news_benchmark.py`.
+Ils restent distincts du pilote RSS et du benchmark PIT strict ; voir la section 10
+du manuel. Le téléchargement ne transforme pas le corpus en preuve PIT.
+
+L'extension est décrite en [section 12 du manuel](fnspid-pc-manual.md#12-inventaire-des-143-tickers-et-comparaison-avec-plusieurs-permutations) :
+inventaire des 143 tickers attendus du socle prix, sélection selon les observations
+du premier TRAIN, réutilisation de l'import et des scores FinBERT du pilote,
+puis quatre références et cinq permutations indépendantes des seeds modèle
+(81 entraînements prévus). La complétude des prix reste un filtre rétrospectif ;
+la couverture reste inconnue et le holdout fermé. Cette procédure ne revendique
+pas encore un inventaire réel ou un benchmark élargi exécuté.
 
 Le scoring réel, les probabilités, les checksums, les exports et les reprises
 ont été vérifiés sur le corpus RSS du 6 octobre. Les **84 tests ciblés** couvrent
