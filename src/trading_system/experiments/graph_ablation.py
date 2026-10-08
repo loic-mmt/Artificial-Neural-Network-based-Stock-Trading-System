@@ -35,6 +35,7 @@ from trading_system.models.neural.trainer import resolve_device, seed_torch_run
 from trading_system.models.specs import ModelSelection
 from trading_system.reporting.warnings import current_universe_warning
 from trading_system.training.financial_loss import FinancialLossConfig, ReturnPanel, position_coefficients
+from trading_system.training.learning_trace import LearningTrace, gradient_norm_l2
 from trading_system.training.overfitting import TrainOnlyFeatureSelector
 from .position_objectives import _align_position_calendar
 from .runner import _filter_universe, _prepare_splits
@@ -67,8 +68,11 @@ class GraphAblationConfig:
     market_transformer_heads: int = 4
     market_transformer_layers: int = 1
     market_gate_temperature: float = 1.0
+    learning_diagnostics: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.learning_diagnostics, bool):
+            raise ValueError("learning_diagnostics must be boolean.")
         GraphBuildConfig(
             "train_pearson", self.graph_lookback, self.graph_threshold,
             self.graph_weight_mode, self.graph_neighbors, self.graph_rebalance_bars,
@@ -411,6 +415,9 @@ def _fit(model, train_ds, val_ds, train_panel, val_panel, loss, config, training
     optimizer = torch.optim.AdamW(model.parameters(), lr=training.learning_rate,
                                   weight_decay=training.weight_decay)
     best, best_state, best_epoch, stale = np.inf, None, 0, 0
+    # The market-only runner also shares this loop with its legacy config.
+    trace = LearningTrace() if getattr(ablation, "learning_diagnostics", False) else None
+    stop_reason = "max_epochs"
     started = perf_counter()
     for epoch in range(training.epochs):
         epoch_seed = (training.seed + epoch + 1) % (2**32)
@@ -419,12 +426,14 @@ def _fit(model, train_ds, val_ds, train_panel, val_panel, loss, config, training
         with torch.no_grad():
             train_positions = _positions(model, train_ds, mode=type(model).__name__,
                                          config=config, batch_dates=ablation.date_batch_size, torch=torch)
-        _, gradient = train_panel.loss_and_gradient(train_positions, loss)
+        train_loss, gradient = train_panel.loss_and_gradient(train_positions, loss)
+        train_phase = trace.phase(train_loss, train_positions) if trace is not None else None
         optimizer.zero_grad(set_to_none=True)
         seed_torch_run(epoch_seed, training.deterministic, torch)
         model.train()
         _positions(model, train_ds, mode=type(model).__name__, config=config,
                    batch_dates=ablation.date_batch_size, torch=torch, backward=gradient)
+        gradient_norm = gradient_norm_l2(model.parameters()) if trace is not None else None
         if training.gradient_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), training.gradient_clip_norm)
         if any(parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all())
@@ -436,19 +445,28 @@ def _fit(model, train_ds, val_ds, train_panel, val_panel, loss, config, training
             val_positions = _positions(model, val_ds, mode=type(model).__name__,
                                        config=config, batch_dates=ablation.date_batch_size, torch=torch)
         val_loss, _ = val_panel.loss_and_gradient(val_positions, loss)
-        if val_loss < best - training.early_stopping_min_delta:
+        improved = val_loss < best - training.early_stopping_min_delta
+        if improved:
             best, best_epoch, stale = val_loss, epoch + 1, 0
             best_state = deepcopy(model.state_dict())
         else:
             stale += 1
+        if trace is not None:
+            trace.record(epoch + 1, train=train_phase, validation=trace.phase(val_loss, val_positions),
+                         gradient_norm_pre_clip=gradient_norm, improved=bool(improved),
+                         stale=stale, best_epoch=best_epoch)
         if stale >= training.early_stopping_patience:
+            stop_reason = "early_stopping"
             break
     if best_state is None:
         raise RuntimeError("No finite graph-ablation checkpoint.")
     model.load_state_dict(best_state)
-    return {"best_epoch": best_epoch, "epochs_run": epoch + 1,
-            "seconds": perf_counter() - started,
-            "parameter_count": sum(p.numel() for p in model.parameters())}
+    fitted = {"best_epoch": best_epoch, "epochs_run": epoch + 1,
+              "seconds": perf_counter() - started,
+              "parameter_count": sum(p.numel() for p in model.parameters())}
+    if trace is not None:
+        fitted["learning_trace"] = trace.finish(stop_reason=stop_reason, best_epoch=best_epoch)
+    return fitted
 
 
 def _write_graphs(path, graphs):
@@ -554,6 +572,8 @@ def _run_context(frame, config, loss, gru_parameters, seeds, ablation, *,
         },
         "protocol": "matched_purged_graph_ablation", "provenance": runtime_provenance(),
     }
+    if not ablation.learning_diagnostics:
+        metadata["ablation"].pop("learning_diagnostics")
     return work, config, folds, _nullable_metadata(metadata)
 
 
@@ -599,6 +619,7 @@ def _task_spec(metadata, prepared, fold, candidate, seed, ablation, market_scale
         "shared_graph_warmup": ablation.graph_lookback,
         "market_context_sha256": metadata["market_context_sha256"] if market_gate else None,
         "date_batch_size": ablation.date_batch_size,
+        **({"learning_diagnostics": True} if ablation.learning_diagnostics else {}),
         "resolved_device": str(device), "precision": "float32",
         "provenance": metadata["provenance"],
     })

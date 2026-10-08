@@ -32,6 +32,8 @@ def build_parser():
     parser.add_argument("--ticker-selection", type=Path)
     parser.add_argument("--device", choices=("cpu", "cuda", "mps", "auto"))
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--learning-diagnostics", action="store_true",
+                        help="Opt-in epoch losses, raw positions and gradient observations; use a new run directory.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Compute signatures, compatibility and counts; never train or write outputs.")
     parser.add_argument("--compare-exposure", action="store_true",
@@ -59,6 +61,8 @@ def main(argv=None):
         raise ValueError("--compare-exposure requires the predeclared feature caps 32 and 64.")
     for name in ("data", "market_context_data", "ticker_selection", "device"):
         _override(config["common_arguments"], "--" + name.replace("_", "-"), getattr(args, name))
+    if args.learning_diagnostics and "--learning-diagnostics" not in config["common_arguments"]:
+        config["common_arguments"].append("--learning-diagnostics")
     from trading_system.pipelines.compare_gnn_graphs import prepare_graph_run
     from trading_system.experiments.graph_ablation import plan_run_graph_ablation, run_graph_ablation
     plan = plan_study(config, args.stage, args.output_dir,

@@ -53,7 +53,8 @@ def prepare_news_sentiment_run(argv=None):
         candidates=candidates, sentiment_hidden_size=args.sentiment_hidden_size,
         date_batch_size=args.date_batch_size, news_protocol=args.news_protocol,
         shuffle_seed=args.news_shuffle_seed,
-        scored_articles_path=str(args.news_scored_articles.resolve()) if args.news_scored_articles else None)
+        scored_articles_path=str(args.news_scored_articles.resolve()) if args.news_scored_articles else None,
+        learning_diagnostics=args.learning_diagnostics)
     # Only pass the original graph parser's options. Its preparation function
     # supplies the shared label, train-only selector and calendar protocol.
     own_flags = {"--news-sentiment-export", "--sentiment-candidates", "--sentiment-hidden-size", "--news-protocol",

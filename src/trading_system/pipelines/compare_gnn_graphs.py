@@ -49,6 +49,8 @@ def build_parser():
     parser.add_argument("--gnn-layers", type=int, default=1)
     parser.add_argument("--gnn-dropout", type=float, default=0.0)
     parser.add_argument("--date-batch-size", type=int, default=32)
+    parser.add_argument("--learning-diagnostics", action="store_true",
+                        help="Record existing TRAIN/validation passes by epoch; no additional model forwards.")
     parser.add_argument("--resume", action="store_true", help="Resume matching completed folds in --output-dir.")
     return parser
 
@@ -129,6 +131,7 @@ def prepare_graph_run(argv=None):
         market_transformer_heads=args.market_transformer_heads,
         market_transformer_layers=args.market_transformer_layers,
         market_gate_temperature=args.market_gate_temperature,
+        learning_diagnostics=args.learning_diagnostics,
     )
     target = args.output_dir or comparisons_dir() / ("gnn-graphs-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
     return dict(

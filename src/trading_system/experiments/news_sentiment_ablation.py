@@ -34,6 +34,7 @@ from trading_system.models.multimodal_system import MaskedLogitFusion
 from trading_system.models.neural.config import GRUConfig
 from trading_system.models.neural.trainer import resolve_device, seed_torch_run
 from trading_system.training.financial_loss import ReturnPanel, position_coefficients
+from trading_system.training.learning_trace import LearningTrace, gradient_norm_l2
 from .graph_ablation import (
     GraphAblationConfig, _atomic_parquet, _classification, _complete, _daily_paths,
     _dates, _fit, _prepare, _resume_metadata, _run_context as _graph_context,
@@ -62,8 +63,11 @@ class NewsSentimentAblationConfig:
     news_protocol: str = "pit"
     shuffle_seed: int = 314159
     scored_articles_path: str | None = None
+    learning_diagnostics: bool = False
 
     def __post_init__(self):
+        if not isinstance(self.learning_diagnostics, bool):
+            raise ValueError("learning_diagnostics must be a bool.")
         if self.news_protocol not in ("pit", FNSPID_PROTOCOL):
             raise ValueError("news_protocol must be pit or fnspid-exploratory.")
         if (not self.candidates or len(set(self.candidates)) != len(self.candidates)
@@ -270,16 +274,20 @@ def _fit_sentiment(model, train_ds, val_ds, train_panel, val_panel, loss, config
                                   weight_decay=training.weight_decay)
     best, state, best_epoch, stale = np.inf, None, 0, 0
     started = perf_counter()
+    trace = LearningTrace() if ablation.learning_diagnostics else None
+    stop_reason = "max_epochs"
     for epoch in range(training.epochs):
         epoch_seed = (training.seed + epoch + 1) % (2**32)
         seed_torch_run(epoch_seed, training.deterministic, torch)
         model.train()
         with torch.no_grad():
             positions = _masked_positions(model, train_ds, config, ablation, torch)
-        _, gradient = train_panel.loss_and_gradient(positions, loss)
+        train_loss, gradient = train_panel.loss_and_gradient(positions, loss)
+        train_phase = LearningTrace.phase(train_loss, positions) if trace is not None else None
         optimizer.zero_grad(set_to_none=True)
         seed_torch_run(epoch_seed, training.deterministic, torch)
         _masked_positions(model, train_ds, config, ablation, torch, backward=gradient)
+        gradient_norm = gradient_norm_l2(model.parameters()) if trace is not None else None
         if training.gradient_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), training.gradient_clip_norm)
         if any(p.grad is not None and not bool(torch.isfinite(p.grad).all()) for p in model.parameters()):
@@ -289,17 +297,27 @@ def _fit_sentiment(model, train_ds, val_ds, train_panel, val_panel, loss, config
         with torch.no_grad():
             positions = _masked_positions(model, val_ds, config, ablation, torch)
         score, _ = val_panel.loss_and_gradient(positions, loss)
-        if score < best - training.early_stopping_min_delta:
+        validation_phase = LearningTrace.phase(score, positions) if trace is not None else None
+        improved = score < best - training.early_stopping_min_delta
+        if improved:
             best, state, best_epoch, stale = score, deepcopy(model.state_dict()), epoch + 1, 0
         else:
             stale += 1
+        if trace is not None:
+            trace.record(epoch + 1, train=train_phase, validation=validation_phase,
+                         gradient_norm_pre_clip=gradient_norm, improved=improved,
+                         stale=stale, best_epoch=best_epoch)
         if stale >= training.early_stopping_patience:
+            stop_reason = "early_stopping"
             break
     if state is None:
         raise RuntimeError("No finite sentiment checkpoint.")
     model.load_state_dict(state)
-    return {"best_epoch": best_epoch, "epochs_run": epoch + 1, "seconds": perf_counter() - started,
-            "parameter_count": sum(p.numel() for p in model.parameters())}
+    fitted = {"best_epoch": best_epoch, "epochs_run": epoch + 1, "seconds": perf_counter() - started,
+              "parameter_count": sum(p.numel() for p in model.parameters())}
+    if trace is not None:
+        fitted["learning_trace"] = trace.finish(stop_reason=stop_reason, best_epoch=best_epoch)
+    return fitted
 
 
 def _coverage(frame, exported, config):
@@ -447,8 +465,12 @@ def _context(frame, config, loss, parameters, seeds, exported, ablation, **optio
     for name in ("graph_context_path", "graph_context_sha256", "sector_context_columns",
                  "market_context_path", "market_context_sha256", "market_columns", "market_audit"):
         metadata.pop(name, None)
+    ablation_metadata = asdict(ablation)
+    if not ablation.learning_diagnostics:
+        # Keep the legacy opt-out metadata/spec shape for existing runs.
+        ablation_metadata.pop("learning_diagnostics")
     metadata.update(
-        protocol="matched_purged_news_sentiment_ablation", ablation=asdict(ablation),
+        protocol="matched_purged_news_sentiment_ablation", ablation=ablation_metadata,
         news_protocol=ablation.news_protocol, point_in_time=not exploratory,
         historical_availability_verified=not exploratory,
         availability_kind=AVAILABILITY_ASSUMPTION if exploratory else "audited_point_in_time",
