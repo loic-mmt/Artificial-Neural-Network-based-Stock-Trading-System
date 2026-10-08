@@ -1,6 +1,6 @@
 # Plan d'implémentation : optimisation multimodale US
 
-Statut : P0 implémenté et testé. Je prépare P1 aux caps 32/64 avec six candidats par cap, dont `identity` et `identity_market`, soit 12 variantes et 108 entraînements maximum. Les contrôles, audits et rapports à exposition comparable sont disponibles, mais les résultats restent en attente. Les diagnostics détaillés des poids du gate et les étapes suivantes restent à implémenter. Je n'ai lancé aucun entraînement US pour cet ajout. Guides : [provenance, replay et orchestration](../src/us-multimodal-p0.md), [benchmark d'interaction](us-feature-gate-interaction.md).
+Statut au 8 octobre 2026 : P0 implémenté et testé ; benchmark P1 terminé, **108/108 entraînements vérifiés**, avec `identity_market` aux deux caps. Les audits de features et comparaisons d'exposition sont complets. La configuration de travail reste cap 32 et gate désactivé ; identité32 + marché reste un challenger fragile, sans promotion automatique. Les diagnostics détaillés des poids du gate et les étapes suivantes sont séparés et restent à faire. Guides : [provenance, replay et orchestration](../src/us-multimodal-p0.md), [benchmark d'interaction](us-feature-gate-interaction.md), [résultats P1](../benchmarks/us-feature-gate-interaction.md).
 
 ## 1. Objectif et périmètre
 
@@ -30,8 +30,8 @@ Références locales : [MASTER](../papers/MASTER/MASTER.md) pour le gate conditi
 | --- | --- | --- |
 | GRU et GNN indépendants | Opérationnels dans le runner d'ablation | Conserver cette séparation |
 | Transformer de marché | Séquence ETF/VIX et agrégats transversaux | Tester sa profondeur, sans ajouter de vote |
-| Gate de features | Pondération `F × softmax`, initialisation identité | Diagnostics et comparaison 32/64 |
-| Sélection des features | Train uniquement, filtrage de couverture/corrélation et classement par variance dans ce runner | Sauvegarder son état et vérifier les ensembles réellement retenus |
+| Gate de features | Pondération `F × softmax`, initialisation identité ; comparaison 32/64 terminée | Diagnostics temporels des poids, séparés du benchmark terminé |
+| Sélection des features | Train uniquement, filtrage couverture/corrélation et classement par variance ; prétraitements sauvegardés et audits 32/64 validés | Attribution financière des features, pas encore réalisée |
 | Profondeurs | `--gnn-layers` et `--market-transformer-layers` existent | Orchestration et contrôles appariés |
 | Checkpoints | Schéma 2, prétraitement complet, signatures et exports internes/externes | Replay vérifié disponible ; anciens runs restent exploratoires si provenance absente |
 | Reprise | `--resume` strict et réutilisation inter-études par signature/fichiers vérifiés | Conserver le code d'origine pour terminer les anciens runs de schéma 1 |
@@ -206,6 +206,33 @@ Retenir 64 uniquement si le gain est stable et justifie le coût. Pour la premi�
 Si le gate gagne, prévoir une ablation secondaire gate statique contre encodeur de marché simple avant d'attribuer ce gain au Transformer. Ces contrôles existent côté `MarketGRUControl`, mais leur intégration dans cette étude et leurs entraînements ne sont pas encore réalisés. Ils évitent de confondre pondération des features, information de marché et capacité du Transformer.
 
 **Budget P1 actuel :** 6 candidats × 2 caps × 3 folds × 3 seeds = **108 entraînements maximum**, avant réutilisation vérifiée de contrôles de schéma 2. Je remplace ainsi l'ancienne grille de dix variantes et 90 entraînements maximum. L'estimation initiale de **45 nouveaux entraînements** supposait les contrôles 32 compatibles et excluait `identity_market` ; elle reste historique, pas le budget du run actuel. La comparaison gate statique/encodeur simple reste une extension conditionnelle comptée séparément.
+
+### 5.4 Résultat P1 et suites conditionnelles
+
+Les 108 tâches et leurs exports sont complets. Les trois folds retiennent
+exactement 32/64 features avec préfixe ordonné et prétraitements communs
+compatibles. Les [résultats détaillés](../benchmarks/us-feature-gate-interaction.md)
+remplacent les anciens statuts « en attente ».
+
+- Conserver cap 32 pour le protocole commun, sans annoncer une inutilité
+  individuelle des 32 features supplémentaires.
+- Conserver le gate désactivé par défaut. Ses trois interactions moyennes avec
+  le cap sont négatives en brut et dans les deux contrôles d'exposition.
+- Garder identité comme contrôle et GNN résiduel32 comme challenger. Le meilleur
+  score moyen appris appartient à identité32 + marché, mais son gain est instable.
+- Ne pas lancer automatiquement la grille de profondeur du Transformer sur la
+  base de ce résultat. Son intérêt doit rester une hypothèse distincte.
+- Les poids temporels du gate et l'importance financière des features restent
+  non documentés. Ce manque ne nécessite pas de recommencer les 108 entraînements.
+
+Le classement actuel par variance avant scaling est sensible aux unités des
+features ; il n'est pas une mesure de contribution au Sharpe. Après intégration
+des données LSE PIT, prévoir une étude d'attribution par familles puis features,
+sur validation chronologique : permutations par blocs, retraits avec réentraînement
+des principaux candidats, stabilité par fold/seed et régimes définis causalement.
+Les contributions ne s'additionnent pas à 100 % en présence de corrélations et
+d'interactions. Les folds externes servent à confirmer les choix, pas à sélectionner
+les features ; le holdout reste fermé.
 
 ## 6. P2 : profondeur du GNN et du Transformer
 
@@ -402,10 +429,12 @@ Après les tests ciblés, lancer la suite complète. Faire ensuite un petit smok
 
 ## 13. Ordre d'implémentation et critères de fin
 
-- [ ] **P0a** : figer le protocole, les dates et les sources ; auditer la compatibilité du run actuel.
-- [ ] **P0b** : compléter provenance/checkpoints, exporter les logits et valider le replay.
-- [ ] **P0c** : orchestrateur portable, signatures de réutilisation, reprise atomique et `--dry-run`.
-- [ ] **P1** : grille 32/64 disponible, avec `identity_market` aux deux caps ; implémenter les diagnostics détaillés du gate et terminer les entraînements et comparaisons appariées.
+- [x] **P0a** : figer le protocole, les dates et les sources ; auditer la compatibilité du run actuel.
+- [x] **P0b** : compléter provenance/checkpoints, exporter les logits et valider le replay.
+- [x] **P0c** : orchestrateur portable, signatures de réutilisation, reprise atomique et `--dry-run`.
+- [x] **P1 benchmark** : 108/108 tâches, `identity_market` aux deux caps, audits et comparaisons financières documentés ; cap 32 et gate désactivé comme configuration de travail.
+- [ ] **P1 diagnostic complémentaire** : exporter les poids du gate par date, entropie, stabilité et nombre effectif de features ; distinct de la complétude du benchmark.
+- [ ] **Attribution des features** : étude financière après intégration LSE PIT ; ne pas confondre classement par variance et importance prédictive.
 - [ ] **P2a** : tester GNN 1/2 avec contrôles de capacité.
 - [ ] **P2b** : tester Transformer 1/2 et, seulement si justifié, leur interaction.
 - [ ] **P3a** : adaptateur de branches gelées et fusions fixes reproductibles.

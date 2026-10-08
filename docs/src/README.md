@@ -11,6 +11,9 @@ Je garde ici le fonctionnement du code. Les performances sont dans [benchmarks](
 - [Losses financières](financial-loss.md).
 - [Purged CV](purged-cv.md).
 - [Contrôle du surapprentissage](overfitting-control.md).
+- [Diagnostic de l'apprentissage](learning-diagnostics.md).
+- [Diagnostic des labels sans entraînement](label-diagnostics.md).
+- [Benchmark post-open des labels, CE et loss hybride](label-loss-benchmark.md).
 - [Optimisation mémoire](memory-optimization.md).
 - [Dashboard interactif des benchmarks et backtests](visualization.md).
 

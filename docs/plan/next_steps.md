@@ -224,16 +224,119 @@ features news dans le GRU, sentiment seul, puis moyenne masquée GRU/sentiment.
 Le train apprend ses scalers sur les seules observations couvertes ; l'absence
 de sentiment ne rend pas le GRU indisponible. Les runners existants ne changent pas.
 
-Il reste à fournir un corpus et une couverture historiques admissibles avant
-de lancer la comparaison financière. Le petit backfill téléchargé aujourd'hui
-sert à vérifier collecte/scoring/export, pas à prouver un gain sur les dates
-anciennes. Le raccordement du panel macro au Transformer, la calibration et
-la fusion apprise restent des étapes suivantes et doivent être benchmarkés
-séparément.
+Le pilote RSS a validé collecte/scoring/export ; il n'apporte pas de news aux
+dates anciennes. Le benchmark [FNSPID](../benchmarks/news-sentiment-fnspid.md)
+est désormais terminé : 81 entraînements sur 53 actions, cinq permutations et
+contrôle neutralisé. Aucun apport robuste de polarité FinBERT n'est démontré.
+FNSPID reste exploratoire : disponibilité historique supposée, couverture et
+versions à publication non prouvées. Le sentiment reste désactivé par défaut,
+sans conclure que toute source future de news sera inutile.
+
+Le raccordement du panel macro au Transformer, la calibration et la fusion
+apprise restent des étapes suivantes, à benchmarker séparément.
 Ce document distingue historique et point-in-time, les entrées de chaque branche,
 les sources complémentaires et les contrôles nécessaires avant ingestion.
 Aucune nouvelle source n'est activée automatiquement par cet inventaire.
 
 Les décisions suivantes viennent du [contrôle d'exposition](../benchmarks/us-exposure-comparison.md).
-Le [plan d'interaction features/gate](us-feature-gate-interaction.md) est prêt
-mais n'a pas encore de résultat local documenté.
+Le [benchmark d'interaction features/gate](../benchmarks/us-feature-gate-interaction.md)
+est terminé au 8 octobre 2026 : 108/108 tâches vérifiées, avec `identity_market`
+aux deux caps. Les résultats fixent une configuration de travail cap 32, gate
+désactivé, identité obligatoire et GNN résiduel comme challenger. Identité32
+avec marché a le meilleur score moyen appris, mais son gain est fragile et
+ne justifie pas une promotion. Aucun entraînement de cette grille ne manque.
+
+## Diagnostic de l'apprentissage : périmètre
+
+Il faut distinguer une information réellement apprise d'un changement de
+direction ou de taille des positions. Cela ne signifie ni rechercher un
+nouveau label ni calculer l'importance de chaque feature.
+
+1. Examiner pertes TRAIN/validation, métrique financière de validation,
+   époque retenue et nombre d'époques exécutées ; comparer stabilité entre seeds.
+2. Examiner distributions des probabilités et positions, saturation long/short,
+   exposition brute/nette, turnover et coûts ; décomposer les périodes qui gagnent
+   ou perdent, sans créer de blacklist rétrospective.
+3. Vérifier si les écarts viennent d'un signal différent, de l'early stopping,
+   ou d'un simple changement d'exposition. Les contrôles de gross déjà produits
+   ne neutralisent pas beta, risque ou direction.
+4. Sur FNSPID, comprendre les deux runs seed 7 expliquant 90,56 % du gain du
+   neutralisé : checkpoints époque 1 contre 57/55 pour l'original. Une époque 1
+   retenue ne prouve pas un bug ni un entraînement absent.
+
+Les exports et checkpoints permettent une première analyse sans nouvel
+entraînement. Les courbes et normes de gradients non sauvegardées ne peuvent
+pas être reconstruites à partir du seul checkpoint final : compléter la
+journalisation pour les prochains runs si nécessaire. Tout nouveau réglage
+d'early stopping se choisit sur validation interne, jamais sur OUTER ou holdout.
+
+La préparation du diagnostic est désormais disponible, sans nouvel entraînement
+ni modification du protocole. [`scripts/diagnose_learning.py`](../../scripts/diagnose_learning.py)
+vérifie les exports multimodaux signés et produit un rapport séparé sur les
+checkpoints retenus, probabilités, positions, exposition exécutée, coûts et
+contributions ticker/période. INNER est le défaut ; OUTER reste une lecture
+descriptive explicite et le holdout final est interdit. Les labels inconnus et
+signaux indisponibles ne sont pas remplacés par des observations Hold ou zéro.
+
+Pour les prochains runs graphe/news et leur orchestration US,
+`--learning-diagnostics` ajoute une trace optionnelle des pertes, positions et
+normes de gradients par époque, sans changer l'optimizer ni la sélection du
+checkpoint. Les courbes absentes des anciens runs restent absentes. La mesure
+TRAIN pré-update avec dropout n'est pas directement comparable à la validation
+post-update en mode évaluation ; un probe dans les mêmes conditions reste à
+ajouter si ce diagnostic devient nécessaire. Il faut utiliser un nouveau dossier
+de run pour activer cette trace, sans tenter d'enrichir un ancien run signé via
+`--resume`.
+
+Les commandes et limites sont décrites dans
+[la documentation du diagnostic](../src/learning-diagnostics.md). Les artefacts
+FNSPID complets doivent être rapatriés du PC avant leur analyse offline sur le
+Mac. Cette étape ne lance ni benchmark de nouveaux réglages, ni attribution
+feature par feature, ni collecte LSE.
+
+### Résultats du diagnostic instrumenté
+
+Le [diagnostic GRU32 instrumenté](../benchmarks/gru-learning-diagnostics.md)
+est terminé : neuf entraînements, 547 époques, exports INNER/OUTER vérifiés,
+holdout fermé. L'optimisation fonctionne, mais les solutions de direction et
+d'amplitude restent très dépendantes des seeds. Les shorts ne sont pas interdits ;
+des épisodes durables mal orientés existent, notamment AAPL fold 2 seed 1.
+Un épisode conservant son signe peut comporter de nombreux resizings.
+
+Avant un nouveau chantier d'architecture, il faut préciser le contrat entre
+labels, loss et politique d'exécution. Le run utilise uniquement une loss
+financière : triple-barrier 10 ne force ni imitation Sell/Hold/Buy, ni TP/SL,
+ni liquidation après dix séances. Objectif hybride supervisé/financier,
+sélectivité des événements et état de position causal sont des pistes distinctes,
+pas des implémentations acquises. Les sorties/réentrées doivent être testées
+ensemble, en tenant compte des [ablations déjà faites](../benchmarks/trading-exit-ablation.md).
+Les comparaisons Sharpe/combiné et d'exposition existent déjà ; aucune grille
+générique supplémentaire n'est nécessaire pour redécouvrir leurs compromis.
+
+## Importance des features et données LSE
+
+Les ablations de familles et le test cap32/64 existent ; une attribution
+financière systématique feature par feature, notamment par régime, reste à faire.
+Le runner multimodal classe par variance TRAIN et filtre les corrélations.
+Ce classement et les poids d'un gate ne sont pas des pourcentages de score expliqué.
+Le module `backtest/lib.py` calcule déjà des importances par permutation sur
+l'AUC d'un arbre auxiliaire de scoring des trades. Ce n'est pas une attribution
+du PnL/Sharpe aux entrées du GRU ou du GNN, ni une validation PIT de ces entrées.
+
+Il est pertinent de réserver l'étude complète à l'intégration LSE, après audit
+de `available_at`, couverture et révisions. Préparer une interface modulaire
+maintenant ne nécessite ni collecte immédiate ni grosse grille d'attribution.
+
+- Commencer par les familles pour mesurer leur apport net et leurs interactions.
+- Mesurer ensuite la baisse de PnL/Sharpe après permutation temporelle par blocs
+  sur un modèle figé, avec groupes de features corrélées ; un mélange ligne par
+  ligne casserait l'autocorrélation et les relations entre actions.
+- Confirmer les retraits importants par réentraînement apparié : dépendance du
+  modèle à une feature et utilité après réapprentissage ne sont pas équivalentes.
+- Rapporter stabilité par fold, seed, secteur et régime défini avec données connues
+  au moment de décision. Choisir les features sur validation interne uniquement.
+
+Il n'existe pas de décomposition naturelle additive « featureX explique 12 % du
+Sharpe ». Utiliser des deltas de score et des incertitudes, pas un classement
+universel. Ajouter des données ou changer le modèle peut modifier les interactions :
+l'importance devra alors être recalculée, même si l'outil d'analyse est réutilisable.

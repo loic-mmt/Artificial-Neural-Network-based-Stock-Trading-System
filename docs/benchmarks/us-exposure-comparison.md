@@ -39,6 +39,11 @@ Le constat reste similaire. La sensibilité par paires contre le GRU confirme au
 
 ## Ce que je garde pour les prochains benchmarks
 
+Les décisions ci-dessous décrivent la suite du diagnostic historique. Le test
+32/64 prévu au point4 est désormais terminé : [108/108 tâches et résultats](us-feature-gate-interaction.md).
+Cap 32 et gate désactivé restent la configuration de travail ; ne pas relancer
+la grille pour combler les anciens statuts périmés.
+
 1. Conserver le GRU comme contrôle principal de Sharpe et de risque, sans le présenter comme gagnant du PnL.
 2. Conserver `identity` comme contrôle obligatoire du GNN. Le résiduel ne gagne que +0,14 point de rendement contre lui en exposition moyenne commune, avec un Sharpe inférieur. En exposition quotidienne commune : +0,31 point et +0,005 de Sharpe ; le gain de Sharpe n'est positif que dans un fold sur trois. Pas de gain relationnel stable démontré.
 3. Retenir `rolling_residual_topk` comme candidat exploratoire pour la suite, pas comme vainqueur confirmé. Garder `rolling_topk` comme sensibilité, sans grosse grille de profondeurs à ce stade.

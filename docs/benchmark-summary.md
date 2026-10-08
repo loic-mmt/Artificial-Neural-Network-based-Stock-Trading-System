@@ -1,6 +1,6 @@
 # Résumé des benchmarks
 
-Mise à jour : 7 octobre 2026. Je garde ici les grandes lignes et les décisions. Chaque fiche liée contient les résultats détaillés, le protocole, les limites et les sources.
+Mise à jour : 8 octobre 2026. Je garde ici les grandes lignes et les décisions. Chaque fiche liée contient les résultats détaillés, le protocole, les limites et les sources.
 
 ## Ce que je retiens
 
@@ -8,7 +8,7 @@ Une bonne accuracy ne garantit pas un bon PnL. Le backtest des labels utilise un
 
 Ma référence GRU reste compacte : une couche, hidden size 32, attention temporelle, tête linéaire, contexte 60, sélection train-only de 32 features et weight decay `1e-5`. Je garde Sharpe comme objectif de risque et la combinaison PnL/Sharpe à 0,25 comme variante plus offensive. Les 32 features d'entrée ne sont pas les 32 unités cachées.
 
-Sur l'US, le GRU reste le contrôle de risque, `identity` le contrôle obligatoire et le GNN résiduel une piste exploratoire. Le gain relationnel n'est pas démontré. Le gate Transformer actuel ne devient pas le réglage par défaut. Je teste ensuite son interaction avec 32/64 features sur un pool commun réentraîné, avec `identity_market` aux deux caps pour contrôler gate et capacité sans relations. Les résultats restent en attente.
+Sur l'US historique, le GRU reste le contrôle de risque, `identity` le contrôle obligatoire et le GNN résiduel une piste exploratoire. Le test 32/64 sur le pool commun réentraîné est maintenant terminé : 108/108 runs, `identity_market` compris. Le cap32 est conservé ; 64 dégrade le Sharpe moyen GRU/GNN, les interactions features/gate sont négatives et le petit gain d'identité64 n'est pas stable entre contrôles d'exposition. Identité32 avec marché est un challenger fragile, pas un nouveau défaut. Le GRU reste une référence temporelle, mais n'est pas le meilleur score de cette nouvelle grille. Ni gain relationnel ni avantage généralisable du gate ne sont démontrés.
 
 Sur FNSPID, l'inventaire des 143 actions retient 53 titres selon la disponibilité du premier TRAIN, sans classement de PnL. Les 81 entraînements et cinq permutations ne démontrent pas d'avantage robuste de la polarité FinBERT. Le neutralisé améliore la moyenne, mais surtout grâce à deux runs seed 7 et à des changements d'exposition. Je ne le retiens pas comme vainqueur validé ; le holdout reste fermé et la disponibilité historique des news n'est pas prouvée.
 
@@ -78,7 +78,8 @@ Protocole : [GRU optim](benchmarks/gru-optim/README.md). Numérotation indépend
 | --- | --- | --- |
 | 72 entraînements, 143 actions | Plus de rendement brut GNN, mais plus d'exposition. GRU meilleur Sharpe moyen. | [US](benchmarks/us-relational-market-benchmark.md) |
 | Exposition égale | Le gain de rendement GNN persiste, mais identité fait presque aussi bien. Pas d'alpha relationnel démontré. | [Comparaison](benchmarks/us-exposure-comparison.md) |
-| Interaction features/gate | Prêt, sans résultats locaux. 12 variantes, 108 entraînements maximum ; `identity` et `identity_market` aux caps 32/64, sur le même pool réentraîné. | [Statut](benchmarks/us-feature-gate-interaction.md) |
+| Interaction features/gate | 108/108 terminés. Cap32 conservé, gate désactivé par défaut ; identité32 + marché challenger fragile. Pas d'avantage relationnel stable. | [Résultats](benchmarks/us-feature-gate-interaction.md) |
+| Diagnostic GRU32 avec traces | 9/9 terminés. Optimisation numérique fonctionne, mais solutions très dépendantes des seeds. Shorts présents ; AAPL reste short environ trois ans dans un checkpoint. Loss financière sans imitation des labels ni sortie triple-barrier imposée. | [Diagnostic](benchmarks/gru-learning-diagnostics.md) |
 
 ## Sentiment news
 

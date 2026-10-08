@@ -101,11 +101,15 @@ une sélection des meilleures 32 parmi elles par le Transformer.
 
 ## Décision
 
-Je garde GRU comme contrôle principal de risque, identité comme contrôle
-obligatoire, top-k résiduel comme challenger exploratoire et top-k brut comme
-sensibilité. Le gate marché reste désactivé par défaut. Avant une grille de
-profondeurs ou une fusion, je compare les caps 32/64 et le gate sur un pool
-commun avec nouvelles baselines : [plan d'interaction](../plan/us-feature-gate-interaction.md).
+La décision historique conserve GRU comme contrôle principal de risque, identité
+comme contrôle obligatoire, top-k résiduel comme challenger et top-k brut comme
+sensibilité. Le gate marché reste désactivé par défaut. La comparaison 32/64
+sur pool commun avec nouvelles baselines est maintenant terminée :
+[résultats d'interaction](us-feature-gate-interaction.md), 108/108 tâches vérifiées.
+Elle conserve cap 32, sans gain stable des relations ou du gate. Identité32 avec
+marché reste un challenger fragile ; le classement du GRU historique ne doit
+pas être transféré à cette nouvelle grille. Le [plan d'interaction](../plan/us-feature-gate-interaction.md)
+garde les commandes de reproduction.
 
 L'[analyse normalisée](us-exposure-comparison.md) vérifie que le gain GNN ne
 vient pas seulement du gross, sans établir un alpha relationnel. Les anciens

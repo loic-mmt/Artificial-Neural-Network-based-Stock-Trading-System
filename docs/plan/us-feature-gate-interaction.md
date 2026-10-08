@@ -1,5 +1,11 @@
 # Benchmark US : interaction features et gate marché
 
+Statut au 8 octobre 2026 : **108/108 entraînements terminés et vérifiés**, rapports
+appariés et contrôles d'exposition disponibles. La [fiche de résultats](../benchmarks/us-feature-gate-interaction.md)
+fixe la conclusion exploratoire : cap32, gate désactivé par défaut, identité
+obligatoire ; `identity_market32` reste un challenger fragile. Les commandes
+ci-dessous décrivent une reproduction, pas un run restant à terminer.
+
 ## Ce que l'on teste
 
 Je teste si le gate guidé par le Transformer aide à exploiter davantage de features, indépendamment pour le GRU, le GNN `rolling_residual_topk` et le GNN identité sans relations. Ce graphe résiduel reste un challenger exploratoire, pas un vainqueur confirmé.
@@ -15,7 +21,10 @@ Je teste si le gate guidé par le Transformer aide à exploiter davantage de fea
 
 Je conserve six candidats par cap : `gru`, `gru_market`, `rolling_residual_topk`, `rolling_residual_topk_market`, `identity` et `identity_market`. Budget maximal : **12 variantes × 3 folds × 3 seeds = 108 entraînements**. L'ancienne grille de dix variantes prévoyait 90 entraînements ; ce budget historique est remplacé par 108. Les checkpoints historiques de schéma 1 ne sont pas réutilisés : le replay précédent valide leurs métriques, pas une provenance absente. Une référence de schéma 2 n'est réutilisée que si sa signature et ses fichiers correspondent exactement.
 
-Les résultats de cette grille restent en attente. Je n'ai lancé aucun entraînement pour ajouter ce contrôle.
+Les 54 tâches par cap sont complètes, y compris les 18 tâches `identity_market`.
+Aucun export requis ne manque et le holdout reste fermé. Les diagnostics détaillés
+des poids du gate ne sont pas encore produits ; ils sont séparés de la complétude
+des entraînements et de la comparaison financière.
 
 Le même pool `technical,market,sector` est utilisé dans toutes les variantes. Le benchmark historique utilisait effectivement `technical,sector`. Les deux baselines sont donc réentraînées sur le pool prospectif commun : ne pas comparer le nouveau cap 64 à l'ancien cap 32 pour attribuer un effet aux seules features supplémentaires.
 
@@ -86,7 +95,13 @@ Aucune position manquante ne devient artificiellement FLAT. Égaliser le gross n
 
 Le Sharpe net ordinaire est invariant à une réduction constante positive des positions lorsque les coûts sont linéaires. Le Sharpe régularisé avec epsilon fixe ne l'est pas : son changement après normalisation ne représente pas nécessairement un changement de qualité du signal. Le score brut signé reste le critère primaire ; les normalisations sont des contrôles descriptifs.
 
-Je compare `identity_market` à `identity` aux caps 32 et 64, par fold/seed, pour mesurer l'effet du gate et de sa capacité supplémentaire sans relations entre actions. Je compare aussi le GNN résiduel à l'identité, avec et sans gate, au même cap : ces contrôles appariés aident à distinguer capacité, gate et relations. Une interaction positive du GNN résiduel, même avec ces contrôles, n'est pas une preuve d'alpha relationnel. Les résultats restent à produire, et les diagnostics détaillés des poids du gate et les nouvelles profondeurs restent des étapes distinctes.
+Les comparaisons `identity_market` contre `identity`, puis GNN résiduel contre
+identité au même cap et état du gate, sont produites par fold/seed. Les neuf
+interactions moyennes de Sharpe, trois branches et trois méthodes d'exposition,
+sont négatives. Le gate ne rend pas le passage à64 intéressant dans ce protocole.
+Les diagnostics détaillés de ses poids, les nouvelles profondeurs et l'attribution
+individuelle des features restent des étapes distinctes. Il ne faut pas confondre
+variance TRAIN, poids d'un gate et contribution financière d'une feature.
 
 Pour recalculer uniquement le rapport après un entraînement terminé :
 
