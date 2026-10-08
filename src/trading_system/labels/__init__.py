@@ -15,6 +15,10 @@ from .forward_return import (
     build_forward_return_labels,
     build_forward_return_labels_by_ticker,
 )
+from .intraday_return import (
+    build_intraday_return_label_result,
+    build_intraday_return_labels,
+)
 from .registry import (
     LabelContext,
     LabelRegistry,
@@ -62,6 +66,8 @@ __all__ = [
     "build_forward_return_label_result",
     "build_forward_return_labels",
     "build_forward_return_labels_by_ticker",
+    "build_intraday_return_label_result",
+    "build_intraday_return_labels",
     "build_persistent_positions",
     "build_triple_barrier_label_result",
     "build_volatility_position_label_result",

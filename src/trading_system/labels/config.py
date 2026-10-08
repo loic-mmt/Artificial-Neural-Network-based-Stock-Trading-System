@@ -100,6 +100,20 @@ class LabelConfig:
         )
 
     @classmethod
+    def intraday_return(
+        cls,
+        *,
+        objective: LabelObjective = "absolute_return",
+    ) -> "LabelConfig":
+        """Retrospective session direction using raw open and close prices."""
+
+        return cls(
+            method="intraday_return",
+            objective=objective,
+            semantics="target_position",
+        )
+
+    @classmethod
     def volatility_position(
         cls,
         *,

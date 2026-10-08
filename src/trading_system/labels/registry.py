@@ -119,12 +119,14 @@ class LabelRegistry:
 def create_default_label_registry() -> LabelRegistry:
     from .breakout import build_breakout_label_result
     from .forward_return import build_forward_return_label_result
+    from .intraday_return import build_intraday_return_label_result
     from .triple_barrier import build_triple_barrier_label_result
     from .volatility_position import build_volatility_position_label_result
 
     registry = LabelRegistry()
     registry.register("breakout", build_breakout_label_result)
     registry.register("forward_return", build_forward_return_label_result)
+    registry.register("intraday_return", build_intraday_return_label_result)
     registry.register("triple_barrier", build_triple_barrier_label_result)
     registry.register("volatility_position", build_volatility_position_label_result)
     return registry

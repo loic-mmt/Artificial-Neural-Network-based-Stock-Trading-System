@@ -18,6 +18,7 @@ FeatureSet = Literal["technical", "market", "expanded"]
 LabelMode = Literal[
     "breakout",
     "forward_return",
+    "intraday_return",
     "triple_barrier",
     "volatility_position",
     "oracle_train_only",
@@ -145,6 +146,7 @@ class ExperimentConfig:
         if self.label_mode not in (
             "breakout",
             "forward_return",
+            "intraday_return",
             "triple_barrier",
             "volatility_position",
             "oracle_train_only",
@@ -289,6 +291,8 @@ class ExperimentConfig:
                 buy_threshold=self.forward_buy_threshold,
                 sell_threshold=self.forward_sell_threshold,
             )
+        if self.label_mode == "intraday_return":
+            return LabelConfig.intraday_return()
         if self.label_mode == "volatility_position":
             return LabelConfig.volatility_position(
                 horizon=self.volatility_horizon,

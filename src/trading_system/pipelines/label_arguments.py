@@ -10,6 +10,7 @@ from trading_system.labels.triple_barrier import VOLATILITY_ESTIMATORS
 _CLI_TO_INTERNAL = {
     "breakout": "breakout",
     "forward-return": "forward_return",
+    "intraday-return": "intraday_return",
     "triple-barrier": "triple_barrier",
     "volatility-position": "volatility_position",
     "oracle-train-only": "oracle_train_only",

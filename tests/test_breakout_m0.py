@@ -96,6 +96,7 @@ def test_breakout_registry_returns_standard_contract():
     assert registry.names() == (
         "breakout",
         "forward_return",
+        "intraday_return",
         "triple_barrier",
         "volatility_position",
     )
