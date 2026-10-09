@@ -14,5 +14,6 @@ Je conserve ici les hypothèses, l'ordre d'implémentation et les protocoles de 
 | StockMixer après l'open | [Protocole 12](stock-mixer-post-open.md) | Terminé ; [résultats](../benchmarks/gru-optim/12-stock-mixer.md). |
 | Débruitage après l'open | [Protocole 13](denoising-post-open.md) | Terminé ; [résultats](../benchmarks/gru-optim/13-denoising.md). |
 | Reset par attention | [Protocole 14](attention-reset-post-open.md) | Terminé ; [résultats](../benchmarks/gru-optim/14-attention-reset.md). |
+| États de trade et de portefeuille | [S0-S3 overnight](trade-state-overnight.md) | Runner disponible ; CE volatilité et PnL/Sharpe 0,25, états détachés. Grille : 72 entraînements, 144 trajectoires. Résultats complets à produire. |
 
 Les anciens plans dans `papers/old_docs/` restent des archives, pas une feuille de route actuelle. Je conserve leur contenu et leur emplacement.
