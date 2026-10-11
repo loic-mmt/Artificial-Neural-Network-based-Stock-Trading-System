@@ -1,4 +1,4 @@
-"""Closed-loop detached-state rollouts and one full-path update per epoch."""
+"""Closed-loop trade-state training, with one full-path update per epoch."""
 
 from dataclasses import asdict, dataclass
 from time import perf_counter
@@ -21,6 +21,7 @@ class TradeStateRollout:
     states: np.ndarray
     raw_states: np.ndarray
     net_returns: np.ndarray
+    embeddings: np.ndarray | None = None
 
 
 def chronological_batches(panel, batch_size):
@@ -31,11 +32,13 @@ def chronological_batches(panel, batch_size):
             yield day, selected, panel.indices[selected, day]
 
 
-def rollout_trade_state_model(model, X, panel, *, state_config=None, loss_config, decoder="continuous"):
+def rollout_trade_state_model(model, X, panel, *, state_config=None, loss_config, decoder="continuous",
+                              cache_embeddings=False):
     """Fresh book each call; all assets observe the same pre-decision snapshot.
 
     The caller controls train/eval mode. Returned NumPy states carry no graph.
-    They are replayed unchanged during backward, with frozen model weights.
+    Detached training replays these states unchanged. TBPTT separately rebuilds
+    the continuous state graph from optional encoder embeddings.
     """
     if not isinstance(model, TradeStateGRUClassifier):
         raise TypeError("Closed-loop rollouts require TradeStateGRUClassifier.")
@@ -93,13 +96,14 @@ def rollout_trade_state_model(model, X, panel, *, state_config=None, loss_config
     expected = panel.path(positions, loss_config)[0]
     if not np.allclose(net, expected, rtol=1e-10, atol=1e-12):
         raise RuntimeError("State book and financial execution paths disagree.")
-    return TradeStateRollout(probabilities, log_probabilities, positions, states, raw, net)
+    return TradeStateRollout(probabilities, log_probabilities, positions, states, raw, net,
+                             embeddings if cache_embeddings else None)
 
 
 def fit_trade_state_model(model, X_train, y_train, known_train, X_val, y_val, known_val,
                           *, objective, train_panel, val_panel, loss_config,
-                          state_config=None, progress_callback=None):
-    """Semi-gradient training: exact current-decision gradients, detached history.
+                          state_config=None, progress_callback=None, tbptt_steps=None):
+    """Detached semi-gradients or partial truncated state-history gradients.
 
     Positions are continuous during both objective families' training. CE uses
     TRAIN-only class weights; the financial objective never consumes labels.
@@ -113,6 +117,13 @@ def fit_trade_state_model(model, X_train, y_train, known_train, X_val, y_val, kn
     if loss_config.objective == "cross_entropy":
         raise ValueError("A financial config is needed to simulate execution costs in every family.")
     state_config = state_config or TradeStateConfig()
+    temporal = state_config.gradient_mode == "tbptt"
+    if temporal and (isinstance(tbptt_steps, bool) or not isinstance(tbptt_steps, int) or tbptt_steps < 1):
+        raise ValueError("TBPTT requires a positive session window.")
+    if not temporal and tbptt_steps is not None:
+        raise ValueError("Detached training does not accept a TBPTT window.")
+    if temporal and objective != "financial":
+        raise ValueError("This gradient study supports TBPTT for financial training only.")
     train, val = model._validate_sequences(X_train), model._validate_sequences(X_val)
     for panel, values in ((train_panel, train), (val_panel, val)):
         _validate_panel(panel, len(values), "panel")
@@ -129,8 +140,9 @@ def fit_trade_state_model(model, X_train, y_train, known_train, X_val, y_val, kn
     class_weights = None if weights is None else torch.as_tensor(weights, dtype=torch.float32, device=device)
     denominators = None if weights is None else [float(weights[y[m]].sum(dtype=np.float64)) for y, m in supervised]
 
-    def objective_pass(values, split, panel):
-        rollout = rollout_trade_state_model(model, values, panel, state_config=state_config, loss_config=loss_config)
+    def objective_pass(values, split, panel, *, retain_embeddings=False):
+        rollout = rollout_trade_state_model(model, values, panel, state_config=state_config,
+            loss_config=loss_config, cache_embeddings=retain_embeddings)
         if use_ce:
             y, known = supervised[split]
             ce = float(-np.sum(rollout.log_probabilities[known, y[known]] * weights[y[known]], dtype=np.float64)
@@ -151,14 +163,27 @@ def fit_trade_state_model(model, X_train, y_train, known_train, X_val, y_val, kn
         epoch_seed = (config.seed + epoch + 1) % (2**32)
         module.train()
         seed_torch_run(epoch_seed, config.deterministic, torch)
-        before, financial_gradient, cached = objective_pass(train, 0, train_panel)
+        before, financial_gradient, cached = objective_pass(train, 0, train_panel, retain_embeddings=temporal)
         optimizer.zero_grad(set_to_none=True)
+        replay_diagnostics = {}
+        embedding_gradient = None
+        if temporal:
+            from trading_system.training.trade_state_gradients import state_history_vjp
+
+            embedding_gradient, head_gradients, replay_diagnostics = state_history_vjp(
+                model, train_panel, cached, financial_gradient, state_config, loss_config, tbptt_steps)
+            for parameter, gradient in zip((module.head.weight, module.head.bias), head_gradients):
+                parameter.grad = gradient.to(device=parameter.device, dtype=parameter.dtype)
         # Identical encoder block shapes, dropout stream and frozen weights;
         # cached states already follow the chronological book. The linear head
         # has no stochastic operations, so replay can batch across sessions.
         seed_torch_run(epoch_seed, config.deterministic, torch)
         for start in range(0, len(train), config.batch_size):
             rows = np.arange(start, min(start + config.batch_size, len(train)))
+            if temporal:
+                embedding = module.encoder.encode(torch.as_tensor(train[rows], device=device))
+                embedding.backward(torch.as_tensor(embedding_gradient[rows], device=device))
+                continue
             logits = module(torch.as_tensor(train[rows], device=device),
                             torch.as_tensor(cached.states[rows], device=device))
             if use_ce:
@@ -176,6 +201,7 @@ def fit_trade_state_model(model, X_train, y_train, known_train, X_val, y_val, kn
                 q = p[:, 2] - p[:, 0]
                 q.backward(torch.as_tensor(financial_gradient[rows], dtype=q.dtype, device=device))
         del cached
+        del embedding_gradient
         gradients = [p.grad for p in parameters if p.grad is not None]
         if not gradients or any(not bool(torch.isfinite(g).all()) for g in gradients):
             raise FloatingPointError("Missing/non-finite trade-state gradients.")
@@ -201,7 +227,7 @@ def fit_trade_state_model(model, X_train, y_train, known_train, X_val, y_val, kn
             "weighted_ce_gradient_norm": norm if use_ce else None,
             "weighted_financial_gradient_norm": None if use_ce else norm,
             "combined_gradient_norm_preclip": norm, "best_epoch": best_epoch, "stale_epochs": stale,
-            "duration_seconds": float(perf_counter() - epoch_started)}
+            "duration_seconds": float(perf_counter() - epoch_started), **replay_diagnostics}
         trace.append(record)
         if progress_callback is not None:
             progress_callback(record)
@@ -228,6 +254,10 @@ def fit_trade_state_model(model, X_train, y_train, known_train, X_val, y_val, kn
         "class_weights": None if weights is None else weights.astype(float).tolist(),
         "class_counts": None if not use_ce else np.bincount(supervised[0][0][supervised[0][1]], minlength=3).tolist(),
         "financial_loss_config": asdict(loss_config) if not use_ce else None,
-        "book_reset": "cash_at_each_partition", "gradient_contract": "current_decision_only_detached_state_history",
+        "book_reset": "cash_at_each_partition", "state_gradient_mode": state_config.gradient_mode,
+        "tbptt_steps": tbptt_steps,
+        "gradient_contract": ("partial_tbptt_continuous_state_history" if temporal
+                              else "current_decision_only_detached_state_history"),
+        "discrete_state_events": "non_differentiable_sign_resets_entry_anchors_ages_underwater",
         "trace": trace}
     return result

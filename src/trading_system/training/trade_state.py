@@ -24,10 +24,14 @@ class TradeStateConfig:
     def __post_init__(self):
         if self.variant not in STATE_VARIANTS:
             raise ValueError("variant must be S0, S1, S2 or S3.")
-        if self.gradient_mode != "detached":
-            raise ValueError("Only detached states are implemented; TBPTT is a later benchmark.")
+        if self.gradient_mode not in ("detached", "tbptt"):
+            raise ValueError("State gradient mode must be detached or tbptt.")
         if any(not np.isfinite(v) or v <= 0 for v in (self.return_scale, self.age_scale)):
             raise ValueError("State return/age scales must be finite and positive.")
+
+    @property
+    def active_width(self):
+        return _WIDTH[self.variant]
 
     def encode(self, observations):
         values = np.asarray(observations, dtype=np.float64)

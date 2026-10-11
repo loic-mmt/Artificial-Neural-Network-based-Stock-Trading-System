@@ -39,6 +39,8 @@ class TradeStateBenchmarkConfig(LabelLossBenchmarkConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.state_gradient_mode != "detached":
+            raise ValueError("The S0-S3 study freezes detached states; use the gradient study for TBPTT.")
         if self.label_methods != ("volatility_position",) or self.protocols != ("overnight",):
             raise ValueError("S0-S3 freezes volatility_position labels and overnight execution.")
         if set(self.families) - {"cross_entropy", "financial"} or set(self.decoders) - {"continuous", "sign"}:
@@ -51,12 +53,23 @@ class TradeStateBenchmarkConfig(LabelLossBenchmarkConfig):
     def state_config(self, variant):
         return TradeStateConfig(variant, self.state_return_scale, self.state_age_scale, self.state_gradient_mode)
 
+    def state_config_for_candidate(self, candidate):
+        return TradeStateConfig(candidate["state_variant"], self.state_return_scale, self.state_age_scale,
+                                candidate.get("state_gradient_mode", self.state_gradient_mode))
+
+    @property
+    def schema_version(self):
+        return "trade_state_v1"
+
+    def candidates(self):
+        return [{"candidate": f"{family}-{variant}", "family": family, "state_variant": variant,
+                 "label_method": "volatility_position" if family == "cross_entropy" else None,
+                 "training_protocol": "overnight"}
+                for family in self.families for variant in self.state_variants]
+
 
 def candidate_grid(config):
-    return [{"candidate": f"{family}-{variant}", "family": family, "state_variant": variant,
-             "label_method": "volatility_position" if family == "cross_entropy" else None,
-             "training_protocol": "overnight"}
-            for family in config.families for variant in config.state_variants]
+    return config.candidates()
 
 
 def benchmark_counts(config):
@@ -73,7 +86,7 @@ def _evaluate_fit(model, parts, panels, supervision, candidate, fold, seed, conf
         decoders = config.decoders if phase == "outer" else ("continuous",)
         for decoder in decoders:
             rolled = rollout_trade_state_model(model, parts[phase]["X"], panels[phase],
-                state_config=config.state_config(candidate["state_variant"]),
+                state_config=config.state_config_for_candidate(candidate),
                 loss_config=config.financial_config(), decoder=decoder)
             identity = {**candidate, "fold": fold, "seed": seed, "protocol": "overnight", "decoder": decoder}
             target = supervision[phase]
@@ -135,7 +148,9 @@ def run_trade_state_benchmark(frame, tickers, destination, *, config=None, resum
     folds = calendar_folds(work, config)
     selected = [f for f in folds if config.folds is None or f["fold"] in config.folds]
     provenance = runtime_provenance()
-    identity = {"schema_version": "trade_state_v1", "config": asdict(config), "tickers": list(tickers),
+    gradient_modes = sorted({row.get("state_gradient_mode", config.state_gradient_mode) for row in candidate_grid(config)})
+    gradient_mode = gradient_modes[0] if len(gradient_modes) == 1 else "mixed"
+    identity = {"schema_version": config.schema_version, "config": asdict(config), "tickers": list(tickers),
         "development_sha256": hash_dataframe(work), "source_sha256": provenance["source_sha256"],
         "packages": provenance["runtime"]["packages"], "folds": folds,
         "cuda_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG") if config.device in ("auto", "cuda") else None}
@@ -150,7 +165,8 @@ def run_trade_state_benchmark(frame, tickers, destination, *, config=None, resum
         root.mkdir(parents=True, exist_ok=True)
         atomic_write_json(metadata_path, _json_safe({**identity, "identity_sha256": digest,
             "runtime": provenance["runtime"], "counts": benchmark_counts(config),
-            "state_columns": STATE_COLUMNS, "state_gradient_mode": "detached",
+            "state_columns": STATE_COLUMNS, "state_gradient_mode": gradient_mode,
+            "state_gradient_modes": gradient_modes, "candidates": candidate_grid(config),
             "state_reset": "cash_at_each_train_inner_outer_partition_and_each_decoder",
             "feature_contract": "J-1 market window + gap_open J; current state outside temporal window",
             "execution": "open_J_to_open_J_plus_1_proxy; five bps per side by default",
@@ -210,8 +226,8 @@ def run_trade_state_benchmark(frame, tickers, destination, *, config=None, resum
                             train_target._label_known.to_numpy(dtype=bool), parts["inner"]["X"],
                             inner_target.Label_id.to_numpy(), inner_target._label_known.to_numpy(dtype=bool),
                             objective=candidate["family"], train_panel=panels["train"], val_panel=panels["inner"],
-                            loss_config=config.financial_config(), state_config=config.state_config(candidate["state_variant"]),
-                            progress_callback=epoch_progress)
+                            loss_config=config.financial_config(), state_config=config.state_config_for_candidate(candidate),
+                            progress_callback=epoch_progress, tbptt_steps=candidate.get("tbptt_steps"))
                         # Persist selected weights before any OUTER reporting.
                         atomic_torch_save(directory / "checkpoint.pt", model.state_dict())
                         atomic_write_json(directory / "learning_diagnostics.json", _json_safe(model.learning_diagnostics_))
@@ -221,7 +237,7 @@ def run_trade_state_benchmark(frame, tickers, destination, *, config=None, resum
                         evaluations = _evaluate_fit(model, parts, panels, supervision, candidate,
                             fold["fold"], seed, config, directory, plots)
                         atomic_write_json(directory / "fit.json", _json_safe({**candidate,
-                            "fold": fold["fold"], "seed": seed, "state_config": asdict(config.state_config(candidate["state_variant"])),
+                            "fold": fold["fold"], "seed": seed, "state_config": asdict(config.state_config_for_candidate(candidate)),
                             "best_epoch": fit.best_epoch, "stop_reason": fit.stop_reason,
                             "epochs_ran": len(fit.history.train_loss), "training_duration_seconds": fit.training_duration_seconds,
                             "parameter_count": fit.parameter_count, "device": fit.device,
@@ -242,7 +258,9 @@ def run_trade_state_benchmark(frame, tickers, destination, *, config=None, resum
     table = pd.DataFrame(results)
     metrics = ["net_return", "net_pnl", "net_sharpe", "regularized_sharpe", "max_drawdown",
                "mean_abs_position", "turnover", "outperformance_vs_always_long", "outperformance_vs_exposure_matched_long"]
-    aggregate = table.groupby(["candidate", "family", "state_variant", "protocol", "decoder"])[metrics].agg(["count", "mean", "std", "min", "max"])
+    groups = ["candidate", "family", "state_variant", "protocol", "decoder"]
+    groups += [col for col in ("state_gradient_mode", "tbptt_steps") if col in table]
+    aggregate = table.groupby(groups, dropna=False)[metrics].agg(["count", "mean", "std", "min", "max"])
     aggregate.columns = [f"{metric}_{stat}" for metric, stat in aggregate.columns]
     _write_table(root / "summary.csv", aggregate.reset_index())
     classification = pd.concat([pd.read_csv(root / directory / "classification.csv").assign(fit_directory=directory)
@@ -251,6 +269,6 @@ def run_trade_state_benchmark(frame, tickers, destination, *, config=None, resum
     report = {"identity_sha256": digest, "counts": benchmark_counts(config),
         "completed_fits": int(table.fit_directory.nunique()), "completed_evaluation_paths": len(results),
         "opposition_comparisons": len(opposition), "final_holdout_opened": False,
-        "selection_performed_on_outer": False, "state_gradient_mode": "detached"}
+        "selection_performed_on_outer": False, "state_gradient_mode": gradient_mode}
     atomic_write_json(root / "report.json", report)
     return report
