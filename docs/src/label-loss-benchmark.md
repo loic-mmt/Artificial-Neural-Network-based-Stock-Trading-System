@@ -2,6 +2,9 @@
 
 Le [plan](../plan/plan-benchmark-labels.md) fixe les questions. Ce guide décrit le runner dédié, ses commandes et ses limites. Aucun comportement des anciens benchmarks n'est remplacé.
 
+Les résultats des 99 entraînements et 378 trajectoires sont documentés dans
+[la fiche du benchmark US post-open](../benchmarks/us-label-loss-post-open.md).
+
 ## Vérifier la grille sans entraînement
 
 ```shell

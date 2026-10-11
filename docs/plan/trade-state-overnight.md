@@ -1,5 +1,9 @@
 # Benchmark des états de trade et de portefeuille
 
+Statut au 11 octobre 2026 : les 72 entraînements et 144 trajectoires sont
+terminés. Les [résultats et conclusions](../benchmarks/us-trade-state-overnight.md)
+fixent la suite : gradients d'état, puis décisions short spécialisées.
+
 ## Question
 
 Il faut vérifier si les informations sur les positions déjà prises améliorent les décisions du GRU. Le benchmark précédent ne permet pas de conclure que leur absence explique, à elle seule, les shorts prolongés sur AAPL.
@@ -31,13 +35,19 @@ Les deux familles s'entraînent avec des positions continues. Le continu est l'�
 
 Tous les états sont détachés. Les paramètres du GRU et de la tête restent entraînables. La loss financière reçoit la trajectoire complète et les coûts de turnover, avec une seule update AdamW par époque. Les conséquences d'une décision sur les états futurs sont exclues du gradient : c'est un semi-gradient, pas une différentiation complète du portefeuille.
 
-Il faut tester le détachement contre une autre méthode, par exemple TBPTT, dans un benchmark ultérieur. Cette comparaison n'est pas implémentée ici.
+La comparaison avec TBPTT est maintenant disponible dans un
+[benchmark distinct](trade-state-gradients.md), avec fenêtres 10/40 et
+contrôles détachés. Elle n'est pas évaluée dans les résultats S0-S3.
 
 Les médianes, le scaler, la sélection des features et les poids CE utilisent TRAIN uniquement. Les checkpoints sont choisis sur la loss inner. Les folds outer servent au reporting et le holdout à partir du 22 juin 2023 reste fermé.
 
 Trois folds et seeds 1, 7, 19 donnent **72 entraînements et 144 trajectoires outer**, avec 300 époques maximum, patience 20. Il faut lire les seeds/folds ensemble, l'exposition, le turnover, les shorts prolongés et les pertes d'apprentissage avant de sélectionner une variante.
 
 ## Commande
+
+Ces commandes reproduisent le benchmark S0-S3 avec états détachés. Elles ne
+lancent pas la future comparaison des gradients ni les modèles spécialisés
+du [plan long/short](short-decision-benchmark.md).
 
 ```shell
 .venv/bin/python -u scripts/run_trade_state_benchmark.py \

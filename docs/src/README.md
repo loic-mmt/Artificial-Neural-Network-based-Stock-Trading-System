@@ -15,6 +15,7 @@ Je garde ici le fonctionnement du code. Les performances sont dans [benchmarks](
 - [Diagnostic des labels sans entraînement](label-diagnostics.md).
 - [Benchmark post-open des labels, CE et loss hybride](label-loss-benchmark.md).
 - [Benchmark overnight des états de trade et de portefeuille](trade-state-benchmark.md).
+- [Gradients temporels des états : détaché et TBPTT](trade-state-gradients.md).
 - [Optimisation mémoire](memory-optimization.md).
 - [Dashboard interactif des benchmarks et backtests](visualization.md).
 

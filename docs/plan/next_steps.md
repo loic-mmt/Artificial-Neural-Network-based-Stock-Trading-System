@@ -313,6 +313,27 @@ ensemble, en tenant compte des [ablations déjà faites](../benchmarks/trading-e
 Les comparaisons Sharpe/combiné et d'exposition existent déjà ; aucune grille
 générique supplémentaire n'est nécessaire pour redécouvrir leurs compromis.
 
+## Priorité apprentissage : états, gradients, puis shorts
+
+Le [benchmark S0-S3 overnight](../benchmarks/us-trade-state-overnight.md)
+est terminé : 72 entraînements et 144 trajectoires. La financière S3 gagne
+en rendement surtout par davantage d'exposition longue ; aucune trajectoire
+ne dépasse buy-and-hold en rendement. La CE au signe devient parfois instable
+et des shorts perdants persistent malgré les informations d'état.
+
+Il faut comparer les gradients d'état en premier, avec S0 et S3 financière
+comme contrôles et CE-S0 comme référence supervisée. Le gradient ne doit pas
+être confondu avec un changement de décodage, de budget ou d'exécution.
+Le [benchmark détaché/TBPTT](trade-state-gradients.md) est implémenté : fenêtres
+10/40, 45 fits et 90 trajectoires par défaut. Ses résultats restent à produire.
+
+Ensuite, il faut tester les trois pistes du
+[plan des décisions long/short](short-decision-benchmark.md) : détecteur Short
+avec Long par défaut, encodeur à deux têtes Long/Flat et Short/Flat, puis deux
+modèles séparés. Long/Flat reste un contrôle pour distinguer éviter une baisse
+de la shorter. Ces pistes ne sont pas encore implémentées ni benchmarkées ;
+le holdout reste fermé.
+
 ## Importance des features et données LSE
 
 Les ablations de familles et le test cap32/64 existent ; une attribution

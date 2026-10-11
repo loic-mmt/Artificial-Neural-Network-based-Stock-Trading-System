@@ -2,6 +2,10 @@
 
 Le [plan S0-S3](../plan/trade-state-overnight.md) fixe la grille. Le script `scripts/run_trade_state_benchmark.py` lance un runner isolé, sans remplacer les workflows historiques.
 
+La [comparaison des gradients](trade-state-gradients.md) utilise un autre
+script et un nouveau dossier. Le mode détaché documenté ici reste le contrôle
+historique ; l'extension TBPTT ne change pas les valeurs forward du livre.
+
 ## Modules
 
 - `training/trade_state.py` : livre overnight causal, observations, activation S0-S3, transformations fixes.

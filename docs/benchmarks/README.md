@@ -4,6 +4,8 @@ Le [résumé général](../benchmark-summary.md) sert de point d'entrée. Chaque
 
 - [Labels M0 à M3](label-methods.md).
 - [Qualité des cinq labels US, sans entraînement](label-quality-us.md).
+- [Labels, CE, financière et hybride US après l'open, 99 entraînements](us-label-loss-post-open.md).
+- [États de trade et de portefeuille S0-S3 en overnight, 72 entraînements](us-trade-state-overnight.md).
 - [Learning improvements, 01 à 23](learning/README.md).
 - [Optimisation GRU, 01 à 14](gru-optim/README.md).
 - [US GNN et marché](us-relational-market-benchmark.md), [exposition comparable](us-exposure-comparison.md), [interaction features/gate](us-feature-gate-interaction.md).
