@@ -321,18 +321,20 @@ en rendement surtout par davantage d'exposition longue ; aucune trajectoire
 ne dépasse buy-and-hold en rendement. La CE au signe devient parfois instable
 et des shorts perdants persistent malgré les informations d'état.
 
-Il faut comparer les gradients d'état en premier, avec S0 et S3 financière
-comme contrôles et CE-S0 comme référence supervisée. Le gradient ne doit pas
-être confondu avec un changement de décodage, de budget ou d'exécution.
-Le [benchmark détaché/TBPTT](trade-state-gradients.md) est implémenté : fenêtres
-10/40, 45 fits et 90 trajectoires par défaut. Ses résultats restent à produire.
+Le [benchmark détaché/TBPTT](trade-state-gradients.md) est terminé : fenêtres
+10/40, 45 fits et 90 trajectoires. Le petit gain moyen de TBPTT 40 n'est pas
+robuste entre périodes, celui de TBPTT 10 disparaît à exposition comparable.
+La financière S3 détachée reste la référence. TBPTT 40 reste exploratoire.
 
 Ensuite, il faut tester les trois pistes du
 [plan des décisions long/short](short-decision-benchmark.md) : détecteur Short
 avec Long par défaut, encodeur à deux têtes Long/Flat et Short/Flat, puis deux
 modèles séparés. Long/Flat reste un contrôle pour distinguer éviter une baisse
-de la shorter. Ces pistes ne sont pas encore implémentées ni benchmarkées ;
-le holdout reste fermé.
+de la shorter. Le runner est implémenté : CE binaire et financière PnL/Sharpe
+0,25, trois architectures, témoins, trois politiques et deux décodages.
+La grille donne 81 fits, 99 encodeurs et 486 trajectoires outer, plus des
+contre-factuels sur les mêmes alertes sans feedback. Le benchmark des shorts
+reste à lancer ; le holdout reste fermé.
 
 ## Importance des features et données LSE
 

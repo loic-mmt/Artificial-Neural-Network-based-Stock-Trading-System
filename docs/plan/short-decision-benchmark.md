@@ -1,7 +1,8 @@
 # Décisions long/short après le benchmark des gradients
 
-Plan retenu le 11 octobre 2026. Statut : hypothèses à tester après la comparaison
-des gradients d'état. Aucun nouveau modèle ni benchmark n'est implémenté ici.
+Plan retenu le 11 octobre 2026, recette fixée le 12 octobre 2026.
+Statut : architectures, runner, exports et tests implémentés. Le benchmark
+complet des shorts n'est pas lancé.
 
 ## Objectif et ordre
 
@@ -10,9 +11,10 @@ rendement de la financière surtout par davantage d'exposition longue. S3 au
 signe ressemble fortement à buy-and-hold, tout en restant sous son rendement.
 Des shorts perdants persistent malgré les informations d'état.
 
-Il faut d'abord lancer le [benchmark détaché/TBPTT](trade-state-gradients.md),
-dont le runner est prêt. Ensuite,
-il faut isoler la qualité des décisions short, sans changer en même temps
+Le [benchmark détaché/TBPTT](trade-state-gradients.md) est terminé : 45 fits et
+90 trajectoires. TBPTT 40 reste un challenger faible, TBPTT 10 n'apporte pas
+de gain robuste à exposition comparable. S3 détaché reste la référence.
+Il faut maintenant isoler la qualité des décisions short, sans changer en même temps
 features, labels, données, exécution et allocation.
 
 La priorité est de vérifier si les shorts gagnent sur les baisses et réduisent
@@ -42,6 +44,13 @@ alertes permet de séparer le gain d'évitement d'une baisse du gain du short.
 Un vrai portefeuille Short/Flat peut être évalué comme diagnostic distinct,
 sans le comparer au buy-and-hold uniquement sur son PnL brut.
 
+Le runner fournit deux comparaisons distinctes : une simulation indépendante
+en boucle fermée pour chaque politique, puis une projection des signaux
+Long/Short gelés, sans réévaluer le modèle. La première peut changer les
+alertes futures via les états. La seconde isole le remplacement du Short
+par Flat sur les mêmes signaux, mais ne représente pas une nouvelle politique
+avec feedback. Il ne faut pas mélanger ces deux contrôles.
+
 ### 2. Un encodeur, deux têtes Long/Flat et Short/Flat
 
 Tester un GRU partagé avec deux têtes indépendantes : une estime l'opportunité
@@ -59,6 +68,12 @@ tout en conservant une représentation de marché commune.
 Tester deux GRU indépendants, chacun avec ses propres paramètres : l'un pour
 Long/Flat, l'autre pour Short/Flat. Conserver la même politique d'arbitrage
 que dans le test à deux têtes pour isoler l'effet de la séparation des encodeurs.
+
+Les deux encodeurs ont des paramètres indépendants, mais leur loss financière
+est celle du portefeuille combiné. Ils partagent une update globale et un
+checkpoint choisi sur inner. Ce ne sont pas deux entraînements isolés dont
+les meilleurs checkpoints seraient assemblés après OUTER. En CE, les losses
+binaires normalisées sont moyennées, avec poids TRAIN distincts par tête.
 
 Le coût de calcul et le nombre de paramètres augmentent. Il faut les rapporter
 et distinguer gain de spécialisation et gain de capacité, sans annoncer un
@@ -86,12 +101,87 @@ est pertinent, mais leur recherche reste bornée et sélectionnée sur inner.
 Il ne faut pas choisir seulement les tickers ou seeds qui gagnent après lecture
 du backtest. Le holdout final reste fermé jusqu'au gel du protocole.
 
-## À fixer avant implémentation
+## Recette fixée avant OUTER
 
-La comparaison des gradients détermine d'abord la recette d'état de référence.
-Il faudra ensuite préciser les cibles des têtes binaires, la loss par branche,
-les seuils, l'arbitrage des conflits et la grille minimale. Le Flat d'un label
-et l'absence d'alerte d'un détecteur ne doivent pas être remappés implicitement.
+- Même GRU32, attention, tête linéaire, contexte 60 et cap32 ; mêmes 143
+  tickers, folds, seeds 1/7/19, allocation fixe `q/N`, coûts 5 bps par sens,
+  features achevées J-1 plus gap open J, exécution proxy open J vers open J+1.
+- États S3 détachés pour les architectures spécialisées et la référence
+  financière trois classes et le témoin CE-S3 apparié. Un témoin CE-S0 garde
+  aussi la référence supervisée historique. Aucun TBPTT, stop, durée maximale ou filtre
+  de régime ajouté.
+- Deux familles : `cross_entropy` binaire et financière PnL/Sharpe, poids
+  PnL 0,25. Pas d'hybride dans cette grille.
+- CE : cibles `volatility_position`, horizon 10. La tête Short apprend
+  `Short` contre `not-Short` : les labels Long et Flat connus sont négatifs.
+  La tête Long apprend `Long` contre `not-Long`. Les inconnus sont masqués,
+  jamais convertis en absence d'alerte connue. Les poids binaires viennent
+  de TRAIN uniquement. La référence CE conserve sa CE trois classes.
+- Financière : aucune supervision par les labels. Les activations bornées
+  commandent la position ; elles ne sont pas des probabilités calibrées.
+- En continu, le détecteur donne `q = 1 - 2 * score_short`. Les deux têtes
+  donnent `q = score_long - score_short`. Un désaccord atténue la position.
+  Long par défaut à taille entière est la politique binaire, pas ce continu.
+- Au décodage `sign`, seuils Long et Short fixés à 0,5, activation si
+  `score > seuil`. Détecteur : absence d'alerte donne +1, alerte donne -1.
+  Deux têtes : une seule active donne son côté ; aucune ou les deux actives
+  donnent Flat. Ce décodage spécialisé n'est pas simplement `sign(q)` pour
+  les deux têtes. Les témoins trois classes gardent leur signe historique.
+- `--conflict-policy margin` autorise une autre règle explicitement choisie
+  avant le run : le plus grand dépassement normalisé du seuil gagne ; égalité
+  donne Flat. Aucun seuil, conflit ou calibrateur sélectionné sur OUTER.
+- `long_flat = max(q, 0)` et `short_flat = min(q, 0)`, après le décodage choisi.
+  Le modèle n'est pas réentraîné pour chaque projection. Chaque simulation
+  fermée repart en cash et recalcule ses propres états.
+- Même plafond 300 époques, patience 20, une seule update AdamW par époque.
+  Le batch size reste une taille de bloc mémoire. Sélection des poids sur
+  inner uniquement ; holdout à partir du 22 juin 2023 exclu avant les features.
+- Régime descriptif : clôture ajustée J-1 comparée à sa moyenne de 200
+  cotations précédentes, par actif. Définition fixée, historique insuffisant
+  nommé `unknown`. Aucune modification des signaux selon ce régime.
+
+### Taille de la grille
+
+Trois architectures fois deux familles, plus financière S3, CE-S3 et CE-S0 témoins :
+**9 configurations, 81 fits, 99 encodeurs GRU entraînés**. Deux des neuf
+configurations entraînent chacune deux encodeurs, d'où la distinction.
+
+Trois politiques fois deux décodages donnent **486 trajectoires outer**.
+Les projections des mêmes alertes donnent en plus **324 contre-factuels**
+économiques sans entraînement ni nouvelle inférence. Ces contre-factuels
+ne comptent pas comme de nouvelles stratégies en boucle fermée.
+
+Avec `--families financial` : 36 fits, 45 encodeurs, 216 trajectoires et
+144 contre-factuels. Les architectures, politiques et décodages se
+sélectionnent séparément ; les témoins peuvent être retirés explicitement
+avec `--no-controls` pour un pilote, pas pour choisir le vainqueur.
+
+### Commande PC GPU
+
+```powershell
+python -u scripts/run_short_decision_benchmark.py --data data/processed/mt5_stocks_us_daily_clean.parquet --ticker-selection configs/benchmark/stocks_us_gnn_complete_2005.json --device cuda --output-dir artifacts/comparisons/us-short-decisions
+```
+
+Ajouter `--resume` à la même commande pour réutiliser les fits complets
+vérifiés par taille et SHA-256. Un fit interrompu repart de son initialisation.
+Il faut conserver sources, versions numériques, paramètres et données identiques.
+
+Pour inspecter la grille sans entraîner ni lire les prix :
+
+```shell
+.venv/bin/python scripts/run_short_decision_benchmark.py --dry-run
+```
+
+Pour vérifier CUDA sur un petit pilote, dans un dossier distinct :
+
+```powershell
+python -u scripts/run_short_decision_benchmark.py --tickers AAPL MSFT --start 2019-01-02 --end 2021-12-31 --cv-folds 1 --seeds 1 --epochs 1 --epoch-multiplier 1 --device cuda --no-plots --output-dir artifacts/comparisons/short-decisions-cuda-pilot
+```
+
+Les [exports et modules](../src/short-decision-benchmark.md) permettent de
+comparer les gains appariés, l'exposition, les erreurs d'alertes, les épisodes
+short prolongés, les régimes et le coût de calcul. Les alertes journalières
+et le taux de réussite des épisodes ne mesurent pas la même chose.
 
 Chaque piste doit être activable séparément. Pas de fusion implicite, de filtre
 de régime obligatoire ni de règle de sortie ajoutée silencieusement. Les frais

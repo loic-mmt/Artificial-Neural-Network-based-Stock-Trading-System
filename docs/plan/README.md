@@ -15,7 +15,7 @@ Je conserve ici les hypothèses, l'ordre d'implémentation et les protocoles de 
 | Débruitage après l'open | [Protocole 13](denoising-post-open.md) | Terminé ; [résultats](../benchmarks/gru-optim/13-denoising.md). |
 | Reset par attention | [Protocole 14](attention-reset-post-open.md) | Terminé ; [résultats](../benchmarks/gru-optim/14-attention-reset.md). |
 | États de trade et de portefeuille | [S0-S3 overnight](trade-state-overnight.md) | Terminé : 72 entraînements, 144 trajectoires ; [résultats](../benchmarks/us-trade-state-overnight.md). |
-| Gradients des états | [Détaché et TBPTT](trade-state-gradients.md) | Implémenté, non benchmarké : 45 fits, 90 trajectoires ; fenêtres 10/40 et contrôles S0/S3. |
-| Spécialisation des décisions long/short | [Shorts après les gradients](short-decision-benchmark.md) | Plan retenu, non implémenté : détecteur Short avec Long par défaut, deux têtes, puis deux modèles séparés. |
+| Gradients des états | [Détaché et TBPTT](trade-state-gradients.md) | Terminé : 45 fits, 90 trajectoires. Pas de gain robuste ; S3 détaché conservé, TBPTT 40 challenger secondaire. |
+| Spécialisation des décisions long/short | [Shorts après les gradients](short-decision-benchmark.md) | Implémenté, non benchmarké : 81 fits, 99 encodeurs, 486 trajectoires ; CE/financière, trois architectures et contrôles explicites. |
 
 Les anciens plans dans `papers/old_docs/` restent des archives, pas une feuille de route actuelle. Je conserve leur contenu et leur emplacement.

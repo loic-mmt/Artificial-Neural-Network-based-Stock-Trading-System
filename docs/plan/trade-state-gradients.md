@@ -1,8 +1,11 @@
 # Benchmark des gradients d'état en overnight
 
-Statut au 11 octobre 2026 : implémenté et prêt à lancer. Les tests logiciels
-ne constituent pas un résultat de performance financière. Le benchmark complet
-n'est pas lancé sur le Mac.
+Statut au 12 octobre 2026 : benchmark terminé sur le PC GPU, 45 fits et
+90 trajectoires, holdout fermé. TBPTT 40 reste très proche du S3 détaché,
+sans gain robuste entre périodes. TBPTT 10 augmente surtout l'exposition et
+dégrade le Sharpe moyen. S3 détaché reste la référence pour le
+[benchmark des décisions short](short-decision-benchmark.md), désormais prêt.
+Les résultats sont dans `artifacts/comparisons/us-trade-state-gradients`.
 
 ## Question
 
@@ -107,8 +110,9 @@ python -u scripts/run_trade_state_gradient_benchmark.py --data data/processed/mt
 ```
 
 Ce pilote vérifie les cinq candidats et dix trajectoires, pas la rentabilité.
-La vérification locale porte sur CPU ; aucun résultat CUDA n'est revendiqué
-avant ce contrôle sur le PC.
+Les tests logiciels locaux portent sur CPU. Le run complet terminé dans
+`us-trade-state-gradients` utilise CUDA ; un nouvel environnement doit encore
+faire ce pilote avant sa propre grille complète.
 
 ## Lecture des résultats
 
