@@ -27,7 +27,7 @@ set -euo pipefail
   --label-between-events hold \
   --label-cost-bps 5 \
   --feature-set expanded \
-  --feature-groups technical,market,sector \
+  --feature-groups technical,sector \
   --no-external-features \
   --overfitting-control \
   --overfitting-max-features 32 \
