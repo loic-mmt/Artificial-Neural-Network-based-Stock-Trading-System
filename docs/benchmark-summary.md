@@ -1,6 +1,6 @@
 # Résumé des benchmarks
 
-Mise à jour : 11 octobre 2026. Je garde ici les grandes lignes et les décisions. Chaque fiche liée contient les résultats détaillés, le protocole, les limites et les sources.
+Mise à jour : 14 octobre 2026. Je garde ici les grandes lignes et les décisions. Chaque fiche liée contient les résultats détaillés, le protocole, les limites et les sources.
 
 ## Ce que je retiens
 
@@ -10,7 +10,9 @@ Ma référence GRU reste compacte : une couche, hidden size 32, attention tempor
 
 Sur le benchmark labels/losses US après l'open, les 99 entraînements sont terminés. Les frais effacent l'essentiel du gain brut intraday et inverser les positions n'aide pas. En overnight, CE volatilité au signe gagne en rendement moyen, mais les 63 trajectoires au signe restent sous buy-and-hold à exposition brute comparable. Les hybrides ressemblent fortement à la financière ; l'apprentissage des classes reste faible et certains shorts persistent plusieurs années.
 
-Le benchmark des états S0-S3 est terminé : 72 entraînements, 144 trajectoires. Les états améliorent surtout le rendement de la financière en augmentant l'exposition longue ; S3 au signe atteint +51,15 %, mais buy-and-hold reste devant à +58,62 %. La CE au signe devient parfois très instable et AAPL peut rester short 773 séances malgré les états renseignés. La suite compare les gradients d'état, puis spécialise les décisions short : Long par défaut avec détecteur Short, deux têtes ou deux modèles Long/Flat et Short/Flat. Le contrôle Long/Flat distingue éviter une baisse de la shorter. Aucun gain d'alpha n'est validé.
+Le benchmark des états S0-S3 est terminé : 72 entraînements, 144 trajectoires. Les états améliorent surtout le rendement de la financière en augmentant l'exposition longue ; S3 au signe atteint +51,15 %, mais buy-and-hold reste devant à +58,62 %. La CE au signe devient parfois très instable et AAPL peut rester short 773 séances malgré les états renseignés.
+
+La spécialisation des shorts est maintenant terminée : 81 fits, 486 trajectoires et 324 contre-factuels. Les deux GRU financiers gagnent surtout par moindre exposition short, sans signal short rentable démontré ; leur gain continu dépend d'un seul couple. Remplacer Short par Flat sur les mêmes signaux améliore le rendement dans 159/162 comparaisons. Le meilleur Long/Flat financier binaire atteint +55,47 %, toujours sous +58,62 % pour always-long. La CE binaire reste faible et instable. Je ne change pas le défaut ; je donne priorité à la cohérence entraînement/exécution et au contrôle Long/Flat. Aucun alpha n'est validé.
 
 Sur l'US historique, le GRU reste le contrôle de risque, `identity` le contrôle obligatoire et le GNN résiduel une piste exploratoire. Le test 32/64 sur le pool commun réentraîné est maintenant terminé : 108/108 runs, `identity_market` compris. Le cap32 est conservé ; 64 dégrade le Sharpe moyen GRU/GNN, les interactions features/gate sont négatives et le petit gain d'identité64 n'est pas stable entre contrôles d'exposition. Identité32 avec marché est un challenger fragile, pas un nouveau défaut. Le GRU reste une référence temporelle, mais n'est pas le meilleur score de cette nouvelle grille. Ni gain relationnel ni avantage généralisable du gate ne sont démontrés.
 
@@ -35,7 +37,8 @@ Protocole : [learning improvements](benchmarks/learning/README.md).
 | Comparaison initiale M0 à M3 | Triple Barrier devient la piste principale. Le décalage labels parfaits/modèle motive le travail sur l'apprentissage. | [Labels et modèles](benchmarks/label-methods.md) |
 | Qualité des labels US, sans entraînement | Triple-barrier fragmenté visuellement, intraday plus coûteux en turnover, volatilité plus persistante. L'irrégularité ne prouve pas l'inapprenabilité. | [Qualité des labels](benchmarks/label-quality-us.md) |
 | Labels/losses US après l'open, 99 entraînements | Intraday pénalisé par les frais, inversion non retenue. Overnight : CE volatilité au signe +42,81 %, financière +35,48 %, buy-and-hold +58,62 %. Les hybrides ne diversifient pas réellement les décisions. Cette étude motive S0-S3 ; holdout fermé. | [Résultats et décisions](benchmarks/us-label-loss-post-open.md) |
-| États de trade S0-S3, 72 entraînements | Financière S3 au signe +51,15 %, Sharpe 0,961, mais aucune trajectoire ne dépasse buy-and-hold en rendement. Gain surtout long/exposition ; CE au signe instable et shorts prolongés encore présents. Gradients, puis spécialisation short à tester. | [Résultats et suite](benchmarks/us-trade-state-overnight.md) |
+| États de trade S0-S3, 72 entraînements | Financière S3 au signe +51,15 %, Sharpe 0,961, mais aucune trajectoire ne dépasse buy-and-hold en rendement. Gain surtout long/exposition ; CE au signe instable et shorts prolongés encore présents. Cette étude motive les contrôles de gradients et la spécialisation short. | [Résultats et suite](benchmarks/us-trade-state-overnight.md) |
+| Spécialisation short, 81 fits | Deux GRU financiers : +48,39 % continu, +52,39 % binaire, mais gain fragile et shorts moyens perdants. Long/Flat gelé gagne dans 159/162 comparaisons ; meilleur Long/Flat fermé +55,47 %, sous always-long +58,62 %. Pas de nouveau défaut ; holdout fermé. | [Analyse des shorts](benchmarks/us-short-decisions.md) |
 | 01. Baseline | GRU gagne en macro-F1. Pas de preuve de rentabilité robuste. | [01](benchmarks/learning/01-baseline.md) |
 | 02. Estimateur | `rolling_std` en classification initiale ; ATR challenger financier. | [02](benchmarks/learning/02-volatility-estimator.md) |
 | 03. Barrières | `0.75/0.75`. Les branches macro-F1/PnL sont identiques, pas deux réplications. | [03](benchmarks/learning/03-profit-stop-barriers.md) |

@@ -1,8 +1,10 @@
 # Décisions long/short après le benchmark des gradients
 
 Plan retenu le 11 octobre 2026, recette fixée le 12 octobre 2026.
-Statut : architectures, runner, exports et tests implémentés. Le benchmark
-complet des shorts n'est pas lancé.
+Statut au 14 octobre 2026 : les 81 fits, 486 trajectoires et 324 contre-factuels
+sont terminés. Les [résultats détaillés](../benchmarks/us-short-decisions.md)
+ne démontrent pas de gain short robuste ; le holdout reste fermé. La recette
+ci-dessous conserve le protocole fixé avant OUTER.
 
 ## Objectif et ordre
 
